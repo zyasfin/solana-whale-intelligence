@@ -1,0 +1,1112 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solana Whale Intelligence</title>
+<style>
+:root{
+  --bg0:#05070d; --bg:#070b14;
+  --panel:rgba(255,255,255,.028); --panel-2:rgba(255,255,255,.05);
+  --border:rgba(255,255,255,.07); --border-2:rgba(255,255,255,.12);
+  --text:#e9eefb; --muted:#8a97b8;
+  --indigo:#6366f1; --violet:#8b5cf6; --cyan:#22d3ee; --blue:#5b8cff;
+  --good:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --chip:rgba(255,255,255,.04);
+  --grad:linear-gradient(135deg,#6366f1,#8b5cf6 45%,#22d3ee);
+  --shadow:0 10px 34px rgba(0,0,0,.45);
+  --r:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color:var(--text);
+  background:
+    radial-gradient(1100px 560px at 88% -10%, rgba(139,92,246,.14), transparent 60%),
+    radial-gradient(900px 500px at -10% 0%, rgba(99,102,241,.12), transparent 60%),
+    radial-gradient(760px 560px at 55% 115%, rgba(34,211,238,.07), transparent 60%),
+    var(--bg0);
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--cyan);text-decoration:none}
+button{font:inherit;cursor:pointer}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+
+input,select,textarea{font:inherit;background:rgba(0,0,0,.28);border:1px solid var(--border);color:var(--text);border-radius:9px;padding:8px 11px;width:100%;transition:border-color .15s, box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--indigo);box-shadow:0 0 0 3px rgba(99,102,241,.22)}
+input::placeholder,textarea::placeholder{color:var(--muted)}
+
+.shell{display:flex;min-height:100vh}
+
+/* ---------------- Sidebar ---------------- */
+.sidebar{width:236px;flex-shrink:0;position:sticky;top:0;height:100vh;overflow:auto;padding:20px 14px;
+  background:rgba(255,255,255,.02);border-right:1px solid var(--border);backdrop-filter:blur(8px);display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:11px;padding:2px 6px 18px}
+.brand .logo{width:34px;height:34px;border-radius:10px;background:var(--grad);display:flex;align-items:center;justify-content:center;box-shadow:0 4px 16px rgba(99,102,241,.5)}
+.brand .logo svg{width:18px;height:18px;color:#fff}
+.brand .bt{line-height:1.1}
+.brand .bt b{font-size:14px;letter-spacing:.2px;display:block}
+.brand .bt span{font-size:10px;color:var(--muted);letter-spacing:.4px;text-transform:uppercase}
+.nav{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+.nav button{display:flex;align-items:center;gap:11px;padding:9px 11px;border:0;background:transparent;color:var(--muted);border-radius:10px;text-align:left;font-size:13px;position:relative;transition:background .15s,color .15s}
+.nav button svg{width:16px;height:16px;flex-shrink:0;opacity:.85}
+.nav button:hover{background:var(--chip);color:var(--text)}
+.nav button.active{background:linear-gradient(90deg,rgba(99,102,241,.18),rgba(139,92,246,.08));color:var(--text);font-weight:600}
+.nav button.active::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;background:var(--grad)}
+.nav button.active svg{color:var(--cyan);opacity:1}
+.sidebar .foot{margin-top:auto;padding-top:14px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.sidebar .foot .rowc{display:flex;align-items:center;gap:7px}
+.sidebar .foot a{color:var(--muted);font-size:11px}
+.sidebar .foot a:hover{color:var(--text)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--good);box-shadow:0 0 10px var(--good);display:inline-block;flex-shrink:0}
+.dot.bad{background:var(--bad);box-shadow:0 0 10px var(--bad)}
+
+/* ---------------- Main / topbar ---------------- */
+.main{flex:1;padding:22px 28px 40px;max-width:1500px;min-width:0}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px;position:sticky;top:0;z-index:20;
+  padding:12px 0;background:linear-gradient(var(--bg0),rgba(5,7,13,.86));backdrop-filter:blur(8px)}
+.topbar .tt{display:flex;align-items:baseline;gap:12px;min-width:0}
+.topbar h1{font-size:20px;margin:0;letter-spacing:-.2px;font-weight:700}
+.topbar .sub{font-size:11px;color:var(--muted)}
+.topbar .actions{display:flex;gap:10px;align-items:center}
+.hint{font-size:11px;color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:7px 13px;border-radius:999px;font-size:12px;font-weight:600;
+  background:rgba(52,211,153,.1);color:var(--good);border:1px solid rgba(52,211,153,.3);white-space:nowrap}
+.pill.bad{background:rgba(248,113,113,.1);color:var(--bad);border-color:rgba(248,113,113,.3)}
+
+/* ---------------- Buttons ---------------- */
+.btn{background:var(--panel-2);border:1px solid var(--border-2);color:var(--text);padding:7px 13px;border-radius:9px;font-size:13px;transition:transform .12s, background .15s, border-color .15s, box-shadow .15s}
+.btn:hover{background:rgba(255,255,255,.09);border-color:rgba(255,255,255,.2)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--grad);border:0;color:#fff;font-weight:600;box-shadow:0 4px 16px rgba(99,102,241,.35)}
+.btn.primary:hover{filter:brightness(1.08);box-shadow:0 6px 20px rgba(139,92,246,.45)}
+.btn.danger{color:var(--bad)}
+.btn.sm{padding:4px 9px;font-size:11px;border-radius:7px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+
+/* ---------------- Views / cards ---------------- */
+.view{display:none}
+.view.active{display:block;animation:fade .22s ease}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1}}
+
+.grid{display:grid;gap:16px;grid-template-columns:repeat(12,1fr)}
+.span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:18px;backdrop-filter:blur(6px);transition:transform .16s, box-shadow .16s, border-color .16s}
+.card:hover{border-color:var(--border-2)}
+.card h3{font-size:11px;margin:0 0 14px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.9px}
+.stat{font-size:26px;font-weight:700;letter-spacing:-.5px}
+.stat small{display:block;font-size:11px;color:var(--muted);font-weight:400;margin-top:4px;letter-spacing:0;text-transform:none}
+.muted{color:var(--muted)}
+
+/* ---------------- Hero ---------------- */
+.hero{grid-column:span 12;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;
+  border:1px solid var(--border);border-radius:18px;padding:26px 28px;position:relative;overflow:hidden;
+  background:linear-gradient(120deg,rgba(99,102,241,.16),rgba(139,92,246,.1) 45%,rgba(34,211,238,.07))}
+.hero::before{content:"";position:absolute;right:-70px;top:-90px;width:320px;height:320px;border-radius:50%;
+  background:radial-gradient(circle,rgba(139,92,246,.28),transparent 65%)}
+.hero::after{content:"";position:absolute;left:38%;bottom:-130px;width:280px;height:280px;border-radius:50%;
+  background:radial-gradient(circle,rgba(34,211,238,.14),transparent 65%)}
+.hero h2{margin:0 0 6px;font-size:24px;letter-spacing:-.5px;font-weight:800;
+  background:linear-gradient(90deg,#fff,#bfc8ff 55%,#8be9ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p{margin:0;color:var(--muted);font-size:13px;max-width:520px}
+.hero > *{position:relative;z-index:1}
+
+/* ---------------- KPI cards ---------------- */
+.kpi{grid-column:span 2;position:relative;overflow:hidden;padding:16px 16px 14px;display:flex;flex-direction:column;gap:8px}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--kpi-accent,var(--grad))}
+.kpi:hover{transform:translateY(-3px);box-shadow:var(--shadow)}
+.kpi .kpi-top{display:flex;justify-content:space-between;align-items:center}
+.kpi .kpi-label{font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.kpi .kpi-icon{width:32px;height:32px;border-radius:9px;display:flex;align-items:center;justify-content:center;color:#fff;flex-shrink:0;
+  background:var(--kpi-accent,var(--grad));box-shadow:0 0 18px var(--kpi-glow,rgba(99,102,241,.35))}
+.kpi .kpi-icon svg{width:16px;height:16px}
+.kpi .kpi-num{font-size:26px;font-weight:800;letter-spacing:-.8px;line-height:1}
+.kpi .kpi-delta{font-size:10px;color:var(--muted)}
+.kpi .kpi-delta.up{color:var(--good)}
+.kpi .spark{width:100%;height:34px;display:block;margin-top:2px}
+
+/* ---------------- Charts ---------------- */
+.chart-card{position:relative}
+.chart-card canvas{width:100%;height:240px;display:block}
+.legend{display:flex;gap:16px;margin-top:12px;font-size:11px;color:var(--muted);flex-wrap:wrap}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend .ld{width:10px;height:10px;border-radius:3px;display:inline-block;box-shadow:0 0 8px currentColor}
+
+/* ---------------- Tables ---------------- */
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+.toolbar input[type=search]{width:250px}
+.pager{display:flex;gap:6px;align-items:center;margin-left:auto}
+.pager span{font-size:12px;color:var(--muted);min-width:18px;text-align:center}
+.tablewrap{overflow:auto;max-height:460px;border:1px solid var(--border);border-radius:11px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--border);white-space:nowrap}
+th{position:sticky;top:0;background:rgba(10,14,24,.96);backdrop-filter:blur(4px);color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;z-index:2}
+tbody tr{transition:background .12s}
+tbody tr:nth-child(even) td{background:rgba(255,255,255,.014)}
+tbody tr:hover td{background:rgba(99,102,241,.09)}
+td.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
+.addr{max-width:160px;overflow:hidden;text-overflow:ellipsis}
+.empty{color:var(--muted);font-size:12px;padding:22px;text-align:center}
+
+/* ---------------- Badges & toggles ---------------- */
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:10px;font-weight:600;letter-spacing:.2px;background:var(--chip);border:1px solid var(--border-2)}
+.badge.funded{color:var(--cyan);border-color:rgba(34,211,238,.35);background:rgba(34,211,238,.08)}
+.badge.preparation{color:var(--warn);border-color:rgba(251,191,36,.3);background:rgba(251,191,36,.07)}
+.badge.deployed{color:var(--good);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.07)}
+.badge.dismissed{color:var(--muted)}
+.badge.entry{color:var(--good)}.badge.exit{color:var(--bad)}
+.badge.active{color:var(--good);border-color:rgba(52,211,153,.3);background:rgba(52,211,153,.07)}
+.badge.flood_wait{color:var(--warn)}
+.badge.disabled{color:var(--muted)}
+.badge.skip{color:var(--bad);border-color:rgba(248,113,113,.3);background:rgba(248,113,113,.07)}
+.badge.score{color:var(--good)}
+.badge.watch{color:var(--cyan)}
+.badge.flow_only{color:var(--warn)}
+.toggle{width:36px;height:20px;border-radius:999px;background:rgba(255,255,255,.08);border:1px solid var(--border-2);position:relative;display:inline-block;vertical-align:middle;transition:background .2s, border-color .2s;cursor:pointer}
+.toggle.on{background:linear-gradient(90deg,#34d399,#22d3ee);border-color:transparent;box-shadow:0 0 12px rgba(52,211,153,.4)}
+.toggle::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .18s}
+.toggle.on::after{left:18px}
+
+/* ---------------- Modals ---------------- */
+.modal{position:fixed;inset:0;background:rgba(3,5,10,.6);backdrop-filter:blur(5px);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
+.modal.open{display:flex;animation:ovl .18s ease}
+.modal.open .box{animation:pop .2s cubic-bezier(.2,.9,.3,1.2)}
+@keyframes ovl{from{opacity:0}to{opacity:1}}
+@keyframes pop{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:scale(1)}}
+.modal .box{background:#0c111f;border:1px solid var(--border-2);border-radius:16px;padding:22px;width:480px;max-width:100%;max-height:90vh;overflow:auto;box-shadow:var(--shadow)}
+.modal .box h3{margin:0 0 16px;font-size:15px;font-weight:700;letter-spacing:-.2px}
+.modal .row{margin-bottom:13px}
+.modal .row label{display:block;font-size:11px;color:var(--muted);margin-bottom:6px;font-weight:500}
+.modal .actions{display:flex;justify-content:flex-end;gap:9px;margin-top:18px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+
+/* ---------------- Toast ---------------- */
+.toast{position:fixed;bottom:22px;right:22px;display:flex;flex-direction:column;gap:9px;z-index:100}
+.toast .t{background:#0d1322;border:1px solid var(--border-2);border-left:3px solid var(--good);padding:11px 16px;border-radius:11px;font-size:13px;box-shadow:var(--shadow);animation:tin .25s cubic-bezier(.2,.9,.3,1.2)}
+.toast .t.err{border-left-color:var(--bad)}
+@keyframes tin{from{opacity:0;transform:translateX(20px)}to{opacity:1}}
+/* settings page */
+.setgrid{display:grid;gap:14px;grid-template-columns:repeat(3,1fr)}
+.setgrid .row{margin-bottom:0}
+.setpill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;font-size:10px;font-weight:600;border:1px solid}
+.setpill.set{color:var(--good);border-color:rgba(52,211,153,.35);background:rgba(52,211,153,.08)}
+.setpill.unset{color:var(--muted);border-color:var(--border-2);background:var(--chip)}
+.srcpill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:10px;font-weight:600;border:1px solid}
+.srcpill.env{color:var(--cyan);border-color:rgba(34,211,238,.35);background:rgba(34,211,238,.08)}
+.srcpill.db{color:var(--violet);border-color:rgba(139,92,246,.4);background:rgba(139,92,246,.1)}
+.lockic{width:13px;height:13px;color:var(--warn);display:inline-block;vertical-align:middle}
+@media(max-width:1100px){.setgrid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.setgrid{grid-template-columns:1fr}}
+
+@media(max-width:1100px){.kpi{grid-column:span 4}}
+@media(max-width:980px){
+  .sidebar{width:66px;padding:16px 10px}
+  .brand .bt,.nav button span,.sidebar .foot{display:none}
+  .nav button{justify-content:center;padding:11px}
+  .span4,.span6,.span8{grid-column:span 12}
+  .kpi{grid-column:span 6}
+  .main{padding:16px}
+  .topbar{position:static}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l5-6 4 4 6-8 3 4"/><path d="M3 21h18"/></svg></div>
+      <div class="bt"><b>Whale Intel</b><span>analytics</span></div>
+    </div>
+    <nav class="nav">
+      <button class="active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Overview</span></button>
+      <button data-view="radar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12l6-6"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg><span>Funding Radar</span></button>
+      <button data-view="signals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg><span>Signals</span></button>
+      <button data-view="wallets"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M16 12.5h3"/></svg><span>Wallets</span></button>
+      <button data-view="smartwallets"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M16 12.5h3"/><path d="M8.5 10.2l.7 1.5 1.6.2-1.2 1.1.3 1.6-1.4-.8-1.4.8.3-1.6-1.2-1.1 1.6-.2z"/></svg><span>Smart Wallets</span></button>
+      <button data-view="api"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg><span>API Keys</span></button>
+      <button data-view="xtrack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2"/></svg><span>X Tracker</span></button>
+      <button data-view="tgtrack"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4L3 11l6 2 2 6 3-4 7-11z"/><path d="M17.5 15.5c.8 1 1.5 2.2 1.5 3.5M14 17c.5.6.8 1.3.8 2"/></svg><span>TG Tracker</span></button>
+      <button data-view="telegram"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4L3 11l6 2 2 6 3-4 7-11z"/></svg><span>Telegram</span></button>
+      <button data-view="clusters"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="7" r="2.4"/><circle cx="12" cy="17" r="2.4"/><path d="M8 7.4l7 7M16.2 8.6l-6.5 6.2"/></svg><span>Clusters</span></button>
+      <button data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg><span>Settings</span></button>
+    </nav>
+    <div class="foot">
+      <div class="rowc"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+      <div style="margin-top:9px"><a href="#" id="logoutLink">logout</a></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div class="tt"><h1 id="viewTitle">Overview</h1><span class="sub">live intelligence</span></div>
+      <div class="actions">
+        <span class="hint" id="updated">—</span>
+        <div class="pill" id="statusPill"><span class="dot"></span><span id="statusPillText">connecting…</span></div>
+      </div>
+    </div>
+
+    <!-- OVERVIEW -->
+    <section class="view active" id="view-overview">
+      <div class="grid">
+        <div class="hero">
+          <div>
+            <h2>Solana Whale Intelligence</h2>
+            <p>Real-time funding radar, signal evaluation &amp; wallet clustering across your tracked universe.</p>
+          </div>
+        </div>
+
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#6366f1,#8b5cf6);--kpi-glow:rgba(99,102,241,.4)">
+          <div class="kpi-top"><div class="kpi-label">Wallets</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M16 12h3"/></svg></div></div>
+          <div class="kpi-num" id="kWallets">—</div><div class="kpi-delta" id="kWalletsD">tracked addresses</div>
+        </div>
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#8b5cf6,#c96cff);--kpi-glow:rgba(139,92,246,.4)">
+          <div class="kpi-top"><div class="kpi-label">Tokens</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/><path d="M12 8v8M9 10h6"/></svg></div></div>
+          <div class="kpi-num" id="kTokens">—</div><div class="kpi-delta" id="kTokensD">monitored mints</div>
+        </div>
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#22d3ee,#6366f1);--kpi-glow:rgba(34,211,238,.4)">
+          <div class="kpi-top"><div class="kpi-label">Clusters</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="7" r="2.5"/><circle cx="12" cy="17" r="2.5"/><path d="M8 7.5l7 7M16 8.5l-6 6"/></svg></div></div>
+          <div class="kpi-num" id="kClusters">—</div><div class="kpi-delta" id="kClustersD">linked groups</div>
+        </div>
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#f59e0b,#f87171);--kpi-glow:rgba(245,158,11,.35)">
+          <div class="kpi-top"><div class="kpi-label">Signals 24h</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg></div></div>
+          <div class="kpi-num" id="kSignals">—</div>
+          <canvas class="spark" id="sparkSignals"></canvas>
+          <div class="kpi-delta up" id="kSignalsD">accepted · last 24h</div>
+        </div>
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#f87171,#f59e0b);--kpi-glow:rgba(248,113,113,.35)">
+          <div class="kpi-top"><div class="kpi-label">Radar open</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg></div></div>
+          <div class="kpi-num" id="kRadarOpen">—</div><div class="kpi-delta" id="kRadarOpenD">active cases</div>
+        </div>
+        <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#34d399,#22d3ee);--kpi-glow:rgba(52,211,153,.35)">
+          <div class="kpi-top"><div class="kpi-label">Transfers 24h</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17l-4-4 4-4M3 13h13M17 7l4 4-4 4M21 11H8"/></svg></div></div>
+          <div class="kpi-num" id="kTransfers">—</div><div class="kpi-delta up" id="kTransfersD">last 24 hours</div>
+        </div>
+
+        <div class="card span6 chart-card"><h3>Signal activity · 24h</h3><canvas id="chartSignals"></canvas>
+          <div class="legend"><span><span class="ld" style="background:#34d399;color:#34d399"></span>accepted</span><span><span class="ld" style="background:#f87171;color:#f87171"></span>rejected</span></div>
+        </div>
+        <div class="card span6 chart-card"><h3>Radar trend · 48h</h3><canvas id="chartRadar"></canvas>
+          <div class="legend"><span><span class="ld" style="background:#22d3ee;color:#22d3ee"></span>funded</span><span><span class="ld" style="background:#fbbf24;color:#fbbf24"></span>preparation</span><span><span class="ld" style="background:#34d399;color:#34d399"></span>deployed</span></div>
+        </div>
+
+        <div class="card span12"><h3>Health</h3>
+          <div class="grid" style="grid-template-columns:repeat(4,1fr)">
+            <div><div class="stat" id="hLatency">—</div><small>DB latency (ms)</small></div>
+            <div><div class="stat" id="hRaw">—</div><small>Raw events</small></div>
+            <div><div class="stat" id="hMsgs">—</div><small>Telegram messages</small></div>
+          </div>
+        </div>
+        <div class="card span4"><h3>Radar stages</h3>
+          <div class="grid" style="grid-template-columns:repeat(2,1fr)">
+            <div><div class="stat" id="rFunded">0</div><small>funded</small></div>
+            <div><div class="stat" id="rPrep">0</div><small>preparation</small></div>
+            <div><div class="stat" id="rDeployed">0</div><small>deployed</small></div>
+            <div><div class="stat" id="rDismissed">0</div><small>dismissed</small></div>
+          </div>
+        </div>
+        <div class="card span8"><h3>Latest signals</h3>
+          <div class="tablewrap"><table><thead><tr><th>Kind</th><th>Score</th><th>Mint</th><th>Created</th></tr></thead>
+          <tbody id="ovSignals"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- RADAR -->
+    <section class="view" id="view-radar">
+      <div class="card">
+        <div class="toolbar"><input type="search" id="radarQ" placeholder="search recipient…"></div>
+        <div class="tablewrap"><table id="radarTable">
+          <thead><tr><th>ID</th><th>Stage</th><th>Conf</th><th>Native</th><th>Recipient</th><th>Updated</th></tr></thead>
+          <tbody id="radarBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- SIGNALS -->
+    <section class="view" id="view-signals">
+      <div class="grid">
+        <div class="card span6"><h3>Signals</h3>
+          <div class="tablewrap"><table><thead><tr><th>Kind</th><th>Score</th><th>Mint</th><th>Created</th></tr></thead>
+          <tbody id="signalsBody"></tbody></table></div>
+        </div>
+        <div class="card span6"><h3>Rejections</h3>
+          <div class="tablewrap"><table><thead><tr><th>Code</th><th>Mint</th><th>Evaluated</th></tr></thead>
+          <tbody id="rejectionsBody"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- WALLETS -->
+    <section class="view" id="view-wallets">
+      <div class="card">
+        <div class="toolbar">
+          <input type="search" id="walletQ" placeholder="search address…">
+          <select id="walletChain" style="width:auto"><option value="solana">solana</option><option value="robinhood">robinhood</option></select>
+          <button class="btn primary" id="btnImportBlocklist">Import blocklist</button>
+          <div class="pager"><button class="btn sm" id="walletPrev">‹</button><span id="walletPage">1</span><button class="btn sm" id="walletNext">›</button></div>
+        </div>
+        <div class="tablewrap"><table id="walletTable">
+          <thead><tr><th>Address</th><th>Disposition</th><th>Source</th><th>Last seen</th><th></th></tr></thead>
+          <tbody id="walletsBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- SMART WALLETS -->
+    <section class="view" id="view-smartwallets">
+      <div class="card" style="margin-bottom:16px">
+        <h3>Groups</h3>
+        <div id="swGroups" style="display:flex;gap:9px;flex-wrap:wrap;align-items:center"></div>
+      </div>
+      <div class="card">
+        <div class="toolbar">
+          <select id="swStatus" style="width:auto">
+            <option value="" selected>All wallets</option>
+            <option value="tracked">Tracked</option>
+            <option value="candidate">Candidates</option>
+            <option value="dismissed">Dismissed</option>
+          </select>
+          <select id="swGroup" style="width:auto"><option value="">All groups</option></select>
+          <button class="btn" id="btnSwRefresh">Refresh</button>
+          <span class="muted" id="swCount" style="font-size:12px"></span>
+          <input id="swManualAddr" class="mono" placeholder="wallet address…" style="width:340px">
+          <button class="btn primary" id="btnSwEnrichAddr">Enrich wallet</button>
+          <button class="btn" id="btnSwEnrichAll">Enrich all</button>
+          <span class="hint">Discovered from GMGN smart-money &amp; KOL trade feeds. Enriched every 15 min (win rate / PnL 30d).</span>
+        </div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>Wallet</th><th>Source</th><th>Group</th><th>X handle</th><th>Followers</th><th>Win rate</th><th>PnL 30d</th><th>Trades</th><th>Volume</th><th>Status</th><th>Last seen</th><th></th></tr></thead>
+          <tbody id="swBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- API KEYS -->
+    <section class="view" id="view-api">
+      <div class="grid">
+        <!-- Helius keys -->
+        <div class="card span12">
+          <div class="toolbar">
+            <span class="muted" id="apiHeliusCount" style="font-size:12px">—</span>
+            <div class="pager">
+              <button class="btn primary" id="btnApiHeliusAdd">+ Add key</button>
+              <button class="btn" id="btnApiHeliusBulk">Bulk add</button>
+            </div>
+          </div>
+          <div class="hint" style="margin-bottom:12px">Paste the full RPC URL (<span class="mono">https://mainnet.helius-rpc.com/?api-key=…</span>) or just the key — Parse Transaction &amp; History URLs derive automatically.</div>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Name</th><th>Key</th><th>RPC URL</th><th>Status</th><th>Monthly usage</th><th>Last check</th><th></th></tr></thead>
+            <tbody id="apiHeliusBody"></tbody></table></div>
+        </div>
+        <!-- GMGN keys -->
+        <div class="card span12">
+          <div class="toolbar">
+            <span class="muted" id="apiGmgnCount" style="font-size:12px">—</span>
+            <div class="pager">
+              <button class="btn" id="btnApiGmgnNewPubkey">New pubkey</button>
+              <button class="btn primary" id="btnApiGmgnAdd">+ Add key</button>
+              <button class="btn" id="btnApiGmgnBulk">Bulk add</button>
+            </div>
+          </div>
+          <h3>GMGN pubkeys</h3>
+          <div class="tablewrap" style="margin-bottom:16px"><table>
+            <thead><tr><th>Public key (PEM)</th><th>Keys bound</th><th>Created</th><th></th></tr></thead>
+            <tbody id="apiGmgnPubkeyBody"></tbody></table></div>
+          <h3>GMGN API keys</h3>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Name</th><th>Key</th><th>Pubkey</th><th>Status</th><th>Monthly usage</th><th>Last check</th><th></th></tr></thead>
+            <tbody id="apiGmgnBody"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- X TRACKER -->
+    <section class="view" id="view-xtrack">
+      <div class="grid">
+        <div class="card span12">
+          <h3>KOL &amp; Smart Money trades</h3>
+          <div class="hint" style="margin-bottom:12px">Merged KOL + Smart Money token trades from GMGN. Cached 60s.</div>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Time</th><th>Wallet</th><th>Tag</th><th>X handle</th><th>Token</th><th>Side</th><th>USD</th></tr></thead>
+            <tbody id="xFeedBody"></tbody></table></div>
+        </div>
+        <div class="card span12">
+          <h3>X KOL leaderboard</h3>
+          <div class="tablewrap"><table>
+            <thead><tr><th>#</th><th>X handle</th><th>Name</th><th>Trades</th><th>Volume USD</th><th>Wallets</th><th>Followers</th><th>Verified</th></tr></thead>
+            <tbody id="xLeadBody"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TG TRACKER -->
+    <section class="view" id="view-tgtrack">
+      <div class="grid">
+        <div class="card span12">
+          <h3>Telegram call heat (GMGN trenches)</h3>
+          <div class="hint" style="margin-bottom:12px">New tokens ranked by Telegram call count. Social fields are self-reported by token deployers — display only. Cached 60s.</div>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Token</th><th>TG calls</th><th>X followers</th><th>Socials</th><th>Liquidity</th><th>MCap</th><th>Age</th></tr></thead>
+            <tbody id="tgHotBody"></tbody></table></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TELEGRAM -->
+    <section class="view" id="view-telegram">
+      <div class="card">
+        <div class="toolbar">
+          <input type="search" id="tgQ" placeholder="channel key…" style="width:220px">
+          <button class="btn primary" id="btnAddChannel">+ Add channel</button>
+          <button class="btn" id="btnBulkChannel">Bulk add</button>
+        </div>
+        <div class="tablewrap"><table><thead><tr><th>Channel</th><th>Status</th><th>Allowlisted</th><th>Last seen</th><th></th></tr></thead>
+        <tbody id="channelsBody"></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- CLUSTERS -->
+    <section class="view" id="view-clusters">
+      <div class="card">
+        <div class="tablewrap"><table><thead><tr><th>Cluster</th><th>Members</th></tr></thead>
+        <tbody id="clustersBody"></tbody></table></div>
+      </div>
+    </section>
+    <!-- SETTINGS -->
+    <section class="view" id="view-settings">
+      <div class="grid">
+        <div class="card span12">
+          <h3>Environment (read-only)</h3>
+          <div class="hint" style="margin-bottom:12px;display:flex;align-items:center;gap:7px">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--warn)"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+            Secret values are never shown — only a masked preview. Editable secrets can be set here; env-only values are read-only.
+            Helius &amp; GMGN API keys are managed in the API Keys panel.
+          </div>
+          <div class="tablewrap"><table><thead><tr><th></th><th>Variable</th><th>Status</th><th>Preview</th><th>Source</th><th></th></tr></thead>
+          <tbody id="envBody"></tbody></table></div>
+        </div>
+        <div class="card span12">
+          <h3>Runtime settings (editable)</h3>
+          <div class="hint" style="margin-bottom:14px">Stored in the database; overrides config defaults. <span style="color:var(--warn)">Restart the service to apply changes that workers read at startup.</span></div>
+          <div class="setgrid">
+            <div class="row"><label>Large funding min (SOL)</label><input type="number" min="0" id="s_large_funding_min_sol"></div>
+            <div class="row"><label>Large funding min (USD)</label><input type="number" min="0" id="s_large_funding_min_usd"></div>
+            <div class="row"><label>Recipient max age (days)</label><input type="number" min="0" id="s_recipient_max_age_days"></div>
+            <div class="row"><label>Preparation alert confidence</label><input type="number" min="0" max="100" id="s_preparation_alert_confidence"></div>
+            <div class="row"><label>Entry min liquidity (USD)</label><input type="number" min="0" id="s_entry_min_liquidity_usd"></div>
+            <div class="row"><label>Full skill score</label><input type="number" min="0" max="100" id="s_full_skill_score"></div>
+            <div class="row"><label>Full copyability score</label><input type="number" min="0" max="100" id="s_full_copyability_score"></div>
+            <div class="row"><label>Telegram concurrency</label><input type="number" min="0" id="s_telegram_concurrency"></div>
+            <div class="row"><label>Runtime profile</label><select id="s_runtime_profile"><option value="low">low</option><option value="scale">scale</option></select></div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;margin-top:16px"><button class="btn primary" id="btnSaveSettings">Save settings</button></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- Helius add modal -->
+<div class="modal" id="apiHeliusModal"><div class="box">
+  <h3>Add Helius key</h3>
+  <div class="row"><label>Name (optional)</label><input id="apiHeliusName" placeholder="helius-1"></div>
+  <div class="row"><label>API key or full RPC URL</label><input id="apiHeliusKeyOrUrl" class="mono" placeholder="https://mainnet.helius-rpc.com/?api-key=…"></div>
+  <div class="row"><label>Monthly limit (optional, blank = unlimited)</label><input id="apiHeliusLimit" type="number" min="0" placeholder="default 1000000 (free plan)"></div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiHeliusModal')">Cancel</button><button class="btn primary" id="btnSaveApiHelius">Save</button></div>
+</div></div>
+<!-- Helius bulk modal -->
+<div class="modal" id="apiHeliusBulkModal"><div class="box">
+  <h3>Bulk add Helius keys</h3>
+  <div class="row"><label>Keys or URLs (one per line)</label><textarea id="apiHeliusBulkText" class="mono" rows="10" placeholder="https://mainnet.helius-rpc.com/?api-key=…&#10;abcdef1234567890…"></textarea></div>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">One per line: full RPC URL or raw API key. <span class="mono">#</span> comments and blanks skipped.</div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiHeliusBulkModal')">Cancel</button><button class="btn primary" id="btnSaveApiHeliusBulk">Import</button></div>
+</div></div>
+<!-- GMGN pubkey display modal -->
+<div class="modal" id="apiPubkeyModal"><div class="box">
+  <h3>New GMGN pubkey</h3>
+  <div class="row"><label>Public key (PEM)</label><textarea id="apiPubkeyPem" class="mono" rows="5" readonly></textarea></div>
+  <div class="hint" style="margin-bottom:6px">Paste this public key into the GMGN panel to create an API key (max 3 keys per pubkey). The private key never leaves this server.</div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiPubkeyModal')">Close</button><button class="btn primary" id="btnCopyPubkey">Copy to clipboard</button></div>
+</div></div>
+<!-- GMGN private key reveal modal -->
+<div class="modal" id="apiPubkeyPrivModal"><div class="box">
+  <h3>Private key — paste into the GMGN panel / gmgn-cli keypair.pem</h3>
+  <div class="row"><label>Private key (PEM)</label><textarea id="apiPubkeyPrivPem" class="mono" rows="5" readonly></textarea></div>
+  <div class="hint" style="margin-bottom:6px;color:var(--warn)">Keep this secret. Anyone with this key can sign as your GMGN pubkey.</div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiPubkeyPrivModal')">Close</button><button class="btn primary" id="btnCopyPrivPubkey">Copy to clipboard</button></div>
+</div></div>
+<!-- GMGN key add modal -->
+<div class="modal" id="apiGmgnModal"><div class="box">
+  <h3>Add GMGN API key</h3>
+  <div class="row"><label>Name (optional)</label><input id="apiGmgnName" placeholder="gmgn-1"></div>
+  <div class="row"><label>API key</label><input id="apiGmgnApiKey" class="mono" placeholder="gmgn api key"></div>
+  <div class="row"><label>Bind to pubkey</label><select id="apiGmgnPubkeySel"></select></div>
+  <div class="row"><label>Monthly limit (optional, blank = unlimited)</label><input id="apiGmgnLimit" type="number" min="0" placeholder="unlimited (no monthly quota)"></div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiGmgnModal')">Cancel</button><button class="btn primary" id="btnSaveApiGmgn">Save</button></div>
+</div></div>
+<!-- GMGN key bulk modal -->
+<div class="modal" id="apiGmgnBulkModal"><div class="box">
+  <h3>Bulk add GMGN API keys</h3>
+  <div class="row"><label>API keys (one per line)</label><textarea id="apiGmgnBulkText" class="mono" rows="10"></textarea></div>
+  <div class="row"><label>Bind to pubkey</label><select id="apiGmgnBulkPubkeySel"></select></div>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">The 3-keys-per-pubkey cap is enforced server-side — excess lines error out and are reported after import.</div>
+  <div class="actions"><button class="btn" onclick="closeModal('apiGmgnBulkModal')">Cancel</button><button class="btn primary" id="btnSaveApiGmgnBulk">Import</button></div>
+</div></div>
+
+<!-- Smart wallet trades modal -->
+<div class="modal" id="swTradesModal"><div class="box" style="width:640px">
+  <h3 id="swTradesTitle">Recent trades</h3>
+  <div class="tablewrap" style="max-height:60vh"><table>
+    <thead><tr><th>Time</th><th>Token</th><th>Side</th><th>USD</th><th>Source</th></tr></thead>
+    <tbody id="swTradesBody"></tbody></table></div>
+  <div class="actions"><button class="btn" onclick="closeModal('swTradesModal')">Close</button></div>
+</div></div>
+
+<!-- Channel modal -->
+<div class="modal" id="tgModal"><div class="box">
+  <h3>Add Telegram channel</h3>
+  <div class="row"><label>Channel key / username</label><input id="tgKey" placeholder="somechannel"></div>
+  <div class="row"><label>Title (optional)</label><input id="tgTitle"></div>
+  <div class="actions"><button class="btn" onclick="closeModal('tgModal')">Cancel</button><button class="btn primary" id="btnSaveChannel">Save</button></div>
+</div></div>
+<!-- Channel bulk modal -->
+<div class="modal" id="tgBulkModal"><div class="box">
+  <h3>Bulk add Telegram channels</h3>
+  <div class="row"><label>Channel keys / usernames (one per line)</label><textarea id="tgBulkText" rows="10"></textarea></div>
+  <div class="muted" style="font-size:12px;margin-bottom:8px">One channel key or username per line. Blank lines and # comments are skipped.</div>
+  <div class="actions"><button class="btn" onclick="closeModal('tgBulkModal')">Cancel</button><button class="btn primary" id="btnSaveChannelBulk">Import</button></div>
+</div></div>
+
+<!-- Label modal -->
+<div class="modal" id="labelModal"><div class="box">
+  <h3>Add wallet label</h3>
+  <input type="hidden" id="labelAddr"><input type="hidden" id="labelChain">
+  <div class="row"><label>Kind</label><select id="labelKind"><option>manual_block</option><option>mev_bot</option><option>dex_bot</option><option>sniper</option><option>bundler</option><option>rat_trader</option><option>insider</option><option>dev</option><option>fresh_wallet</option></select></div>
+  <div class="row"><label>Disposition</label><select id="labelDisp"><option value="skip">skip</option><option value="watch">watch</option><option value="flow_only">flow_only</option><option value="score">score</option></select></div>
+  <div class="row"><label>Reason</label><input id="labelReason"></div>
+  <div class="actions"><button class="btn" onclick="closeModal('labelModal')">Cancel</button><button class="btn primary" id="btnSaveLabel">Save</button></div>
+</div></div>
+
+<!-- Blocklist modal -->
+<div class="modal" id="blModal"><div class="box">
+  <h3>Import blocklist</h3>
+  <div class="row"><label>Chain</label><select id="blChain"><option value="solana">solana</option><option value="robinhood">robinhood</option></select></div>
+  <div class="row"><label>Addresses (one per line)</label><textarea id="blText" rows="10"></textarea></div>
+  <div class="actions"><button class="btn" onclick="closeModal('blModal')">Cancel</button><button class="btn primary" id="btnSaveBlocklist">Import</button></div>
+</div></div>
+
+<div class="toast" id="toast"></div>
+<!-- Secret (write-only) modal -->
+<div class="modal" id="secretModal"><div class="box">
+  <h3 id="secretTitle">Set secret</h3>
+  <input type="hidden" id="secretName">
+  <div class="row"><label>New value (write-only — never displayed)</label><input type="password" id="secretValue" autocomplete="off" placeholder="enter new value"></div>
+  <div class="hint" style="margin-bottom:6px">Stored encrypted (AES-256-GCM). Restart service to apply.</div>
+  <div class="actions">
+    <button class="btn danger" id="btnClearSecret" style="margin-right:auto">Clear override</button>
+    <button class="btn" onclick="closeModal('secretModal')">Cancel</button>
+    <button class="btn primary" id="btnSaveSecret">Save</button>
+  </div>
+</div></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const short=a=>a&&a.length>12?a.slice(0,6)+"…"+a.slice(-4):(a||"");
+const fmtT=t=>t?new Date(t).toLocaleString():"—";
+const fmtN=n=>n==null?"—":(typeof n==="number"?n:Number(n)).toLocaleString();
+const state={walletPage:1,walletLimit:20,radar:[],wallets:[],sortKey:{},sortDir:{}};
+
+function toast(msg,err){const d=document.createElement("div");d.className="t"+(err?" err":"");d.textContent=msg;$("toast").appendChild(d);setTimeout(()=>d.remove(),3200)}
+function setConn(ok){$("connDot").className="dot"+(ok?"":" bad");$("connText").textContent=ok?"connected":"offline";
+  const p=$("statusPill");if(p){p.classList.toggle("bad",!ok);$("statusPillText").textContent=ok?"Live":"Offline";
+  const u=$("updated");if(u)u.textContent="updated "+new Date().toLocaleTimeString()}}
+async function api(url,opt){const r=await fetch(url,opt);
+  if(r.status===401&&location.pathname!=="/login"){location.href="/login";throw new Error("HTTP 401 (redirecting to login)")}
+  if(!r.ok){const t=await r.text();throw new Error("HTTP "+r.status+(t?": "+t.slice(0,200):""))}
+  return r.status===204?null:r.json()}
+function closeModal(id){$(id).classList.remove("open")}
+function openModal(id){$(id).classList.add("open")}
+
+// navigation
+document.querySelectorAll(".nav button").forEach(b=>b.addEventListener("click",()=>{
+  document.querySelectorAll(".nav button").forEach(x=>x.classList.remove("active"));b.classList.add("active");
+  document.querySelectorAll(".view").forEach(v=>v.classList.remove("active"));
+  $("view-"+b.dataset.view).classList.add("active");
+  $("viewTitle").textContent=b.textContent.trim();
+  loadView(b.dataset.view);
+}));
+$("logoutLink").addEventListener("click",async e=>{e.preventDefault();await fetch("/logout",{method:"POST"});location.href="/login"});
+
+// ---------------------------------------------------------------------------
+// tiny self-contained canvas charts (no external libs), polished rendering
+// ---------------------------------------------------------------------------
+const CHART={signals:null,radar:null};
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
+function niceCeil(v){if(v<=5)return 5;const p=Math.pow(10,Math.floor(Math.log10(v)));const f=v/p;return (f<=1?1:f<=2?2:f<=5?5:10)*p}
+function prepCanvas(c){const dpr=window.devicePixelRatio||1;const w=c.clientWidth,h=c.clientHeight;c.width=w*dpr;c.height=h*dpr;const g=c.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);return{g,w,h}}
+function noData(g,w,h,P){g.fillStyle=cssVar("--muted");g.font="12px sans-serif";g.textAlign="center";g.fillText("no data yet",(P.l+(w-P.r))/2,(P.t+(h-P.b))/2)}
+function frame(g,w,h,max){const P={l:38,r:10,t:10,b:22};g.strokeStyle=cssVar("--border");g.fillStyle=cssVar("--muted");g.font="10px sans-serif";g.textAlign="right";g.lineWidth=1;const n=4;
+  for(let i=0;i<=n;i++){const y=P.t+(h-P.t-P.b)*i/n;g.globalAlpha=.4;g.beginPath();g.moveTo(P.l,y);g.lineTo(w-P.r,y);g.stroke();g.globalAlpha=1;
+    g.fillText(Math.round(max*(n-i)/n),P.l-7,y+3)}return P}
+function hexA(hex,a){const h=hex.replace("#","");const n=parseInt(h.length===3?h.split("").map(c=>c+c).join(""):h,16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`}
+function rrect(g,x,y,w,h,r){r=Math.min(r,w/2,h);g.beginPath();g.moveTo(x,y+r);g.arcTo(x,y,x+w,y,r);g.lineTo(x+w,y+r);g.arcTo(x+w,y,x+w,y+r,r);g.lineTo(x+w,y+h);g.lineTo(x,y+h);g.closePath()}
+function smoothPath(g,pts){g.beginPath();if(pts.length<2){if(pts.length)g.arc(pts[0][0],pts[0][1],2,0,7);return}
+  g.moveTo(pts[0][0],pts[0][1]);
+  for(let i=0;i<pts.length-1;i++){const p0=pts[Math.max(0,i-1)],p1=pts[i],p2=pts[i+1],p3=pts[Math.min(pts.length-1,i+2)];
+    const c1x=p1[0]+(p2[0]-p0[0])/6,c1y=p1[1]+(p2[1]-p0[1])/6,c2x=p2[0]-(p3[0]-p1[0])/6,c2y=p2[1]-(p3[1]-p1[1])/6;
+    g.bezierCurveTo(c1x,c1y,c2x,c2y,p2[0],p2[1])}}
+function drawChart(canvas,cfg){
+  if(!canvas)return;const{g,w,h}=prepCanvas(canvas);g.clearRect(0,0,w,h);
+  const series=cfg.series||[];const labels=cfg.labels||[];
+  const max=niceCeil(Math.max(1,...series.flatMap(s=>s.data)));
+  const P=frame(g,w,h,max);const iw=w-P.l-P.r,ih=h-P.t-P.b;
+  const n=Math.max(1,labels.length);
+  if(!labels.length||series.every(s=>!s.data.some(v=>v>0))){noData(g,w,h,P);return}
+  const xAt=i=>P.l+iw*(n===1?.5:i/(n-1));
+  const yAt=v=>P.t+ih*(1-v/max);
+  if(cfg.type==="bar"){
+    const bw=Math.min(14,iw/n/series.length-3),gw=bw*series.length;
+    series.forEach((s,si)=>{for(let i=0;i<n;i++){const v=s.data[i]||0;if(v<=0)continue;
+      const cx=P.l+iw*(i+.5)/n,x=cx-gw/2+si*bw,y=yAt(v);
+      const gr=g.createLinearGradient(0,y,0,P.t+ih);gr.addColorStop(0,hexA(s.color,.95));gr.addColorStop(1,hexA(s.color,.35));
+      g.fillStyle=gr;rrect(g,x,y,bw,P.t+ih-y,3);g.fill()}});
+  }else{
+    series.forEach(s=>{
+      const pts=[];for(let i=0;i<n;i++)pts.push([xAt(i),yAt(s.data[i]||0)]);
+      if(s.fill){smoothPath(g,pts);g.lineTo(xAt(n-1),P.t+ih);g.lineTo(xAt(0),P.t+ih);g.closePath();
+        const gr=g.createLinearGradient(0,P.t,0,P.t+ih);gr.addColorStop(0,hexA(s.color,.32));gr.addColorStop(1,hexA(s.color,0));g.fillStyle=gr;g.fill()}
+      smoothPath(g,pts);g.strokeStyle=s.color;g.lineWidth=2.2;g.lineJoin="round";g.lineCap="round";g.stroke();
+      if(pts.length===1){g.fillStyle=s.color;g.beginPath();g.arc(pts[0][0],pts[0][1],3,0,7);g.fill()}
+    });
+  }
+  g.fillStyle=cssVar("--muted");g.font="10px sans-serif";g.textAlign="center";const step=Math.ceil(n/6);
+  for(let i=0;i<n;i+=step)g.fillText(labels[i]||"",cfg.type==="bar"?P.l+iw*(i+.5)/n:xAt(i),h-7);
+}
+function drawSpark(canvas,data,color){
+  if(!canvas)return;const{g,w,h}=prepCanvas(canvas);g.clearRect(0,0,w,h);
+  if(!data||!data.length)return;
+  const max=Math.max(1,...data);const pts=data.map((v,i)=>[2+(w-4)*(data.length===1?.5:i/(data.length-1)),h-4-(h-8)*(v/max)]);
+  smoothPath(g,pts);g.lineTo(pts[pts.length-1][0],h);g.lineTo(pts[0][0],h);g.closePath();
+  const gr=g.createLinearGradient(0,0,0,h);gr.addColorStop(0,hexA(color,.35));gr.addColorStop(1,hexA(color,0));g.fillStyle=gr;g.fill();
+  smoothPath(g,pts);g.strokeStyle=color;g.lineWidth=1.6;g.lineJoin="round";g.lineCap="round";g.stroke();
+}
+const fmtHour=t=>{const d=new Date(t);return d.getHours().toString().padStart(2,"0")+":00"};
+function renderSignalChart(){const c=$("chartSignals");if(!c)return;const d=CHART.signals;
+  drawChart(c,d?{type:"area",labels:d.map(r=>fmtHour(r.t)),series:[{color:"#34d399",fill:true,data:d.map(r=>r.accepted)},{color:"#f87171",fill:false,data:d.map(r=>r.rejected)}]}:{type:"area",labels:[],series:[]});
+  drawSpark($("sparkSignals"),d?d.map(r=>r.accepted):[],"#f59e0b")}
+function renderRadarChart(){const c=$("chartRadar");if(!c)return;const d=CHART.radar;
+  drawChart(c,d?{type:"bar",labels:d.map(r=>fmtHour(r.t)),series:[{color:"#22d3ee",data:d.map(r=>r.funded)},{color:"#fbbf24",data:d.map(r=>r.preparation)},{color:"#34d399",data:d.map(r=>r.deployed)}]}:{type:"bar",labels:[],series:[]})}
+window.addEventListener("resize",()=>{renderSignalChart();renderRadarChart()});
+async function loadMetrics(){
+  try{const o=await api("/api/metrics/overview");
+    $("kWallets").textContent=fmtN(o.wallets);$("kTokens").textContent=fmtN(o.tokens);$("kClusters").textContent=fmtN(o.clusters);
+    $("kSignals").textContent=fmtN(o.signals_24h);$("kRadarOpen").textContent=fmtN(o.radar_open);$("kTransfers").textContent=fmtN(o.transfers_24h);
+  }catch(e){}
+  try{CHART.signals=await api("/api/metrics/signals/timeline?hours=24");renderSignalChart()}catch(e){renderSignalChart()}
+  try{CHART.radar=await api("/api/metrics/radar/trend?hours=48");renderRadarChart()}catch(e){renderRadarChart()}
+}
+async function loadOverview(){
+  loadMetrics();
+  try{const h=await api("/api/health");setConn(true);
+    $("hLatency").textContent=(h.database_latency_ms??0).toFixed(1);
+    $("hRaw").textContent=fmtN(h.storage?.raw_events);;
+    $("hMsgs").textContent=fmtN(h.telegram?.messages_stored);
+    $("rFunded").textContent=fmtN(h.funding_radar?.funded);$("rPrep").textContent=fmtN(h.funding_radar?.preparation);
+    $("rDeployed").textContent=fmtN(h.funding_radar?.deployed);$("rDismissed").textContent=fmtN(h.funding_radar?.dismissed);
+  }catch(e){setConn(false)}
+  try{const s=await api("/api/signals?limit=8");$("ovSignals").innerHTML=s.length?s.map(x=>row(x)).join(""):`<tr><td colspan="4" class="empty">no signals</td></tr>`;
+    function row(x){return `<tr><td><span class="badge ${x.signal_kind}">${x.signal_kind}</span></td><td>${x.score}</td><td class="mono addr">${short(x.mint)}</td><td class="muted">${fmtT(x.created_at)}</td></tr>`}
+  }catch(e){}
+}
+
+// radar
+async function loadRadar(){
+  const q=$("radarQ").value;let data=await api("/api/funding/radar/cases?limit=200").catch(()=>[]);
+  if(q)data=data.filter(c=>(c.recipient||"").toLowerCase().includes(q.toLowerCase()));
+  state.radar=data;renderRadar(data);
+}
+function renderRadar(rows){
+  $("radarBody").innerHTML=rows.length?rows.map(c=>`<tr><td>${c.id}</td><td><span class="badge ${c.stage}">${c.stage}</span></td><td>${c.confidence}</td><td>${fmtN(c.first_funding_native)}</td><td class="mono addr">${short(c.recipient)}</td><td class="muted">${fmtT(c.updated_at)}</td></tr>`).join(""):`<tr><td colspan="6" class="empty">no cases</td></tr>`;
+}
+$("radarQ").addEventListener("input",()=>renderRadar(state.radar.filter(c=>(c.recipient||"").toLowerCase().includes($("radarQ").value.toLowerCase()))));
+
+// signals view
+async function loadSignals(){
+  const s=await api("/api/signals?limit=50").catch(()=>[]);
+  $("signalsBody").innerHTML=s.length?s.map(x=>`<tr><td><span class="badge ${x.signal_kind}">${x.signal_kind}</span></td><td>${x.score}</td><td class="mono addr">${short(x.mint)}</td><td class="muted">${fmtT(x.created_at)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty">no signals</td></tr>`;
+  const r=await api("/api/signals/rejections?limit=50").catch(()=>[]);
+  $("rejectionsBody").innerHTML=r.length?r.map(x=>`<tr><td class="mono">${x.rejection_code}</td><td class="mono addr">${short(x.mint)}</td><td class="muted">${fmtT(x.evaluated_at)}</td></tr>`).join(""):`<tr><td colspan="3" class="empty">no rejections</td></tr>`;
+}
+
+// wallets with pagination + search + labels
+async function loadWallets(){
+  const q=$("walletQ").value,chain=$("walletChain").value;
+  let url=`/api/wallets?chain=${chain}&limit=${state.walletLimit}`;if(q)url+=`&q=${encodeURIComponent(q)}`;
+  const data=await api(url).catch(()=>[]);state.wallets=data;
+  $("walletPage").textContent=state.walletPage;
+  $("walletsBody").innerHTML=data.length?data.map(w=>`<tr>
+    <td class="mono addr">${short(w.address)}</td>
+    <td>${w.disposition?`<span class="badge ${w.disposition}">${w.disposition}</span>`:'<span class="muted">—</span>'}</td>
+    <td class="muted">${w.source}</td><td class="muted">${fmtT(w.last_seen)}</td>
+    <td><button class="btn sm" onclick="openLabel('${chain}','${w.address}')">label</button></td></tr>`).join(""):`<tr><td colspan="5" class="empty">no wallets</td></tr>`;
+}
+$("walletQ").addEventListener("input",()=>{state.walletPage=1;loadWallets()});
+$("walletChain").addEventListener("change",()=>{state.walletPage=1;loadWallets()});
+$("walletPrev").addEventListener("click",()=>{if(state.walletPage>1){state.walletPage--;loadWallets()}});
+$("walletNext").addEventListener("click",()=>{state.walletPage++;loadWallets()});
+window.openLabel=(chain,addr)=>{$("labelChain").value=chain;$("labelAddr").value=addr;openModal("labelModal")};
+$("btnSaveLabel").addEventListener("click",async()=>{
+  try{await api(`/api/wallets/${$("labelChain").value}/${$("labelAddr").value}/labels`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kind:$("labelKind").value,disposition:$("labelDisp").value,reason:$("labelReason").value})});
+    toast("label saved");closeModal("labelModal");loadWallets();}catch(e){toast("label failed: "+e.message,true)}
+});
+$("btnImportBlocklist").addEventListener("click",()=>openModal("blModal"));
+$("btnSaveBlocklist").addEventListener("click",async()=>{
+  const addresses=$("blText").value.split("\n").map(s=>s.trim()).filter(Boolean);
+  try{const r=await api("/api/blocklist/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({chain:$("blChain").value,addresses})});
+    toast(`imported ${r.imported} addresses`);closeModal("blModal");loadWallets();}catch(e){toast("import failed: "+e.message,true)}
+});
+
+// copy to clipboard with fallback
+window.copyText=async t=>{
+  try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(t)}
+    else{const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();document.execCommand("copy");ta.remove()}
+    toast("copied")}catch(e){toast("copy failed",true)}
+};
+
+// API keys (Helius + GMGN)
+const usageFmt=(u,l)=>fmtN(u)+"/"+(l==null?"∞":fmtN(l));
+const lastCheck=k=>k.last_error?`<span style="color:var(--bad)" title="${String(k.last_error).replace(/"/g,"&quot;")}">error</span>`:(k.last_ok_at?`<span class="muted">${fmtT(k.last_ok_at)}</span>`:'<span class="muted">—</span>');
+const enPill=k=>`<span class="setpill ${k.enabled?"set":"unset"}">${k.enabled?"enabled":"disabled"}</span>`;
+async function loadApi(){
+  const [hk,gp,gk]=await Promise.all([
+    api("/api/helius-keys").catch(e=>e),
+    api("/api/gmgn-pubkeys").catch(e=>e),
+    api("/api/gmgn-keys").catch(e=>e),
+  ]);
+  // Helius
+  if(hk instanceof Error){$("apiHeliusCount").textContent="";$("apiHeliusBody").innerHTML=`<tr><td colspan="7" class="empty">failed to load (${hk.message})</td></tr>`}
+  else{
+    $("apiHeliusCount").textContent=hk.length+(hk.length===1?" key":" keys")+" · "+hk.filter(k=>k.enabled).length+" enabled";
+    $("apiHeliusBody").innerHTML=hk.length?hk.map(k=>`<tr>
+      <td>${k.name||'<span class="muted">—</span>'}</td>
+      <td class="mono muted">${k.key_preview||"—"}</td>
+      <td class="mono addr" title="${(k.rpc_url||"").replace(/"/g,"&quot;")}">${short(k.rpc_url)}</td>
+      <td>${enPill(k)}</td>
+      <td>${usageFmt(k.used_this_month,k.monthly_limit)}</td>
+      <td>${lastCheck(k)}</td>
+      <td style="text-align:right"><button class="btn sm" onclick="testHelius(${k.id})">test</button> <button class="btn sm" onclick="toggleHelius(${k.id})">${k.enabled?"disable":"enable"}</button> <button class="btn sm danger" onclick="delHelius(${k.id})">del</button></td></tr>`).join(""):`<tr><td colspan="7" class="empty">no Helius keys — add one</td></tr>`;
+  }
+  // GMGN pubkeys
+  if(gp instanceof Error){$("apiGmgnPubkeyBody").innerHTML=`<tr><td colspan="4" class="empty">failed to load (${gp.message})</td></tr>`}
+  else{
+    $("apiGmgnPubkeyBody").innerHTML=gp.length?gp.map(p=>`<tr>
+      <td class="mono addr" title="${String(p.public_key_pem||"").replace(/"/g,"&quot;")}">${short((p.public_key_pem||"").replace(/\s+/g," "))}</td>
+      <td>${p.n_keys??0}/3</td>
+      <td class="muted">${fmtT(p.created_at)}</td>
+      <td style="text-align:right"><button class="btn sm" onclick="revealPubkey(${p.id})">show</button> <button class="btn sm danger" onclick="delPubkey(${p.id})">del</button></td></tr>`).join(""):`<tr><td colspan="4" class="empty">no pubkeys — create one first</td></tr>`;
+  }
+  // GMGN keys
+  if(gk instanceof Error){$("apiGmgnCount").textContent="";$("apiGmgnBody").innerHTML=`<tr><td colspan="7" class="empty">failed to load (${gk.message})</td></tr>`}
+  else{
+    $("apiGmgnCount").textContent=gk.length+(gk.length===1?" key":" keys")+" · "+gk.filter(k=>k.enabled).length+" enabled";
+    $("apiGmgnBody").innerHTML=gk.length?gk.map(k=>`<tr>
+      <td>${k.name||'<span class="muted">—</span>'}</td>
+      <td class="mono muted">${k.key_preview||"—"}</td>
+      <td class="mono muted" title="${String(k.pubkey_pem||"").replace(/"/g,"&quot;")}">#${k.pubkey_id}</td>
+      <td>${enPill(k)}</td>
+      <td>${usageFmt(k.used_this_month,k.monthly_limit)}</td>
+      <td>${lastCheck(k)}</td>
+      <td style="text-align:right"><button class="btn sm" onclick="testGmgn(${k.id})">test</button> <button class="btn sm" onclick="toggleGmgn(${k.id})">${k.enabled?"disable":"enable"}</button> <button class="btn sm danger" onclick="delGmgn(${k.id})">del</button></td></tr>`).join(""):`<tr><td colspan="7" class="empty">no GMGN keys — add one</td></tr>`;
+  }
+  window._apiPubkeys=gp||[];
+}
+function fillPubkeySel(sel){
+  const pubs=window._apiPubkeys||[];
+  sel.innerHTML=pubs.length?pubs.map(p=>`<option value="${p.id}" ${(p.n_keys??0)>=3?"disabled":""}>pubkey #${p.id} (${p.n_keys??0}/3)</option>`).join(""):`<option value="" disabled selected>no pubkeys — create one first</option>`;
+}
+// Helius add / bulk
+$("btnApiHeliusAdd").addEventListener("click",()=>{["apiHeliusName","apiHeliusKeyOrUrl","apiHeliusLimit"].forEach(i=>$(i).value="");openModal("apiHeliusModal")});
+$("btnSaveApiHelius").addEventListener("click",async()=>{
+  const key_or_url=$("apiHeliusKeyOrUrl").value.trim();
+  if(!key_or_url){toast("enter a key or URL",true);return}
+  const body={key_or_url};if($("apiHeliusName").value.trim())body.name=$("apiHeliusName").value.trim();
+  if($("apiHeliusLimit").value!=="")body.monthly_limit=+$("apiHeliusLimit").value;
+  try{await api("/api/helius-keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    toast("key added");closeModal("apiHeliusModal");loadApi();}catch(e){toast("add failed: "+e.message,true)}
+});
+$("btnApiHeliusBulk").addEventListener("click",()=>{$("apiHeliusBulkText").value="";openModal("apiHeliusBulkModal")});
+$("btnSaveApiHeliusBulk").addEventListener("click",async()=>{
+  const lines=$("apiHeliusBulkText").value;
+  try{const r=await api("/api/helius-keys/bulk",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lines})});
+    toast(`added ${r.added}, skipped ${r.skipped_duplicates} duplicates`);
+    (r.errors||[]).forEach(e=>toast("error: "+(e.line??e),true));
+    closeModal("apiHeliusBulkModal");loadApi();}catch(e){toast("bulk import failed: "+e.message,true)}
+});
+window.toggleHelius=async id=>{try{await api(`/api/helius-keys/${id}/toggle`,{method:"POST"});loadApi()}catch(e){toast("toggle failed",true)}};
+window.delHelius=async id=>{if(!confirm("delete key?"))return;try{await api(`/api/helius-keys/${id}`,{method:"DELETE"});toast("deleted");loadApi()}catch(e){toast("delete failed",true)}};
+window.testHelius=async id=>{try{const r=await api(`/api/helius-keys/${id}/test`,{method:"POST"});
+  toast(r.ok?`ok · ${r.latency_ms}ms`:"test failed: "+(r.error||"unknown"),!r.ok);loadApi()}catch(e){toast("test failed: "+e.message,true)}};
+// GMGN pubkeys + keys
+$("btnApiGmgnNewPubkey").addEventListener("click",async()=>{
+  try{const r=await api("/api/gmgn-pubkeys",{method:"POST"});
+    $("apiPubkeyPem").value=r.public_key_pem||"";openModal("apiPubkeyModal");loadApi();}catch(e){toast("pubkey creation failed: "+e.message,true)}
+});
+$("btnCopyPubkey").addEventListener("click",()=>copyText($("apiPubkeyPem").value));
+$("btnCopyPrivPubkey").addEventListener("click",()=>copyText($("apiPubkeyPrivPem").value));
+window.revealPubkey=async id=>{
+  try{const r=await api(`/api/gmgn-pubkeys/${id}/reveal`,{method:"POST"});
+    $("apiPubkeyPrivPem").value=r.private_key_pem||"";openModal("apiPubkeyPrivModal");}catch(e){toast("reveal failed: "+e.message,true)}
+};
+window.delPubkey=async id=>{
+  if(!confirm("delete pubkey? keys bound to it must be removed first"))return;
+  try{await api(`/api/gmgn-pubkeys/${id}`,{method:"DELETE"});toast("pubkey deleted");loadApi()}catch(e){toast(e.message,true)}
+};
+$("btnApiGmgnAdd").addEventListener("click",()=>{["apiGmgnName","apiGmgnApiKey","apiGmgnLimit"].forEach(i=>$(i).value="");fillPubkeySel($("apiGmgnPubkeySel"));openModal("apiGmgnModal")});
+$("btnSaveApiGmgn").addEventListener("click",async()=>{
+  const api_key=$("apiGmgnApiKey").value.trim(),pubkey_id=+$("apiGmgnPubkeySel").value;
+  if(!api_key){toast("enter an API key",true);return}
+  if(!pubkey_id){toast("select a pubkey",true);return}
+  const body={api_key,pubkey_id};if($("apiGmgnName").value.trim())body.name=$("apiGmgnName").value.trim();
+  if($("apiGmgnLimit").value!=="")body.monthly_limit=+$("apiGmgnLimit").value;
+  try{await api("/api/gmgn-keys",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    toast("key added");closeModal("apiGmgnModal");loadApi();}catch(e){toast("add failed: "+e.message,true)}
+});
+$("btnApiGmgnBulk").addEventListener("click",()=>{$("apiGmgnBulkText").value="";fillPubkeySel($("apiGmgnBulkPubkeySel"));openModal("apiGmgnBulkModal")});
+$("btnSaveApiGmgnBulk").addEventListener("click",async()=>{
+  const lines=$("apiGmgnBulkText").value,pubkey_id=+$("apiGmgnBulkPubkeySel").value;
+  if(!pubkey_id){toast("select a pubkey",true);return}
+  try{const r=await api("/api/gmgn-keys/bulk",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({lines,pubkey_id})});
+    toast(`added ${r.added}, skipped ${r.skipped_duplicates} duplicates`);
+    (r.errors||[]).forEach(e=>toast("error: "+(e.line??e),true));
+    closeModal("apiGmgnBulkModal");loadApi();}catch(e){toast("bulk import failed: "+e.message,true)}
+});
+window.toggleGmgn=async id=>{try{await api(`/api/gmgn-keys/${id}/toggle`,{method:"POST"});loadApi()}catch(e){toast("toggle failed",true)}};
+window.delGmgn=async id=>{if(!confirm("delete key?"))return;try{await api(`/api/gmgn-keys/${id}`,{method:"DELETE"});toast("deleted");loadApi()}catch(e){toast("delete failed",true)}};
+window.testGmgn=async id=>{try{const r=await api(`/api/gmgn-keys/${id}/test`,{method:"POST"});
+  toast(r.ok?"ok":"test failed: "+(r.error||"unknown"),!r.ok);loadApi()}catch(e){toast("test failed: "+e.message,true)}};
+
+// telegram channels CRUD
+async function loadTelegram(){
+  const data=await api("/api/telegram/channels").catch(()=>[]);
+  $("channelsBody").innerHTML=data.length?data.map(c=>`<tr>
+    <td class="mono">${c.channel_key}</td><td><span class="badge ${c.status}">${c.status}</span></td>
+    <td>${c.allowlisted?"yes":"no"}</td><td class="muted">${fmtT(c.last_observed_at)}</td>
+    <td><button class="btn sm danger" onclick="removeChannel('${c.channel_key}')">remove</button></td></tr>`).join(""):`<tr><td colspan="5" class="empty">no channels</td></tr>`;
+}
+$("btnAddChannel").addEventListener("click",()=>{const k=$("tgQ").value.trim();if(k){$("tgKey").value=k;}openModal("tgModal")});
+$("btnSaveChannel").addEventListener("click",async()=>{
+  try{await api("/api/telegram/channels",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({channel_key:$("tgKey").value.trim(),title:$("tgTitle").value||null})});
+    toast("channel added (no auto-join)");closeModal("tgModal");loadTelegram();}catch(e){toast("add failed: "+e.message,true)}
+});
+$("btnBulkChannel").addEventListener("click",()=>{$("tgBulkText").value="";openModal("tgBulkModal")});
+$("btnSaveChannelBulk").addEventListener("click",async()=>{
+  const channels=$("tgBulkText").value.split("\n").map(s=>s.trim()).filter(s=>s&&!s.startsWith("#"));
+  try{const r=await api("/api/telegram/channels/bulk",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({channels})});
+    toast(`imported ${r.imported} channels`);closeModal("tgBulkModal");loadTelegram();}catch(e){toast("bulk import failed: "+e.message,true)}
+});
+window.removeChannel=async key=>{if(!confirm("remove channel from allowlist? history retained."))return;try{await api(`/api/telegram/channels/${key}`,{method:"DELETE"});toast("removed");loadTelegram()}catch(e){toast("remove failed",true)}};
+
+// clusters
+async function loadClusters(){
+  const data=await api("/api/clusters").catch(()=>[]);
+  $("clustersBody").innerHTML=data.length?data.map(c=>`<tr><td>#${c.cluster_id}</td><td>${c.member_count}</td></tr>`).join(""):`<tr><td colspan="2" class="empty">no clusters</td></tr>`;
+}
+
+// settings
+const EDITABLE=["large_funding_min_sol","large_funding_min_usd","recipient_max_age_days","preparation_alert_confidence","entry_min_liquidity_usd","full_skill_score","full_copyability_score","telegram_concurrency","runtime_profile"];
+const LOCK='<svg class="lockic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+async function loadSettings(){
+  try{const raw=await api("/api/settings/env");
+    const SKIP_ENV=n=>n==="HELIUS_KEYS"||n==="GMGN_KEYS"||n==="GMGN_API_KEY"||n==="ROBINHOOD_RPC_URL"||/^HELIUS_KEY_/.test(n);
+    const rows=raw.filter(r=>!SKIP_ENV(r.name));
+    $("envBody").innerHTML=rows.length?rows.map(r=>{
+      const src=r.source?`<span class="srcpill ${r.source}">${r.source}</span>`:'<span class="muted">—</span>';
+      const setBtn=r.secret&&r.editable===true?`<button class="btn sm" onclick="openSecret('${r.name}',${r.source==="db"})">set</button>`:"";
+      return `<tr>
+      <td style="width:26px">${r.secret?LOCK:""}</td>
+      <td class="mono">${r.name}</td>
+      <td><span class="setpill ${r.set?"set":"unset"}">${r.set?"set":"not set"}</span></td>
+      <td class="mono muted">${r.preview||"—"}</td>
+      <td>${src}</td>
+      <td style="text-align:right">${setBtn}</td></tr>`}).join(""):`<tr><td colspan="6" class="empty">no env vars</td></tr>`;
+  }catch(e){$("envBody").innerHTML=`<tr><td colspan="6" class="empty">failed to load (${e.message})</td></tr>`}
+  try{const rt=await api("/api/settings/runtime");
+    EDITABLE.forEach(k=>{const el=$("s_"+k);if(el&&rt[k]!=null)el.value=rt[k]});
+  }catch(e){}
+}
+$("btnSaveSettings").addEventListener("click",async()=>{
+  const settings={};
+  for(const k of EDITABLE){const el=$("s_"+k);if(!el)continue;
+    settings[k]=(k==="runtime_profile")?el.value:Number(el.value)}
+  try{const r=await api("/api/settings/runtime",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({settings})});
+    toast(`saved ${r.applied} settings`);loadSettings()}catch(e){toast("save failed: "+e.message,true)}
+});
+
+// secret editor (write-only)
+window.openSecret=(name,isDb)=>{
+  $("secretName").value=name;$("secretValue").value="";$("secretTitle").textContent="Set "+name;
+  $("btnClearSecret").style.display=isDb?"":"none";
+  openModal("secretModal");
+};
+$("btnSaveSecret").addEventListener("click",async()=>{
+  const name=$("secretName").value,value=$("secretValue").value;
+  if(!value){toast("enter a value",true);return}
+  try{await api("/api/settings/secrets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,value})});
+    toast("secret set");closeModal("secretModal");loadSettings()}catch(e){toast("save failed: "+e.message,true)}
+});
+$("btnClearSecret").addEventListener("click",async()=>{
+  const name=$("secretName").value;if(!name)return;
+  try{await api(`/api/settings/secrets/${encodeURIComponent(name)}`,{method:"DELETE"});
+    toast("override cleared");closeModal("secretModal");loadSettings()}catch(e){toast("clear failed: "+e.message,true)}
+});
+
+// X tracker (KOL + Smart Money trades via GMGN)
+const gmgnErr=e=>/503|no GMGN keys/i.test(e.message||"");
+const GMGN_EMPTY=cols=>`<tr><td colspan="${cols}" class="empty">No GMGN keys configured — add one in the API Keys page.</td></tr>`;
+const xLink=u=>u?`<a href="https://x.com/${encodeURIComponent(u)}" target="_blank" rel="noopener">@${u}</a>`:'<span class="muted">—</span>';
+const fmtUsd=n=>n==null?"—":"$"+fmtN(Math.round(Number(n)));
+const fmtAge=t=>{if(!t)return"—";const s=Math.max(0,Date.now()/1000-Number(t));if(s<3600)return Math.floor(s/60)+"m";if(s<86400)return Math.floor(s/3600)+"h";return Math.floor(s/86400)+"d"};
+async function loadXtrack(){
+  const [feed,lead]=await Promise.all([
+    api("/api/track/x/feed?limit=50").catch(e=>e),
+    api("/api/track/x/leaderboard?limit=25").catch(e=>e),
+  ]);
+  if(feed instanceof Error){$("xFeedBody").innerHTML=gmgnErr(feed)?GMGN_EMPTY(7):`<tr><td colspan="7" class="empty">failed to load (${feed.message})</td></tr>`}
+  else{
+    $("xFeedBody").innerHTML=feed.length?feed.map(r=>`<tr>
+      <td class="muted">${fmtT(r.timestamp*1000)}</td>
+      <td class="mono addr" title="${r.maker||""}">${short(r.maker)}</td>
+      <td><span class="setpill ${r.wallet_tag==="kol"?"unset":"set"}">${r.wallet_tag||"—"}</span></td>
+      <td>${xLink(r.twitter_username)}</td>
+      <td class="mono" title="${r.base_address||""}">${r.base_token?.symbol||short(r.base_address)}</td>
+      <td style="color:${r.side==="buy"?"var(--good)":"var(--bad)"}">${r.side||"—"}</td>
+      <td>${fmtUsd(r.amount_usd)}</td></tr>`).join(""):`<tr><td colspan="7" class="empty">no trades yet</td></tr>`;
+  }
+  if(lead instanceof Error){$("xLeadBody").innerHTML=gmgnErr(lead)?GMGN_EMPTY(8):`<tr><td colspan="8" class="empty">failed to load (${lead.message})</td></tr>`}
+  else{
+    $("xLeadBody").innerHTML=lead.length?lead.map((r,i)=>`<tr>
+      <td class="muted">${i+1}</td>
+      <td>${xLink(r.twitter_username)}</td>
+      <td>${r.twitter_name||'<span class="muted">—</span>'}</td>
+      <td>${fmtN(r.n_trades)}</td>
+      <td>${fmtUsd(r.total_usd)}</td>
+      <td title="${(r.wallets||[]).join(", ").replace(/"/g,"&quot;")}">${(r.wallets||[]).length}</td>
+      <td>${r.followers_count!=null?fmtN(r.followers_count):'<span class="muted">—</span>'}</td>
+      <td>${r.is_blue_verified?'<span style="color:var(--cyan)">✓</span>':""}</td></tr>`).join(""):`<tr><td colspan="8" class="empty">no leaderboard data</td></tr>`;
+  }
+}
+// TG tracker (GMGN trenches hot tokens)
+async function loadTgtrack(){
+  const hot=await api("/api/track/tg/hot?limit=25").catch(e=>e);
+  if(hot instanceof Error){$("tgHotBody").innerHTML=gmgnErr(hot)?GMGN_EMPTY(7):`<tr><td colspan="7" class="empty">failed to load (${hot.message})</td></tr>`;return}
+  $("tgHotBody").innerHTML=hot.length?hot.map(r=>{
+    const socials=[r.twitter?`<a href="${r.twitter.startsWith("http")?r.twitter:"https://x.com/"+encodeURIComponent(r.twitter)}" target="_blank" rel="noopener" title="X / Twitter">𝕏</a>`:"",
+      r.telegram?`<a href="${r.telegram.startsWith("http")?r.telegram:"https://t.me/"+encodeURIComponent(r.telegram)}" target="_blank" rel="noopener" title="Telegram">TG</a>`:""].filter(Boolean).join(" ");
+    return `<tr>
+      <td class="mono" title="${r.token_address||""}">${r.symbol||""} <span class="muted">${short(r.token_address)}</span></td>
+      <td${(r.tg_call_count||0)>=10?' style="font-weight:700"':""}>${fmtN(r.tg_call_count)}</td>
+      <td>${r.x_user_follower!=null?fmtN(r.x_user_follower):'<span class="muted">—</span>'}</td>
+      <td>${socials||'<span class="muted">—</span>'}</td>
+      <td>${fmtUsd(r.liquidity)}</td>
+      <td>${fmtUsd(r.mcap)}</td>
+      <td class="muted">${fmtAge(r.created_at)}</td></tr>`;
+  }).join(""):`<tr><td colspan="7" class="empty">no hot tokens</td></tr>`;
+}
+
+// Smart wallets (smart-money / KOL copy candidates)
+const swGroupChip=g=>{
+  const parts=[];
+  if(g.min_win_rate!=null)parts.push("≥"+Math.round(Number(g.min_win_rate)*100)+"%");
+  if(g.min_realized_pnl_usd!=null)parts.push("≥$"+fmtN(g.min_realized_pnl_usd));
+  if(g.min_trades!=null)parts.push("≥"+fmtN(g.min_trades)+" trades");
+  if(g.stats_period)parts.push(String(g.stats_period));
+  if(g.min_followers!=null)parts.push("≥"+fmtN(g.min_followers)+" followers");
+  if(g.require_blue_verified)parts.push("verified only");
+  return `<button class="btn sm" onclick="setSwGroup('${String(g.name).replace(/'/g,"\\'")}')" title="${parts.join(" · ").replace(/"/g,"&quot;")}"><b>${g.name}</b>${parts.length?` <span class="muted">${parts.join(" · ")}</span>`:""} <span class="setpill set" style="margin-left:4px">${g.n_wallets??0}</span></button>`;
+};
+window.setSwGroup=name=>{$("swGroup").value=name;loadSmartWallets()};
+async function loadSmartWallets(){
+  const st=$("swStatus").value,grp=$("swGroup").value;
+  const url="/api/smart-wallets?limit=50"+(st?`&status=${encodeURIComponent(st)}`:"")+(grp?`&group=${encodeURIComponent(grp)}`:"");
+  const [rows,groups]=await Promise.all([
+    api(url).catch(e=>e),
+    api("/api/smart-wallets/groups").catch(e=>e),
+  ]);
+  // groups chips + select (tolerate groups failure)
+  const gl=groups instanceof Error?[]:groups;
+  $("swGroups").innerHTML=groups instanceof Error
+    ?`<span class="muted" style="font-size:12px">groups unavailable (${groups.message})</span>`
+    :(gl.length?gl.map(swGroupChip).join(""):'<span class="muted" style="font-size:12px">no groups configured</span>');
+  const sel=$("swGroup"),cur=sel.value;
+  sel.innerHTML='<option value="">All groups</option>'+gl.map(g=>`<option value="${String(g.name).replace(/"/g,"&quot;")}">${g.name}</option>`).join("");
+  sel.value=gl.some(g=>g.name===cur)?cur:"";
+  // leaderboard rows
+  if(rows instanceof Error){$("swBody").innerHTML=`<tr><td colspan="12" class="empty">failed to load (${rows.message})</td></tr>`;$("swCount").textContent="";return}
+  $("swCount").textContent=rows.length+(rows.length===1?" wallet":" wallets");
+  $("swBody").innerHTML=rows.length?rows.map(w=>{
+    const pnl=w.realized_pnl==null?'<span class="muted">—</span>':`<span style="color:${Number(w.realized_pnl)>=0?"var(--good)":"var(--bad)"}">${fmtUsd(w.realized_pnl)}</span>`;
+    const wr=w.win_rate==null?'<span class="muted">—</span>':(Number(w.win_rate)*100).toFixed(1)+"%";
+    const statusPill=`<span class="setpill ${w.status==="tracked"?"set":"unset"}" ${w.status==="dismissed"?'style="opacity:.55"':""}>${w.status}</span>`;
+    return `<tr>
+    <td class="mono addr" title="${w.address}">${short(w.address)}</td>
+    <td><span class="setpill ${w.source==="smartmoney"?"set":"unset"}">${w.source}</span></td>
+    <td>${w.group_name?`<span class="setpill set">${w.group_name}</span>`:'<span class="muted">—</span>'}</td>
+    <td>${xLink(w.twitter_username)}</td>
+    <td>${w.followers_count!=null?fmtN(w.followers_count):'<span class="muted">—</span>'}</td>
+    <td>${wr}</td>
+    <td>${pnl}</td>
+    <td>${fmtN(w.n_trades)}</td>
+    <td>${fmtUsd(w.total_usd)}</td>
+    <td>${statusPill}</td>
+    <td class="muted">${fmtT(w.last_seen_at)}</td>
+    <td style="text-align:right"><button class="btn sm" onclick="enrichSw('${w.address}')">enrich</button> <button class="btn sm" onclick="trackSw('${w.address}',${w.tracked?"false":"true"})">${w.tracked?"untrack":"track"}</button> <button class="btn sm" onclick="showSwTrades('${w.address}')">trades</button>${w.status!=="dismissed"?` <button class="btn sm danger" onclick="dismissSw('${w.address}')">dismiss</button>`:""}</td></tr>`;
+  }).join(""):`<tr><td colspan="12" class="empty">no smart wallets discovered yet</td></tr>`;
+}
+$("swGroup").addEventListener("change",()=>loadSmartWallets());
+$("swStatus").addEventListener("change",()=>loadSmartWallets());
+$("btnSwRefresh").addEventListener("click",()=>loadSmartWallets());
+window.enrichSw=async address=>{
+  try{await api(`/api/smart-wallets/${address}/enrich`,{method:"POST"});toast("enrich queued")}catch(e){toast("enrich failed: "+e.message,true)}
+};
+$("btnSwEnrichAddr").addEventListener("click",async()=>{
+  const a=$("swManualAddr").value.trim();
+  if(!a){toast("enter a wallet address",true);return}
+  try{const r=await api(`/api/smart-wallets/${a}/enrich`,{method:"POST"});
+    toast("enrich queued"+(r&&r.existed===false?" (new wallet)":""));
+    $("swManualAddr").value="";setTimeout(()=>loadSmartWallets(),1500);}catch(e){toast("enrich failed: "+e.message,true)}
+});
+$("btnSwEnrichAll").addEventListener("click",async()=>{
+  if(!confirm("queue enrichment for ALL wallets? this uses GMGN rate budget"))return;
+  try{const r=await api("/api/smart-wallets/enrich-all",{method:"POST"});
+    toast(`queued ${r.queued} wallets for enrichment`);}catch(e){toast("enrich-all failed: "+e.message,true)}
+});
+window.trackSw=async(address,tracked)=>{
+  try{await api(`/api/smart-wallets/${address}/track`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tracked})});
+    toast(tracked?"wallet tracked":"wallet untracked");loadSmartWallets();}catch(e){toast("track failed: "+e.message,true)}
+};
+window.dismissSw=async address=>{
+  if(!confirm("dismiss wallet? it will be hidden from candidates"))return;
+  try{await api(`/api/smart-wallets/${address}/dismiss`,{method:"POST"});
+    toast("wallet dismissed");loadSmartWallets();}catch(e){toast("dismiss failed: "+e.message,true)}
+};
+window.showSwTrades=async address=>{
+  $("swTradesTitle").textContent="Recent trades — "+short(address);
+  $("swTradesBody").innerHTML=`<tr><td colspan="5" class="empty">loading…</td></tr>`;
+  openModal("swTradesModal");
+  const rows=await api(`/api/smart-wallets/${address}/trades?limit=50`).catch(e=>e);
+  if(rows instanceof Error){$("swTradesBody").innerHTML=`<tr><td colspan="5" class="empty">failed to load (${rows.message})</td></tr>`;return}
+  $("swTradesBody").innerHTML=rows.length?rows.map(t=>`<tr>
+    <td class="muted">${fmtT(t.trade_ts)}</td>
+    <td class="mono" title="${t.mint||""}">${t.symbol||short(t.mint)}</td>
+    <td style="color:${t.side==="buy"?"var(--good)":"var(--bad)"}">${t.side||"—"}</td>
+    <td>${fmtUsd(t.amount_usd)}</td>
+    <td><span class="setpill ${t.source==="smartmoney"?"set":"unset"}">${t.source||"—"}</span></td></tr>`).join(""):`<tr><td colspan="5" class="empty">no trades recorded</td></tr>`;
+};
+
+function loadView(v){({overview:loadOverview,radar:loadRadar,signals:loadSignals,wallets:loadWallets,smartwallets:loadSmartWallets,api:loadApi,xtrack:loadXtrack,tgtrack:loadTgtrack,telegram:loadTelegram,clusters:loadClusters,settings:loadSettings})[v]?.()}
+loadOverview();setInterval(()=>{const v=document.querySelector(".nav button.active").dataset.view;loadView(v)},30000);
+</script>
+</body>
+</html>

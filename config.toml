@@ -1,0 +1,122 @@
+# Solana Whale Intelligence runtime configuration.
+# Runtime profile: "low" (2 vCPU / 4 GB) or "scale" (8 vCPU / 16 GB app workers).
+runtime_profile = "low"
+
+[chains.solana]
+enabled = true
+
+[chains.robinhood]
+enabled = true
+# All Robinhood values are configurable; none are hard-coded network facts.
+# eth_chainId is validated at startup against robinhood_chain_id.
+chain_id = ""              # hex string WITHOUT 0x, e.g. "1a2b3c" (empty => adapter disabled until configured)
+# Helius multi-chain path slug; EVM endpoint derives from [helius].base_url as
+# "{base_url}/v1/{helius_slug}/?api-key=HELIUS_KEY_1" (no separate RPC env var).
+helius_slug = "robinhood"
+native_symbol = ""         # e.g. "ETH"-style native asset symbol when known
+native_decimals = 18
+explorer_url = ""
+start_block = 0
+
+[helius]
+# Free plan per-key defaults per API class. Adjust to your documented plan limits.
+# Shared multi-chain base URL. Solana JSON-RPC/WS and every EVM chain endpoint
+# are derived from it; the default matches the previous hardcoded behavior.
+# base_url = "https://mainnet.helius-rpc.com"
+rpc_rate_per_second = 10
+enhanced_rate_per_second = 2
+wallet_rate_per_second = 2
+max_retries = 3
+timeout_seconds = 30
+
+[gmgn]
+base_url = "https://openapi.gmgn.ai"
+# Weighted token bucket: capacity 20, refill 20/s unless documented otherwise.
+bucket_capacity = 20
+bucket_refill_per_second = 20
+timeout_seconds = 30
+enabled_routes = ["trenches", "trending", "signal", "smartmoney", "kol", "info", "security", "pool", "holders", "traders", "stats", "profits", "activity", "created_tokens"]
+# Smart Wallets track (separate from Funding Radar): config-driven promotion
+# GROUPS based on GMGN /v1/user/wallet_stats (30d). A wallet is assigned the
+# FIRST (strictest) group whose thresholds it fully meets -> status tracked.
+# No matching group -> stays candidate; dismiss_after_fails consecutive failed
+# enriches -> dismissed. Manually pinned wallets (tracked=true) are never
+# auto-demoted/dismissed.
+[smart_wallet]
+poll_interval_seconds = 60   # smartmoney/kol trade feed poll interval
+enrich_batch = 10            # max wallets enriched per 15-min cycle
+dismiss_after_fails = 3      # consecutive failed enriches before dismiss
+
+# ORDER = priority, strictest first. Per-group custom rules (all optional):
+# stats_period ("7d"/"30d"), min_followers, require_blue_verified,
+# min_avg_trade_usd. A required-but-missing stat field => criterion NOT met.
+[[smart_wallet.groups]]
+name = "elite"
+min_win_rate = 0.7           # win rate (0-1) over stats_period
+min_realized_pnl_usd = 100000  # realized profit (USD) over stats_period
+min_trades = 50              # trade count (buys+sells) over stats_period
+stats_period = "30d"         # wallet_stats period for this group
+min_followers = 10000        # require Twitter followers >= N
+require_blue_verified = false
+# min_avg_trade_usd = 500    # optional: require avg trade size >= N USD
+
+[[smart_wallet.groups]]
+name = "solid"
+min_win_rate = 0.5
+min_realized_pnl_usd = 10000
+min_trades = 10
+
+[[smart_wallet.groups]]
+name = "watch"
+min_win_rate = 0.4
+min_realized_pnl_usd = 1000
+min_trades = 5
+
+[telegram]
+enabled = true
+# Allowlist of public channel usernames. No auto-join; channel must be public/resolvable.
+allowlist = []
+# Global history-fetch concurrency (low profile: 4, scale profile: 32)
+concurrency = 4
+backfill_limit_per_channel = 1000
+
+[funding_radar]
+large_funding_min_sol = 100
+large_funding_min_usd = 10000
+percentile_floor_sol = 10
+percentile = 0.99
+recipient_max_age_days = 7
+preparation_window_days = 7
+fanout_threshold = 3
+preparation_evidence_required = 2
+preparation_alert_confidence = 70
+
+[scoring]
+min_meaningful_trades = 20
+min_tokens_traded = 5
+full_skill_score = 70
+full_copyability_score = 60
+history_completeness_floor = 0.80
+conviction_cap_below_completeness = 49
+
+[signals]
+entry_max_token_age_hours = 24
+entry_min_liquidity_usd = 20000
+market_max_age_seconds = 300
+exit_liquidity_drop_ratio = 0.30
+
+[narrative]
+gmgn_only_confidence_cap = 49
+
+[retention]
+raw_events_days_low = 14
+raw_events_days_scale = 90
+
+[queues]
+# Fixed precedence, highest first. Pause from the bottom upward under pressure.
+precedence = ["live_watch", "funding_radar", "telegram_ingest", "seed_sync", "historical_backfill"]
+historical_backfill_pause_lag_seconds = 60
+
+[server]
+webhook_bind = "127.0.0.1:8787"
+webhook_auth_token = ""

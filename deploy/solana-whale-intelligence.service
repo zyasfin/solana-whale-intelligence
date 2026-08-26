@@ -1,0 +1,33 @@
+[Unit]
+Description=Solana Whale Intelligence - on-chain intelligence service
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=solana-intel
+Group=solana-intel
+WorkingDirectory=/opt/solana-whale-intelligence
+# Optional env file ('-' prefix = start even if missing).
+# Edit /etc/solana-whale-intelligence.env to provide DATABASE_URL, API keys, etc.
+EnvironmentFile=-/etc/solana-whale-intelligence.env
+
+# Main daemon (default). Only ONE ExecStart may be active for Type=simple.
+ExecStart=/opt/solana-whale-intelligence/solana-whale-intelligence run
+
+# Admin panel variant: comment out the ExecStart above, uncomment the one
+# below, then run `systemctl daemon-reload && systemctl restart solana-whale-intelligence`.
+# Prefer binding to a Tailscale IP instead of 0.0.0.0 (see deploy/README.md).
+# ExecStart=/opt/solana-whale-intelligence/solana-whale-intelligence watch serve-admin --bind 0.0.0.0:8789
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/solana-whale-intelligence
+
+[Install]
+WantedBy=multi-user.target
