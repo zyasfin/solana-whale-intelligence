@@ -110,7 +110,15 @@ input::placeholder,textarea::placeholder{color:var(--muted)}
 .view.active{display:block;animation:viewin .3s cubic-bezier(.2,.7,.3,1)}
 @keyframes viewin{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
-.grid{display:grid;gap:18px;grid-template-columns:repeat(12,1fr)}
+/* ============ View header ============ */
+.view-head{margin-bottom:24px;padding-bottom:18px;border-bottom:1px solid var(--border);position:relative}
+.view-head::before{content:"";position:absolute;left:0;bottom:-1px;width:64px;height:3px;border-radius:3px;
+  background:var(--grad);box-shadow:0 0 14px rgba(20,241,149,.55)}
+.view-head h2{margin:0 0 8px;font-size:28px;letter-spacing:-.7px;font-weight:900;line-height:1.1;
+  background:linear-gradient(90deg,#fff,#b8ffe2 60%,#14f195);-webkit-background-clip:text;background-clip:text;color:transparent}
+.view-head p{margin:0;color:var(--muted);font-size:12.5px;line-height:1.55;max-width:640px}
+
+.grid{display:grid;gap:20px;grid-template-columns:repeat(12,1fr)}
 .span4{grid-column:span 4}.span6{grid-column:span 6}.span8{grid-column:span 8}.span12{grid-column:span 12}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:20px;backdrop-filter:blur(8px);
   box-shadow:0 2px 12px rgba(0,0,0,.25),inset 0 1px 0 rgba(255,255,255,.02);
@@ -137,7 +145,7 @@ input::placeholder,textarea::placeholder{color:var(--muted)}
 .hero > *{position:relative;z-index:1}
 
 /* ============ KPI cards ============ */
-.kpi{grid-column:span 2;position:relative;overflow:hidden;padding:18px 18px 16px;display:flex;flex-direction:column;gap:9px}
+.kpi{grid-column:span 2;position:relative;overflow:hidden;padding:20px 20px 18px;display:flex;flex-direction:column;gap:10px}
 .kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--kpi-accent,var(--grad))}
 .kpi::after{content:"";position:absolute;right:-34px;top:-34px;width:110px;height:110px;border-radius:50%;
   background:radial-gradient(circle,var(--kpi-glow,rgba(20,241,149,.16)),transparent 70%);opacity:0;transition:opacity .2s}
@@ -301,6 +309,7 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
             <h2>Solana Whale Intelligence</h2>
             <p>Real-time funding radar, signal evaluation &amp; wallet clustering across your tracked universe.</p>
           </div>
+        </div>
         <div class="card kpi" style="--kpi-accent:linear-gradient(180deg,#14f195,#00ffa3);--kpi-glow:rgba(20,241,149,.4)">
           <div class="kpi-top"><div class="kpi-label">Wallets</div><div class="kpi-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M16 12h3"/></svg></div></div>
           <div class="kpi-num" id="kWallets">—</div><div class="kpi-delta" id="kWalletsD">tracked addresses</div>
@@ -359,6 +368,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- RADAR -->
     <section class="view" id="view-radar">
+      <div class="view-head">
+        <h2>Funding Radar</h2>
+        <p>Track funded → preparation → deployed lifecycle</p>
+      </div>
       <div class="card">
         <div class="toolbar"><input type="search" id="radarQ" placeholder="search recipient…"></div>
         <div class="tablewrap"><table id="radarTable">
@@ -369,6 +382,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- SIGNALS -->
     <section class="view" id="view-signals">
+      <div class="view-head">
+        <h2>Signals</h2>
+        <p>Entry/exit gates and rejection codes</p>
+      </div>
       <div class="grid">
         <div class="card span6"><h3>Signals</h3>
           <div class="tablewrap"><table><thead><tr><th>Kind</th><th>Score</th><th>Mint</th><th>Created</th></tr></thead>
@@ -383,6 +400,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- WALLETS -->
     <section class="view" id="view-wallets">
+      <div class="view-head">
+        <h2>Wallets</h2>
+        <p>Tracked addresses across chains</p>
+      </div>
       <div class="card">
         <div class="toolbar">
           <input type="search" id="walletQ" placeholder="search address…">
@@ -398,6 +419,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- SMART WALLETS -->
     <section class="view" id="view-smartwallets">
+      <div class="view-head">
+        <h2>Smart Wallets</h2>
+        <p>GMGN smart-money &amp; KOL wallets</p>
+      </div>
       <div class="card" style="margin-bottom:16px">
         <h3>Groups</h3>
         <div id="swGroups" style="display:flex;gap:9px;flex-wrap:wrap;align-items:center"></div>
@@ -426,6 +451,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- API KEYS -->
     <section class="view" id="view-api">
+      <div class="view-head">
+        <h2>API Keys</h2>
+        <p>Helius &amp; GMGN provider credentials</p>
+      </div>
       <div class="grid">
         <!-- Helius keys -->
         <div class="card span12">
@@ -465,6 +494,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- X TRACKER -->
     <section class="view" id="view-xtrack">
+      <div class="view-head">
+        <h2>X Tracker</h2>
+        <p>KOL &amp; smart-money trade feed</p>
+      </div>
       <div class="grid">
         <div class="card span12">
           <h3>KOL &amp; Smart Money trades</h3>
@@ -484,6 +517,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- TG TRACKER -->
     <section class="view" id="view-tgtrack">
+      <div class="view-head">
+        <h2>TG Tracker</h2>
+        <p>Telegram call heat from GMGN trenches</p>
+      </div>
       <div class="grid">
         <div class="card span12">
           <h3>Telegram call heat (GMGN trenches)</h3>
@@ -497,6 +534,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- TELEGRAM -->
     <section class="view" id="view-telegram">
+      <div class="view-head">
+        <h2>Telegram</h2>
+        <p>Ingested channels</p>
+      </div>
       <div class="card">
         <div class="toolbar">
           <input type="search" id="tgQ" placeholder="channel key…" style="width:220px">
@@ -510,6 +551,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
 
     <!-- CLUSTERS -->
     <section class="view" id="view-clusters">
+      <div class="view-head">
+        <h2>Clusters</h2>
+        <p>Soft wallet clusters</p>
+      </div>
       <div class="card">
         <div class="tablewrap"><table><thead><tr><th>Cluster</th><th>Members</th></tr></thead>
         <tbody id="clustersBody"></tbody></table></div>
@@ -517,6 +562,10 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
     </section>
     <!-- SETTINGS -->
     <section class="view" id="view-settings">
+      <div class="view-head">
+        <h2>Settings</h2>
+        <p>Environment &amp; runtime configuration</p>
+      </div>
       <div class="grid">
         <div class="card span12">
           <h3>Environment (read-only)</h3>
