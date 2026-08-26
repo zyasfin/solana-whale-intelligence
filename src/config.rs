@@ -1,7 +1,7 @@
 #![allow(dead_code)]  // profile/chain fields are consumed by runtime workers
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Runtime capacity profile.
@@ -505,7 +505,7 @@ pub struct ServerConfig {
 
 /// One promotion tier. ORDER = priority: the enrich loop assigns the FIRST
 /// (strictest) group whose thresholds a wallet fully meets.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SmartWalletGroup {
     pub name: String,
     /// Minimum win rate (0-1) over `stats_period`.
@@ -740,6 +740,40 @@ impl SmartWalletConfig {
         }
         periods
     }
+}
+
+/// Parse and validate a JSON array of smart-wallet promotion groups (as stored
+/// in `admin_settings` under `smart_wallet_groups`). Returns a clear error
+/// message on any invalid entry so the admin endpoint can surface it verbatim.
+///
+/// An empty array is a valid input (meaning "revert to config.toml"), but the
+/// caller is expected to treat it as a delete signal rather than persist it.
+pub fn parse_smart_wallet_groups(value: &serde_json::Value) -> Result<Vec<SmartWalletGroup>, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "smart_wallet_groups must be a JSON array".to_string())?;
+    let mut groups = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let group: SmartWalletGroup = serde_json::from_value(item.clone())
+            .map_err(|e| format!("group[{i}]: {e}"))?;
+        if group.name.trim().is_empty() {
+            return Err(format!("group[{i}]: 'name' must be non-empty"));
+        }
+        if !(0.0..=1.0).contains(&group.min_win_rate) {
+            return Err(format!(
+                "group[{i}] ({:?}): 'min_win_rate' must be between 0 and 1",
+                group.name
+            ));
+        }
+        if group.stats_period.trim().is_empty() {
+            return Err(format!(
+                "group[{i}] ({:?}): 'stats_period' must be non-empty",
+                group.name
+            ));
+        }
+        groups.push(group);
+    }
+    Ok(groups)
 }
 
 #[derive(Clone, Debug, Deserialize)]

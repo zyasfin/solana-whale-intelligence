@@ -424,7 +424,8 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
         <p>GMGN smart-money &amp; KOL wallets</p>
       </div>
       <div class="card" style="margin-bottom:16px">
-        <h3>Groups</h3>
+        <h3 style="display:flex;justify-content:space-between;align-items:center">Groups
+          <button class="btn sm" id="btnSwEditGroups">Edit groups</button></h3>
         <div id="swGroups" style="display:flex;gap:9px;flex-wrap:wrap;align-items:center"></div>
       </div>
       <div class="card">
@@ -653,6 +654,18 @@ td.mono,.mono{font-family:var(--font-mono);font-size:11.5px}
     <tbody id="swTradesBody"></tbody></table></div>
   <div class="actions"><button class="btn" onclick="closeModal('swTradesModal')">Close</button></div>
 </div></div>
+
+<!-- Smart wallet groups editor modal -->
+<div class="modal" id="swGroupsModal"><div class="box" style="width:640px">
+  <h3>Edit promotion groups</h3>
+  <div class="hint" style="margin-bottom:14px">Order matters — first (strictest) matching group wins. Empty list reverts to config.toml defaults.</div>
+  <div id="swGroupsEditor"></div>
+  <button class="btn" id="btnSwAddGroup" style="margin-top:12px">+ Add group</button>
+  <div class="actions">
+    <button class="btn" id="btnSwGroupsCancel">Cancel</button>
+    <button class="btn primary" id="btnSwGroupsSave">Save groups</button>
+  </div>
+ </div></div>
 
 <!-- Channel modal -->
 <div class="modal" id="tgModal"><div class="box">
@@ -1158,6 +1171,75 @@ async function loadSmartWallets(){
 $("swGroup").addEventListener("change",()=>loadSmartWallets());
 $("swStatus").addEventListener("change",()=>loadSmartWallets());
 $("btnSwRefresh").addEventListener("click",()=>loadSmartWallets());
+
+// --- Smart wallet promotion groups editor ---
+let swGroupsEdit=[];
+const swGroupEditable=g=>({
+  name:g.name??"",
+  min_win_rate:g.min_win_rate!=null?Number(g.min_win_rate):0.5,
+  min_realized_pnl_usd:g.min_realized_pnl_usd!=null?Number(g.min_realized_pnl_usd):0,
+  min_trades:g.min_trades!=null?Number(g.min_trades):0,
+  stats_period:g.stats_period==="7d"?"7d":"30d",
+  min_followers:g.min_followers!=null?Number(g.min_followers):null,
+  require_blue_verified:!!g.require_blue_verified,
+  min_avg_trade_usd:g.min_avg_trade_usd!=null?Number(g.min_avg_trade_usd):null,
+});
+const swGroupDefault=()=>({name:"",min_win_rate:0.5,min_realized_pnl_usd:0,min_trades:0,stats_period:"30d",min_followers:null,require_blue_verified:false,min_avg_trade_usd:null});
+const swEsc=v=>String(v).replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+function renderSwGroupsEditor(){
+  const el=$("swGroupsEditor");
+  if(!swGroupsEdit.length){el.innerHTML='<div class="hint">No groups yet — click "+ Add group" to create one, or Save an empty list to revert to config.toml defaults.</div>';return}
+  el.innerHTML=swGroupsEdit.map((g,i)=>`<div class="sw-group-row" style="display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr 1fr;gap:8px;padding:10px;border:1px solid var(--border-2);border-radius:10px;margin-bottom:10px;background:rgba(20,241,149,.03)">
+    <div class="row" style="margin-bottom:0"><label>name</label><input data-idx="${i}" data-k="name" value="${swEsc(g.name)}" placeholder="group name"></div>
+    <div class="row" style="margin-bottom:0"><label>min_win_rate</label><input type="number" step="0.01" min="0" max="1" data-idx="${i}" data-k="min_win_rate" value="${g.min_win_rate}"></div>
+    <div class="row" style="margin-bottom:0"><label>min_realized_pnl_usd</label><input type="number" step="any" data-idx="${i}" data-k="min_realized_pnl_usd" value="${g.min_realized_pnl_usd}"></div>
+    <div class="row" style="margin-bottom:0"><label>min_trades</label><input type="number" step="1" data-idx="${i}" data-k="min_trades" value="${g.min_trades}"></div>
+    <div class="row" style="margin-bottom:0"><label>stats_period</label><select data-idx="${i}" data-k="stats_period"><option value="7d"${g.stats_period==="7d"?" selected":""}>7d</option><option value="30d"${g.stats_period==="30d"?" selected":""}>30d</option></select></div>
+    <div class="row" style="margin-bottom:0"><label>min_followers</label><input type="number" step="1" data-idx="${i}" data-k="min_followers" value="${g.min_followers==null?"":g.min_followers}" placeholder="optional"></div>
+    <div class="row" style="margin-bottom:0"><label>min_avg_trade_usd</label><input type="number" step="any" data-idx="${i}" data-k="min_avg_trade_usd" value="${g.min_avg_trade_usd==null?"":g.min_avg_trade_usd}" placeholder="optional"></div>
+    <div class="row" style="margin-bottom:0"><label>verified</label><label style="display:flex;align-items:center;gap:6px;font-weight:400;color:var(--fg)"><input type="checkbox" data-idx="${i}" data-k="require_blue_verified"${g.require_blue_verified?" checked":""}> require_blue_verified</label></div>
+    <div class="row" style="margin-bottom:0;display:flex;align-items:flex-end"><button class="btn sm danger" onclick="removeSwGroupRow(${i})">remove</button></div>
+  </div>`).join("");
+}
+window.openSwGroupsEditor=async()=>{
+  const groups=await api("/api/smart-wallets/groups").catch(e=>e);
+  swGroupsEdit=(groups instanceof Error?[]:groups).map(swGroupEditable);
+  renderSwGroupsEditor();
+  openModal("swGroupsModal");
+};
+window.addSwGroupRow=()=>{swGroupsEdit.push(swGroupDefault());renderSwGroupsEditor()};
+window.removeSwGroupRow=i=>{swGroupsEdit.splice(i,1);renderSwGroupsEditor()};
+window.saveSwGroups=async()=>{
+  const rows=[...$("swGroupsEditor").querySelectorAll(".sw-group-row")];
+  const out=swGroupsEdit.map((g,i)=>{
+    const row=rows[i];
+    const get=k=>{const n=row.querySelector(`[data-k="${k}"]`);return n?n.value:""};
+    const num=(v,opt)=>{if(v===""||v==null)return opt?null:0;const x=Number(v);return isNaN(x)?(opt?null:0):x};
+    return {
+      name:get("name").trim(),
+      min_win_rate:num(get("min_win_rate")),
+      min_realized_pnl_usd:num(get("min_realized_pnl_usd")),
+      min_trades:Math.round(num(get("min_trades"))),
+      stats_period:get("stats_period")==="7d"?"7d":"30d",
+      min_followers:num(get("min_followers"),true),
+      require_blue_verified:!!(row.querySelector(`[data-k="require_blue_verified"]`).checked),
+      min_avg_trade_usd:num(get("min_avg_trade_usd"),true),
+    };
+  });
+  for(const g of out){if(!g.name){toast("every group needs a name",true);return}}
+  for(const g of out){if(g.min_win_rate<0||g.min_win_rate>1){toast("min_win_rate must be 0..1",true);return}}
+  try{
+    await api("/api/smart-wallets/groups",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(out)});
+    toast(out.length?`saved ${out.length} group${out.length===1?"":"s"}`:"reverted to config.toml defaults");
+    closeModal("swGroupsModal");
+    loadSmartWallets();
+  }catch(e){toast("save groups failed: "+e.message,true)}
+};
+$("btnSwEditGroups").addEventListener("click",openSwGroupsEditor);
+$("btnSwAddGroup").addEventListener("click",addSwGroupRow);
+$("btnSwGroupsSave").addEventListener("click",saveSwGroups);
+$("btnSwGroupsCancel").addEventListener("click",()=>closeModal("swGroupsModal"));
+
 window.enrichSw=async address=>{
   try{await api(`/api/smart-wallets/${address}/enrich`,{method:"POST"});toast("enrich queued")}catch(e){toast("enrich failed: "+e.message,true)}
 };

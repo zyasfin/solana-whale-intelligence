@@ -1,0 +1,8 @@
+-- Smart Wallet promotion groups editable from the admin panel.
+-- Stored in admin_settings under key 'smart_wallet_groups' as a JSON array of
+-- SmartWalletGroup objects. When present, it overrides config.toml
+-- [smart_wallet.groups]; deleting the key reverts to config.toml.
+--
+-- No DDL is required: the existing admin_settings table (migration 0002)
+-- already provides the key/value persistence this feature uses. This file
+-- exists solely to record the feature in the migration history.

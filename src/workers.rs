@@ -670,8 +670,39 @@ fn smart_wallet_stats_metrics(stats: &serde_json::Value) -> (Option<f64>, Option
     (win_rate, realized_pnl, trades)
 }
 
+/// Read the DB override for Smart Wallet promotion groups, if present and
+/// valid. Returns `None` when there is no override (or it is invalid JSON),
+/// so the caller falls back to the `config.toml` groups.
+async fn smart_wallet_groups_from_db(
+    pool: &PgPool,
+) -> Option<Vec<crate::config::SmartWalletGroup>> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT value FROM admin_settings WHERE key = 'smart_wallet_groups'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let value = value?;
+    match crate::config::parse_smart_wallet_groups(&value) {
+        Ok(groups) => Some(groups),
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid smart_wallet_groups override; ignoring");
+            None
+        }
+    }
+}
+
 async fn smart_wallet_enrich_once(ctx: &std::sync::Arc<WorkerContext>, gmgn: &std::sync::Arc<GmgnPool>) -> Result<u32> {
-    let batch = ctx.smart_wallet_config.enrich_batch.max(1) as i64;
+    // Apply a DB override to the promotion groups for this cycle (if any),
+    // while keeping the rest of the config (enrich_batch, dismiss_after_fails)
+    // from the startup snapshot. Changes take effect on the NEXT cycle without
+    // a restart.
+    let mut cfg = ctx.smart_wallet_config.clone();
+    if let Some(groups) = smart_wallet_groups_from_db(&ctx.pool).await {
+        cfg.groups = groups;
+    }
+    let batch = cfg.enrich_batch.max(1) as i64;
     let mut enriched = 0u32;
 
     // 1) Drain manually requested wallets FIRST (enrich_requested_at set via
@@ -693,7 +724,7 @@ async fn smart_wallet_enrich_once(ctx: &std::sync::Arc<WorkerContext>, gmgn: &st
         tracing::info!(count = requested.len(), "smart wallet manual enrich drain");
     }
     for (address, pinned) in requested {
-        match smart_wallet_enrich_one(ctx, gmgn, &address, pinned).await {
+        match smart_wallet_enrich_one(ctx, gmgn, &cfg, &address, pinned).await {
             Ok(()) => enriched += 1,
             Err(err) => tracing::warn!(error = %err, address, "manual enrich failed"),
         }
@@ -722,7 +753,7 @@ async fn smart_wallet_enrich_once(ctx: &std::sync::Arc<WorkerContext>, gmgn: &st
     .await?;
 
     for (address, manually_pinned) in candidates {
-        match smart_wallet_enrich_one(ctx, gmgn, &address, manually_pinned).await {
+        match smart_wallet_enrich_one(ctx, gmgn, &cfg, &address, manually_pinned).await {
             Ok(()) => enriched += 1,
             Err(err) => tracing::warn!(error = %err, address, "enrich failed"),
         }
@@ -736,10 +767,10 @@ async fn smart_wallet_enrich_once(ctx: &std::sync::Arc<WorkerContext>, gmgn: &st
 async fn smart_wallet_enrich_one(
     ctx: &std::sync::Arc<WorkerContext>,
     gmgn: &std::sync::Arc<GmgnPool>,
+    cfg: &crate::config::SmartWalletConfig,
     address: &str,
     manually_pinned: bool,
 ) -> Result<()> {
-    let cfg = &ctx.smart_wallet_config;
     // Fetch one wallet_stats payload per distinct stats_period (usually 1).
     let mut payloads: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let mut primary: Option<serde_json::Value> = None;

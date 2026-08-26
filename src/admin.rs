@@ -146,7 +146,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/track/tg/hot", get(track_tg_hot))
         // Smart Wallets (GMGN-fed analysis track, separate from Funding Radar)
         .route("/api/smart-wallets", get(list_smart_wallets))
-        .route("/api/smart-wallets/groups", get(list_smart_wallet_groups))
+        .route("/api/smart-wallets/groups", get(list_smart_wallet_groups).put(save_smart_wallet_groups))
         .route("/api/smart-wallets/enrich-all", post(enrich_all_smart_wallets))
         .route("/api/smart-wallets/{address}/enrich", post(enrich_smart_wallet))
         .route("/api/smart-wallets/{address}/trades", get(smart_wallet_trades))
@@ -1538,14 +1538,47 @@ async fn enrich_smart_wallet(
     Ok(Json(serde_json::json!({ "ok": true, "queued": true, "existed": existed })))
 }
 
-/// GET /api/smart-wallets/groups — config promotion tiers with live wallet
-/// counts per group (group_name = name).
+/// Key in `admin_settings` holding the DB override for Smart Wallet promotion
+/// groups (a JSON array of `SmartWalletGroup`). When present and valid it
+/// overrides `config.toml` [smart_wallet.groups]; deleting it reverts.
+const SMART_WALLET_GROUPS_KEY: &str = "smart_wallet_groups";
+
+/// Read the DB override for Smart Wallet groups, if present and valid.
+/// Returns `Ok(None)` when no override exists (or it is invalid JSON), so
+/// callers fall back to `effective_groups()`.
+async fn smart_wallet_groups_override(
+    pool: &PgPool,
+) -> Option<Vec<crate::config::SmartWalletGroup>> {
+    let value: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT value FROM admin_settings WHERE key = $1",
+    )
+    .bind(SMART_WALLET_GROUPS_KEY)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let value = value?;
+    match crate::config::parse_smart_wallet_groups(&value) {
+        Ok(groups) => Some(groups),
+        Err(err) => {
+            tracing::warn!(error = %err, "invalid smart_wallet_groups override; ignoring");
+            None
+        }
+    }
+}
+
+/// GET /api/smart-wallets/groups — promotion tiers with live wallet counts
+/// per group. Prefers the DB override (`smart_wallet_groups`); falls back to
+/// `config.toml` [smart_wallet.groups]. Each entry carries a `source` marker
+/// ("db" | "config") so the UI knows whether an override is active.
 async fn list_smart_wallet_groups(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_auth(&state, &headers).await?;
-    let groups = state.settings.config.smart_wallet.effective_groups();
+    let from_db = smart_wallet_groups_override(&state.pool).await;
+    let source = if from_db.is_some() { "db" } else { "config" };
+    let groups = from_db.unwrap_or_else(|| state.settings.config.smart_wallet.effective_groups());
     let mut out = Vec::new();
     for g in groups {
         let n_wallets: i64 = sqlx::query_scalar(
@@ -1560,10 +1593,62 @@ async fn list_smart_wallet_groups(
             "min_win_rate": g.min_win_rate,
             "min_realized_pnl_usd": g.min_realized_pnl_usd,
             "min_trades": g.min_trades,
+            "stats_period": g.stats_period,
+            "min_followers": g.min_followers,
+            "require_blue_verified": g.require_blue_verified,
+            "min_avg_trade_usd": g.min_avg_trade_usd,
             "n_wallets": n_wallets,
+            "source": source,
         }));
     }
     Ok(Json(out))
+}
+
+/// PUT /api/smart-wallets/groups — replace the promotion groups persisted in
+/// `admin_settings`. Body is either a JSON array of groups or
+/// `{ "groups": [...] }`. An empty/null array deletes the override (revert to
+/// config.toml). Returns `{ ok, applied }`.
+async fn save_smart_wallet_groups(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_write_auth(&state, &headers).await?;
+    // Accept either a bare array or { "groups": [...] }.
+    let arr = match &body {
+        serde_json::Value::Array(_) => body.clone(),
+        serde_json::Value::Object(map) => map
+            .get("groups")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    };
+    // null or [] -> delete the override (revert to config.toml).
+    if arr.is_null() || arr.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+        sqlx::query("DELETE FROM admin_settings WHERE key = $1")
+            .bind(SMART_WALLET_GROUPS_KEY)
+            .execute(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(serde_json::json!({ "ok": true, "applied": 0 })));
+    }
+    let groups = crate::config::parse_smart_wallet_groups(&arr)
+        .map_err(|msg| {
+            tracing::warn!(error = %msg, "invalid smart_wallet_groups payload");
+            StatusCode::BAD_REQUEST
+        })?;
+    let applied = groups.len();
+    let value = serde_json::to_value(&groups).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query(
+        "INSERT INTO admin_settings (key, value, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+    )
+    .bind(SMART_WALLET_GROUPS_KEY)
+    .bind(value)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "ok": true, "applied": applied })))
 }
 
 /// GET /api/smart-wallets/{address}/trades?limit=50 — latest tracked trades.
