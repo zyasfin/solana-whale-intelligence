@@ -117,6 +117,8 @@ Runtime logic implemented (Phase 1), all in `src/sf/`:
   idempotency 2-mode).
 - `signal_gate.rs` — entry signal gate model (first-failure-wins, 10 gates,
   fail-closed on missing data).
+- `wallet_runtime.rs` — §8.6 exact swap reconstruction → wallet intelligence:
+  average cost, realized/unrealized outcome, early-entry timing, recurrence.
 
 Review findings (agent hermes, `tests/review_runtime_regressions.rs`) — 4 bugs
 found and fixed, with in-module regression tests added:
@@ -125,10 +127,8 @@ found and fixed, with in-module regression tests added:
 3. Oversell realized full proceeds instead of matched-only → proportional.
 4. Fallback idempotency key too aggressive → now `source + entity + event type
    + time bucket + raw hash` (§7.1); `RawPayload` gained `event_type`.
-
-Build/test status (verified locally on Rust 1.97, crate `solana-whale-intelligence`):
-- `cargo build` clean; `cargo test` = 143 passed (134 legacy `main.rs` + 4 agent
-  review + 5 in-module regression), 0 failed.
+- `cargo build` clean; `cargo test` = 148 passed (134 legacy `main.rs` + 4 agent
+  review + 10 in-module regression incl. `wallet_runtime`), 0 failed.
 
 ## 8. Known limitations
 

@@ -26,3 +26,4 @@ pub mod strategy;
 pub mod cost_basis;
 pub mod ingest_runtime;
 pub mod signal_gate;
+pub mod wallet_runtime;
