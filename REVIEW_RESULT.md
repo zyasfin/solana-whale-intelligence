@@ -18,6 +18,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-002 | 2026-08-30 | re-review fix F01 + F02 | APPROVED | 162 passed, 0 failed |
 | REV-003 | 2026-08-30 | `token_runtime`–`strategy_runtime` (B11–B18) | 5 bug | 196 passed, 0 failed |
 | REV-004 | 2026-08-30 | re-review fix F01–F05 | APPROVED | 198 passed, 0 failed |
+| REV-005 | 2026-08-30 | final runtime B19–B22 | 1 bug | 218 passed, 0 failed |
+| REV-006 | 2026-08-30 | re-review fix F01 | APPROVED | 218 passed, 0 failed |
 
 ---
 
@@ -268,3 +270,93 @@ cargo test — 198 passed, 0 failed (60 module + 134 legacy + 4 regression)
 ### Verdict
 
 **APPROVED** — kelima temuan REV-003 diperbaiki, regression test hijau.
+
+---
+
+## REV-005 — Final runtime: execution, autonomy, browser, decision
+
+**Tanggal:** 2026-08-30 11:19 UTC  
+**Mode:** Read-only correctness review  
+**Acuan:** `REVIEW_BRIEF.md` section B item 19–22; `CONVENTIONS.md` §3–§5  
+**Scope:** `execution_runtime.rs`, `autonomy_runtime.rs`, `browser_runtime.rs`, `decision_runtime.rs`, serta domain type frozen terkait.
+
+### Temuan
+
+#### REV-005-F01 — FIXED — Execution state machine menyimpang dari transition table frozen
+
+**Lokasi:** `src/sf/execution_runtime.rs`, `ExecutionState` dan `can_transition` (sekitar line 24–65).
+
+**Masalah:** runtime membuat state machine berbasis indeks yang berbeda dari `intent.rs::IntentState::can_transition_to`. Akibatnya:
+
+- state skip diterima, misalnya `Proposed -> Submitted`;
+- transisi fail-safe ilegal diterima, misalnya `Proposed -> FailedSafe`;
+- `UnknownReconciliation` memblok semua transisi, termasuk hasil rekonsiliasi sah ke `Confirmed`, `FailedSafe`, atau `Cancelled`;
+- `Confirmed` tidak diperlakukan terminal dan dapat berpindah ke sibling terminal lain;
+- runtime mengganti state frozen `Approved/Built` dengan `Quoted`, sehingga dua transition table dapat berbeda.
+
+**Saran fix:** jangan duplikasi transition table. Gunakan `intent::IntentState` dan delegasikan ke `IntentState::can_transition_to`, atau encode tabel `matches!` yang identik verbatim. Tambahkan regression test untuk menolak skip/illegal fail-safe, mengizinkan tiga hasil rekonsiliasi, dan memastikan seluruh terminal state tidak punya outgoing transition.
+
+### Acceptance criteria
+
+| Item | Module | Hasil |
+|---|---|---|
+| B19 | `execution_runtime.rs` | FAIL — `REV-005-F01` |
+| B20 | `autonomy_runtime.rs` | PASS |
+| B21 | `browser_runtime.rs` | PASS |
+| B22 | `decision_runtime.rs` | PASS |
+
+### Verifikasi
+
+```text
+cargo test
+218 passed
+0 failed
+```
+
+Rincian: `80 module + 134 legacy + 4 regression = 218`.
+
+### Verdict
+
+**CHANGES REQUIRED** — perbaiki `REV-005-F01`, tambah regression test, lalu append re-review sebagai `REV-006`.
+
+---
+
+## REV-006 — Re-review setelah fix REV-005-F01
+
+**Tanggal:** 2026-08-30 (post-fix)  
+**Mode:** Re-verifikasi fix (read-only)  
+**Acuan:** `REVIEW_BRIEF.md` section B item 19  
+**Scope:** fix `REV-005-F01`
+
+### Hasil fix
+
+#### REV-005-F01 — ACCEPTED
+
+- `execution_runtime.rs` — `ExecutionState` kini re-export dari `intent::IntentState`
+  (bukan enum duplikat); `can_transition` mendelegasikan ke
+  `IntentState::can_transition_to` (transition table frozen). Tidak ada duplikasi
+  state machine.
+- Regression test: `execution_forward_matches_frozen_table` (tolak skip/illegal),
+  `reconciliation_allows_only_three_outcomes` (UNKNOWN_RECONCILIATION hanya ke
+  CONFIRMED/FAILED_SAFE/CANCELLED).
+
+### Acceptance criteria (re-check)
+
+| Item | Module | Hasil |
+|---|---|---|
+| B19 | `execution_runtime.rs` | PASS — F01 fixed |
+| B20 | `autonomy_runtime.rs` | PASS |
+| B21 | `browser_runtime.rs` | PASS |
+| B22 | `decision_runtime.rs` | PASS |
+
+### Verifikasi
+
+```text
+cargo build — clean (no warning)
+cargo test — 218 passed, 0 failed (80 module + 134 legacy + 4 regression)
+```
+
+### Verdict
+
+**APPROVED** — temuan REV-005 diperbaiki, regression test hijau. Seluruh runtime
+module (B5–B22) kini PASS.
