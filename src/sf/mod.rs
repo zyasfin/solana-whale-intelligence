@@ -27,3 +27,5 @@ pub mod cost_basis;
 pub mod ingest_runtime;
 pub mod signal_gate;
 pub mod wallet_runtime;
+pub mod portfolio_runtime;
+pub mod source_health_runtime;
