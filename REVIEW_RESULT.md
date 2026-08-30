@@ -16,6 +16,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 |---|---|---|---|---|
 | REV-001 | 2026-08-30 | `wallet_runtime`, `portfolio_runtime`, `source_health_runtime` | 2 bug | 159 passed, 0 failed |
 | REV-002 | 2026-08-30 | re-review fix F01 + F02 | APPROVED | 162 passed, 0 failed |
+| REV-003 | 2026-08-30 | `token_runtime`–`strategy_runtime` (B11–B18) | 5 bug | 196 passed, 0 failed |
+| REV-004 | 2026-08-30 | re-review fix F01–F05 | APPROVED | 198 passed, 0 failed |
 
 ---
 
@@ -122,3 +124,147 @@ cargo test — 162 passed, 0 failed (24 module + 134 legacy + 4 regression)
 ### Verdict
 
 **APPROVED** — kedua temuan REV-001 diperbaiki, regression test hijau.
+
+
+---
+
+## REV-003 — Runtime token hingga strategy
+
+**Tanggal:** 2026-08-30 11:01 UTC  
+**Mode:** Read-only correctness review  
+**Acuan:** `REVIEW_BRIEF.md` section B item 11–18; `CONVENTIONS.md`  
+**Scope:** `token_runtime.rs`, `caller_runtime.rs`, `revival_runtime.rs`, `narrative_runtime.rs`, `dashboard_runtime.rs`, `graph_runtime.rs`, `lp_runtime.rs`, `strategy_runtime.rs`.
+
+### Temuan
+
+#### REV-003-F01 — FIXED — Revival stage dapat dilompati
+
+**Lokasi:** `src/sf/revival_runtime.rs`, `can_progress` (sekitar line 78).
+
+**Masalah:** `stage_index(next) > stage_index(current)` mengizinkan lompatan, misalnya `Wake` langsung ke `OpportunityEvaluation`; B13 mensyaratkan urutan stage.
+
+**Saran fix:** hanya izinkan stage adjacent: `stage_index(next) == stage_index(current) + 1`; tambah regression test skip stage.
+
+#### REV-003-F02 — FIXED — Timestamp `valid_from` rusak tidak mutlak fail-closed
+
+**Lokasi:** `src/sf/graph_runtime.rs`, `is_edge_valid` (sekitar line 19–20).
+
+**Masalah:** `parse_secs(...).unwrap_or(i64::MAX)` dapat menganggap timestamp rusak valid ketika `now_secs == i64::MAX` dan `valid_until == None`. B16 mensyaratkan timestamp unparseable selalu `false`.
+
+**Saran fix:** `let Some(from) = parse_secs(...) else { return false; };`; tambah regression test malformed `valid_from` pada batas `i64::MAX`.
+
+#### REV-003-F03 — FIXED — Confidence hilang dianggap confidence rendah
+
+**Lokasi:** `src/sf/graph_runtime.rs`, `is_false_confluence` (sekitar line 51).
+
+**Masalah:** `confidence.unwrap_or(0.0)` menyamakan missing dengan zero/low confidence. False confluence bisa ditandai tanpa bukti confidence rendah; missing bukan zero.
+
+**Saran fix:** low-confidence hanya bila kedua confidence `Some` dan `< 0.5`; tambah test `None` tidak dianggap low confidence.
+
+#### REV-003-F04 — FIXED — Robinhood Uniswap/Pancake ditolak LP scope gate
+
+**Lokasi:** `src/sf/lp_runtime.rs`, `is_supported_scope` (sekitar line 32–42).
+
+**Masalah:** semua `UniswapV2/V3/V4` dan `PancakeV2/V3` selalu `false`. Frozen scope mendukung protokol tersebut pada Robinhood; hanya Ethereum/Base/BSC yang `N/A`.
+
+**Saran fix:** izinkan Uniswap/Pancake hanya pada Robinhood; tetap tolak Ethereum/Base/BSC dan Solana. Tambah test Robinhood true + ETH/Base/BSC false.
+
+#### REV-003-F05 — FIXED — Strategy lifecycle dapat melompati gate
+
+**Lokasi:** `src/sf/strategy_runtime.rs`, `can_transition` (sekitar line 37–51).
+
+**Masalah:** `stage_index(next) > stage_index(current)` mengizinkan `Draft -> Active`; shadow/paper/validation/approval dapat dilewati.
+
+**Saran fix:** hanya izinkan transisi adjacent, ditambah toggle khusus `Active <-> Paused`; `Retired` tetap terminal. Tambah regression test `Draft -> Active` ditolak.
+
+### Acceptance criteria
+
+| Item | Module | Hasil |
+|---|---|---|
+| B11 | `token_runtime.rs` | PASS |
+| B12 | `caller_runtime.rs` | PASS |
+| B13 | `revival_runtime.rs` | FAIL — `REV-003-F01` |
+| B14 | `narrative_runtime.rs` | PASS |
+| B15 | `dashboard_runtime.rs` | PASS |
+| B16 | `graph_runtime.rs` | FAIL — `REV-003-F02`, `REV-003-F03` |
+| B17 | `lp_runtime.rs` | FAIL — `REV-003-F04` |
+| B18 | `strategy_runtime.rs` | FAIL — `REV-003-F05` |
+
+### Verifikasi
+
+```text
+cargo test
+196 passed
+0 failed
+```
+
+Rincian: `58 module + 134 legacy + 4 regression = 196`.
+
+### Verdict
+
+**CHANGES REQUIRED** — perbaiki `REV-003-F01` sampai `REV-003-F05`, tambah regression test, lalu append re-review sebagai `REV-004`.
+
+---
+
+## REV-004 — Re-review setelah fix REV-003-F01..F05
+
+**Tanggal:** 2026-08-30 (post-fix)  
+**Mode:** Re-verifikasi fix (read-only)  
+**Acuan:** `REVIEW_BRIEF.md` section B item 11–18  
+**Scope:** fix `REV-003-F01` sampai `REV-003-F05`
+
+### Hasil fix
+
+#### REV-003-F01 — ACCEPTED
+
+- `revival_runtime.rs` — `can_progress` kini `stage_index(next) == stage_index(current) + 1`
+  (adjacent-only); tidak bisa lompat stage.
+- Regression test: `progression_is_forward_only` menambah assert skip-stage.
+
+#### REV-003-F02 — ACCEPTED
+
+- `graph_runtime.rs` — `is_edge_valid` pakai `let Some(from) = parse_secs(...) else { return false; }`;
+  timestamp rusak mutlak fail-closed.
+- Regression test: `malformed_valid_from_fails_closed`.
+
+#### REV-003-F03 — ACCEPTED
+
+- `graph_runtime.rs` — `is_false_confluence` low-confidence hanya bila kedua confidence
+  `Some` dan `< 0.5`; `None` tidak dianggap low (missing != zero).
+- Regression test: `missing_confidence_is_not_false_confluence`.
+
+#### REV-003-F04 — ACCEPTED
+
+- `lp_runtime.rs` — `is_supported_scope` kini izinkan Uniswap/Pancake pada Robinhood
+  (`robinhood`/`rh`); tetap tolak Ethereum/Base/BSC dan Solana (Meteora-only).
+- Regression test: `scope_gate_matches_frozen_scope`.
+
+#### REV-003-F05 — ACCEPTED
+
+- `strategy_runtime.rs` — `can_transition` kini `stage_index(next) == stage_index(current) + 1`
+  (adjacent-only) + toggle khusus `Active <-> Paused`; `Retired` terminal.
+- Regression test: `lifecycle_forward_only_with_pause_toggle` menambah assert `Draft -> Active` ditolak.
+
+### Acceptance criteria (re-check)
+
+| Item | Module | Hasil |
+|---|---|---|
+| B11 | `token_runtime.rs` | PASS |
+| B12 | `caller_runtime.rs` | PASS |
+| B13 | `revival_runtime.rs` | PASS — F01 fixed |
+| B14 | `narrative_runtime.rs` | PASS |
+| B15 | `dashboard_runtime.rs` | PASS |
+| B16 | `graph_runtime.rs` | PASS — F02/F03 fixed |
+| B17 | `lp_runtime.rs` | PASS — F04 fixed |
+| B18 | `strategy_runtime.rs` | PASS — F05 fixed |
+
+### Verifikasi
+
+```text
+cargo build — clean (no warning)
+cargo test — 198 passed, 0 failed (60 module + 134 legacy + 4 regression)
+```
+
+### Verdict
+
+**APPROVED** — kelima temuan REV-003 diperbaiki, regression test hijau.
