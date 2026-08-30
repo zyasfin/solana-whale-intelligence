@@ -39,13 +39,15 @@ arsitektur "Signal Forge". Dari dokumen itu telah dihasilkan:
 - 17 migration SQL (`1001..1017`) di `/root/swi-deploy/migrations/`.
 - 2 dokumen pendukung: `CONVENTIONS.md` + `REUSE_AUDIT.md`.
 
-Status: ini adalah **fondasi/scaffold + runtime parsial**, bukan sistem jadi.
+Status: ini adalah **fondasi/scaffold + runtime**, bukan sistem jadi.
 Tiga blocker arsitektur sudah dibekukan (RESOLVED). Implementasi runtime sudah
-mencakup 15 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime,
+mencakup 19 titik (cost_basis, ingest_runtime, signal_gate, wallet_runtime,
 portfolio_runtime, source_health_runtime, token_runtime, caller_runtime,
 revival_runtime, narrative_runtime, dashboard_runtime, graph_runtime,
-lp_runtime, strategy_runtime, plus `source::select_provider`), sisanya masih
-tipe domain.
+lp_runtime, strategy_runtime, execution_runtime, autonomy_runtime,
+browser_runtime, decision_runtime, plus `source::select_provider`). Sisanya
+adalah module domain murni (tipe/enum untuk DDL): core, identity, auth, jobs,
+ingest, intent.
 
 ## 1. Daftar artefak (path lengkap)
 
@@ -96,6 +98,10 @@ execution.rs  autonomy.rs
 /root/swi-src/src/sf/graph_runtime.rs        — §9 entity edges + false confluence
 /root/swi-src/src/sf/lp_runtime.rs           — §8.9 LP pool metrics
 /root/swi-src/src/sf/strategy_runtime.rs     — §13 strategy lifecycle + evaluation
+/root/swi-src/src/sf/execution_runtime.rs    — §16/§17/§19 execution + kill switch
+/root/swi-src/src/sf/autonomy_runtime.rs     — §14/§15 AUTO_BOUNDED rollout
+/root/swi-src/src/sf/browser_runtime.rs      — §4.3 browser worker gating
+/root/swi-src/src/sf/decision_runtime.rs     — §12 decision component gating
 ```
 
 ### Migration SQL (`/root/swi-deploy/migrations/`)
@@ -197,15 +203,35 @@ helius.rs  telegram_ingest.rs  gmgn.rs  narrative.rs  graph.rs  dll.
       terminal.
     - `shadow_passed` fail-closed: ada rejected candidate = FAIL.
     - `negative_findings` menjumlah rejected candidates (retention req #13).
+19. `execution_runtime.rs` (§16/§17/§19) — cek hal berikut:
+    - `can_transition` forward-only; UNKNOWN_RECONCILIATION memblok submission
+      baru; CANCELLED/FAILED_SAFE terminal.
+    - `action_permitted`: Halt memblok semua; ExitOnly hanya izinkan
+      risk-reducing (Sell/PartialSell/Close/EmergencyExit).
+    - `signer_policy_passes` = checklist tertutup; satu field false → fail.
+20. `autonomy_runtime.rs` (§14/§15) — cek hal berikut:
+    - `is_autonomous` hanya AUTO_BOUNDED.
+    - `can_claim_close` matures sebelum `can_open` (claim/close sebelum open/reseed).
+    - `limit_raise_permitted` butuh phase ≥ claim/close + guard + human approval.
+    - `thresholds_sane` fail-closed (drawdown < 0, CI ≥ 0, requires approval).
+21. `browser_runtime.rs` (§4.3) — cek hal berikut:
+    - `capture_usable` = session OK + no challenge (fail-closed).
+    - `capture_retryable` hanya transient challenge; hard failure tidak retry.
+    - `enrichment_warranted` hanya TokenTriggeredResolve (cheap-first).
+22. `decision_runtime.rs` (§12) — cek hal berikut:
+    - `evaluate`: missing capability → MissingCapability; mandatory `pass=false`
+      atau `None` → Reject (fail-closed); semua pass → Approve.
+    - `is_reproducible` butuh ≥1 evidence snapshot.
+    - `unresolved_mandatory` menghitung mandatory yang belum `Some(true)`.
 
 ### C. Kualitas SQL
-19. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
-20. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
-21. Enum/CHECK konsisten dengan enum Rust di atas.
+23. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
+24. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
+25. Enum/CHECK konsisten dengan enum Rust di atas.
 
 ### D. Integritas repo
-22. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
-23. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
+26. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
+27. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
     chrono, serde). Catatan: toolchain Rust TIDAK terpasang di host ini.
 
 ## 3. Batas yang diketahui (jangan dilaporkan sebagai bug)
