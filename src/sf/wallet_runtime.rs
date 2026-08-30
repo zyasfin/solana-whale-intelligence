@@ -75,9 +75,10 @@ pub fn reconstruct_swaps(
 
     let realized_pnl: Decimal = positions.iter().map(|p| p.realized_pnl).sum();
 
-    // Average cost per token: open cost / open amount (0 when nothing open).
+    // Average cost per (chain, wallet, token): open cost / open amount
+    // (0 when nothing open).
     let mut average_cost = HashMap::new();
-    for (token, (amount, cost)) in &residual.per_token {
+    for ((_chain, _wallet, token), (amount, cost)) in &residual.per_token {
         let avg = if *amount != Decimal::ZERO {
             *cost / *amount
         } else {
@@ -86,10 +87,10 @@ pub fn reconstruct_swaps(
         average_cost.insert(token.clone(), avg);
     }
 
-    // Unrealized PnL: mark - residual cost (per open token). No mark provided
+    // Unrealized PnL: mark - residual cost (per token). No mark provided
     // -> -cost (fail-closed, no fabricated price).
     let mut unrealized_pnl = Decimal::ZERO;
-    for (token, (_, cost)) in &residual.per_token {
+    for ((_chain, _wallet, token), (_, cost)) in &residual.per_token {
         let mark = mark_usd
             .and_then(|m| m.get(token))
             .copied()
@@ -162,16 +163,23 @@ pub fn build_wallet_intelligence(
     token_birth_ts: Option<i64>,
     clusters: &HashMap<String, String>,
 ) -> WalletIntelligence {
-    let rec = reconstruct_swaps(swaps, mark_usd);
-    let recurrence = compute_recurrence(swaps, clusters);
+    // Filter swaps to this wallet's (chain, address) so stray swaps from other
+    // wallets can never leak into the aggregate (REV-001-F01).
+    let own: Vec<PricedSwap> = swaps
+        .iter()
+        .filter(|p| p.swap.chain == chain && p.swap.wallet == address)
+        .cloned()
+        .collect();
+    let rec = reconstruct_swaps(&own, mark_usd);
+    let recurrence = compute_recurrence(&own, clusters);
 
     // Average cost basis for the wallet's primary (most-traded) token, or None.
     let cost_basis = rec
         .average_cost
         .iter()
         .max_by(|a, b| {
-            let ta = swaps.iter().filter(|p| p.swap.token == *a.0).count();
-            let tb = swaps.iter().filter(|p| p.swap.token == *b.0).count();
+            let ta = own.iter().filter(|p| p.swap.token == *a.0).count();
+            let tb = own.iter().filter(|p| p.swap.token == *b.0).count();
             ta.cmp(&tb)
         })
         .map(|(token, avg)| CostBasis {
@@ -182,8 +190,7 @@ pub fn build_wallet_intelligence(
 
     // `early_entry_timing` is exposed as a standalone function (the frozen
     // `WalletIntelligence` type has no early-entry field; see §8.6).
-    let _ = early_entry_timing(swaps, token_birth_ts);
-
+    let _ = early_entry_timing(&own, token_birth_ts);
     WalletIntelligence {
         chain: chain.into(),
         address: address.into(),
@@ -296,5 +303,25 @@ mod tests {
         let cb = wi.cost_basis.as_ref().unwrap();
         assert_eq!(cb.token, "T1");
         assert!(wi.recurrence.is_some());
+    }
+
+    // Regression REV-001-F01: build_wallet_intelligence must filter to the
+    // wallet's own (chain, address) — stray swaps from another wallet must not
+    // leak into the aggregate.
+    #[test]
+    fn build_wallet_intelligence_filters_other_wallets() {
+        let swaps = vec![
+            ps("A", "T1", SwapDirection::Buy, "100", "10", "100", "2026-01-01T00:00:00Z"),
+            // Stray swap from wallet B for the SAME token — must be ignored.
+            ps("B", "T1", SwapDirection::Buy, "500", "50", "500", "2026-01-01T00:00:00Z"),
+        ];
+        let wi = build_wallet_intelligence("solana", "A", None, &swaps, None, None, &HashMap::new());
+        // Wallet A only bought 10 token for 100 USD; realized outcome reflects
+        // A only (no sell -> realized 0), not B's 500.
+        assert_eq!(wi.realized_outcome.as_deref(), Some("0"));
+        let cb = wi.cost_basis.as_ref().unwrap();
+        assert_eq!(cb.token, "T1");
+        // Average cost = A's 100 / 10 = 10, not polluted by B's 500/50.
+        assert_eq!(cb.average_cost, "10");
     }
 }

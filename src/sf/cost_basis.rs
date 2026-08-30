@@ -36,8 +36,10 @@ pub struct MatchedPosition {
 /// Aggregate residual (still-open) cost basis.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CostBasisResidual {
-    /// token -> (open_amount, open_cost_usd)
-    pub per_token: HashMap<String, (Decimal, Decimal)>,
+    /// (chain, wallet, token) -> (open_amount, open_cost_usd).
+    /// Key is the full tuple so two wallets trading the same token never
+    /// overwrite each other's residual (REV-001-F01).
+    pub per_token: HashMap<(String, String, String), (Decimal, Decimal)>,
 }
 
 impl CostBasisResidual {
@@ -68,8 +70,7 @@ pub fn fifo_match(swaps: &[ScoredSwap]) -> (Vec<MatchedPosition>, CostBasisResid
 
     let mut positions = Vec::new();
     let mut residual = CostBasisResidual::default();
-
-    for ((_chain, _wallet, token), mut scored) in by_key {
+    for ((chain, wallet, token), mut scored) in by_key {
         // Chronological order (unknown timestamp -> earliest). Stable.
         scored.sort_by_key(|s| s.swap.timestamp_secs().unwrap_or(0));
 
@@ -138,7 +139,7 @@ pub fn fifo_match(swaps: &[ScoredSwap]) -> (Vec<MatchedPosition>, CostBasisResid
         let (amt, cost) = open
             .iter()
             .fold((Decimal::ZERO, Decimal::ZERO), |(a, c), l| (a + l.amount, c + l.cost_usd));
-        residual.per_token.insert(token, (amt, cost));
+        residual.per_token.insert((chain.clone(), wallet.clone(), token.clone()), (amt, cost));
     }
 
     (positions, residual)
@@ -198,7 +199,7 @@ mod tests {
         ];
         let (_, residual) = fifo_match(&swaps);
         // buy opened 10 token (amount_out); sell closed all 10 -> residual zero
-        assert_eq!(residual.per_token["TOKEN"].0, Decimal::ZERO);
+        assert_eq!(residual.per_token[&("solana".to_string(), "A".to_string(), "TOKEN".to_string())].0, Decimal::ZERO);
     }
 
     // Regression #2: wallets are isolated — one wallet cannot consume another's
@@ -211,6 +212,25 @@ mod tests {
         ];
         let (positions, _) = fifo_match(&swaps);
         assert_eq!(positions[0].unmatched_sell_amount, d("10"));
+    }
+
+    // Regression #4 (REV-001-F01): two wallets trading the SAME token must not
+    // overwrite each other's residual — key is (chain, wallet, token).
+    #[test]
+    fn residual_isolated_by_wallet_for_same_token() {
+        let swaps = vec![
+            scored("A", SwapDirection::Buy, "100", "10", "100", "2026-01-01T00:00:00Z"),
+            scored("B", SwapDirection::Buy, "200", "20", "200", "2026-01-01T00:00:00Z"),
+        ];
+        let (_, residual) = fifo_match(&swaps);
+        // Wallet A: 10 token open, cost 100.
+        let a = residual.per_token[&("solana".to_string(), "A".to_string(), "TOKEN".to_string())];
+        assert_eq!(a.0, d("10"));
+        assert_eq!(a.1, d("100"));
+        // Wallet B: 20 token open, cost 200 — distinct entry, not overwritten.
+        let b = residual.per_token[&("solana".to_string(), "B".to_string(), "TOKEN".to_string())];
+        assert_eq!(b.0, d("20"));
+        assert_eq!(b.1, d("200"));
     }
 
     // Regression #3: oversell realizes only matched proceeds.

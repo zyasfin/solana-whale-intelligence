@@ -17,7 +17,7 @@ fn buy_quantity_is_token_amount_out() {
         scored("A", SwapDirection::Sell, "10", "120", "120", "2026-01-01T01:00:00Z", "s"),
     ];
     let (_, residual) = fifo_match(&swaps);
-    assert_eq!(residual.per_token["TOKEN"].0, Decimal::ZERO, "buy must open amount_out token quantity");
+    assert_eq!(residual.per_token[&("solana".to_string(), "A".to_string(), "TOKEN".to_string())].0, Decimal::ZERO, "buy must open amount_out token quantity");
 }
 
 #[test]
