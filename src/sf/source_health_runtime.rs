@@ -47,7 +47,13 @@ pub fn transition(current: &ProviderHealth, signal: &HealthSignal) -> SourceHeal
         return SourceHealthState::Disabled;
     }
 
-    // Success-based rules first: a recent success dominates the "up" path.
+    // Hard failures dominate: 3+ consecutive failures -> DOWN, regardless of
+    // any historical success timestamp still on the record (REV-001-F02).
+    if signal.consecutive_failures >= 3 {
+        return SourceHealthState::Down;
+    }
+
+    // Success-based rules: a recent success drives the "up" path.
     if let Some(success) = signal.last_success_secs {
         let cadence_ok = signal
             .expected_cadence_secs
@@ -74,28 +80,23 @@ pub fn transition(current: &ProviderHealth, signal: &HealthSignal) -> SourceHeal
             // Had a success but cadence is broken -> still degraded/silent.
             SourceHealthState::Silent
         }
+    } else if signal.schema_stale {
+        SourceHealthState::Degraded
     } else {
-        // No success at all -> connected-but-silent (or down on hard failures).
-        if signal.consecutive_failures >= 3 {
-            SourceHealthState::Down
-        } else if signal.schema_stale {
-            SourceHealthState::Degraded
-        } else {
-            SourceHealthState::Silent
-        }
+        // No success at all -> connected-but-silent.
+        SourceHealthState::Silent
     }
 }
 
 /// Apply a health signal to a `ProviderHealth` in place, returning the new
-/// state. This mutates `last_success_at`, `last_request_at`, `consecutive_failures`
-/// and `state` so the frozen record stays consistent with the transition.
 pub fn apply(health: &mut ProviderHealth, signal: &HealthSignal) -> SourceHealthState {
     if let Some(s) = signal.last_success_secs {
         health.last_success_at = Some(s.to_string());
-        health.consecutive_failures = 0;
-    } else {
-        health.consecutive_failures = signal.consecutive_failures;
     }
+    // `consecutive_failures` is the caller-provided truth; a fresh success
+    // yields 0 there, but a historical success on the record must NOT reset
+    // the counter (REV-001-F02).
+    health.consecutive_failures = signal.consecutive_failures;
     if let Some(r) = signal.last_request_secs {
         health.last_request_at = Some(r.to_string());
     }
@@ -223,5 +224,28 @@ mod tests {
         assert_eq!(h.state, SourceHealthState::Up);
         assert_eq!(h.last_success_at.as_deref(), Some("1000"));
         assert_eq!(h.consecutive_failures, 0);
+    }
+
+    // Regression REV-001-F02: 3+ consecutive failures must be DOWN even when a
+    // historical success timestamp is still on the record.
+    #[test]
+    fn failures_dominate_historical_success() {
+        let mut h = base();
+        h.last_success_at = Some("900".to_string()); // historical success
+        let sig = HealthSignal {
+            last_success_secs: Some(900), // still Some (historical), but...
+            last_request_secs: Some(1000),
+            expected_cadence_secs: Some(60),
+            parser_success_rate: Some(1.0),
+            schema_stale: false,
+            consecutive_failures: 3, // 3 recent failures
+            disabled: false,
+        };
+        assert_eq!(transition(&h, &sig), SourceHealthState::Down);
+
+        // apply must also produce DOWN and NOT reset the counter to 0.
+        let st = apply(&mut h, &sig);
+        assert_eq!(st, SourceHealthState::Down);
+        assert_eq!(h.consecutive_failures, 3);
     }
 }
