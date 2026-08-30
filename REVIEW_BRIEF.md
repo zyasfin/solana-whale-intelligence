@@ -41,8 +41,9 @@ arsitektur "Signal Forge". Dari dokumen itu telah dihasilkan:
 
 Status: ini adalah **fondasi/scaffold + runtime parsial**, bukan sistem jadi.
 Tiga blocker arsitektur sudah dibekukan (RESOLVED). Implementasi runtime sudah
-mencakup 5 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime, plus
-`source::select_provider`), sisanya masih tipe domain.
+mencakup 7 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime,
+portfolio_runtime, source_health_runtime, plus `source::select_provider`),
+sisanya masih tipe domain.
 
 ## 1. Daftar artefak (path lengkap)
 
@@ -83,6 +84,8 @@ execution.rs  autonomy.rs
 /root/swi-src/src/sf/ingest_runtime.rs   — ingestion pipeline §7.2
 /root/swi-src/src/sf/signal_gate.rs      — entry signal gate model
 /root/swi-src/src/sf/wallet_runtime.rs   — §8.6 swap reconstruction → wallet intel
+/root/swi-src/src/sf/portfolio_runtime.rs — §8.11 portfolio projections + risk
+/root/swi-src/src/sf/source_health_runtime.rs — §8.12 source-health state machine
 ```
 
 ### Migration SQL (`/root/swi-deploy/migrations/`)
@@ -135,15 +138,28 @@ helius.rs  telegram_ingest.rs  gmgn.rs  narrative.rs  graph.rs  dll.
      satu timestamp absen (jangan infer timestamp).
    - `compute_recurrence` — tokens_traded & distinct_clusters dihitung dari
      `HashSet` (distinct, bukan total swap).
+9. `portfolio_runtime.rs` (§8.11) — cek hal berikut:
+   - `project` — total notional = Σ semua line; `by_kind` subtotal per
+     token/pool/chain/strategy benar; correlated exposure pakai union-find dan
+     dihitung SEKALI per grup (bukan additive per line); malformed notional →
+     0 (fail-closed, jangan parse jadi error).
+   - `check_treasury_separation` — fail-closed: treasury tidak terpisah = Err.
+10. `source_health_runtime.rs` (§8.12) — cek hal berikut:
+    - State verbatim: UP/SILENT/DEGRADED/DOWN/RECOVERING/DISABLED.
+    - Aturan kunci: **connected-but-silent = SILENT** (request terus tapi tak
+      ada success dalam cadence → SILENT, bukan UP).
+    - schema_stale → DEGRADED; consecutive_failures ≥ 3 → DOWN; satu sample
+      bagus setelah degraded → RECOVERING (bukan langsung UP); disabled → DISABLED.
+    - `apply` harus mutate `ProviderHealth` konsisten dengan `transition`.
 
 ### C. Kualitas SQL
-9. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
-10. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
-11. Enum/CHECK konsisten dengan enum Rust di atas.
+11. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
+12. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
+13. Enum/CHECK konsisten dengan enum Rust di atas.
 
 ### D. Integritas repo
-12. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
-13. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
+14. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
+15. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
     chrono, serde). Catatan: toolchain Rust TIDAK terpasang di host ini.
 
 ## 3. Batas yang diketahui (jangan dilaporkan sebagai bug)
