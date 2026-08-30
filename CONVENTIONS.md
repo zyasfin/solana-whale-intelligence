@@ -130,6 +130,16 @@ Runtime logic implemented (Phase 1), all in `src/sf/`:
   reputation by regime, outcome window clamped to +21d.
 - `revival_runtime.rs` — §8.8 revival stage progression (wake → baseline →
   activation gate → refresh → quality → evaluation); fail-closed on gate.
+- `narrative_runtime.rs` — §8.4 name/meme provenance: token-first flow, role
+  extraction (originator/adopter/spread), stage resolution from evidence.
+- `dashboard_runtime.rs` — §22 IA + §21 retention: tier routing (hot/warm/cold),
+  hot projection assembly, operational vs research routing.
+- `graph_runtime.rs` — §9 entity edges: valid-window check, false-confluence
+  detection, neighbor degree.
+- `lp_runtime.rs` — §8.9 LP pool: fee-to-TVL, protocol scope gate (ETH/Base/BSC
+  = N/A), range-chamber assembly.
+- `strategy_runtime.rs` — §13 strategy lifecycle (DRAFT→…→RETIRED) + shadow/paper
+  evaluation, pause/resume toggle, negative-findings retention.
 
 Review findings (agent hermes, `tests/review_runtime_regressions.rs`) — 4 bugs
 found and fixed, with in-module regression tests added:
@@ -138,8 +148,8 @@ found and fixed, with in-module regression tests added:
 3. Oversell realized full proceeds instead of matched-only → proportional.
 4. Fallback idempotency key too aggressive → now `source + entity + event type
    + time bucket + raw hash` (§7.1); `RawPayload` gained `event_type`.
-- `cargo build` clean; `cargo test` = 176 passed (134 legacy `main.rs` + 4 agent
-  review + 38 in-module regression), 0 failed.
+- `cargo build` clean; `cargo test` = 196 passed (134 legacy `main.rs` + 4 agent
+  review + 58 in-module regression), 0 failed.
 
 ## 8. Known limitations
 
