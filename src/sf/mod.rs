@@ -32,3 +32,8 @@ pub mod source_health_runtime;
 pub mod token_runtime;
 pub mod caller_runtime;
 pub mod revival_runtime;
+pub mod narrative_runtime;
+pub mod dashboard_runtime;
+pub mod graph_runtime;
+pub mod lp_runtime;
+pub mod strategy_runtime;
