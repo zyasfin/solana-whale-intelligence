@@ -124,6 +124,12 @@ Runtime logic implemented (Phase 1), all in `src/sf/`:
   separation check.
 - `source_health_runtime.rs` — §8.12 source-health state machine
   (UP/SILENT/DEGRADED/DOWN/RECOVERING/DISABLED); connected-but-silent = SILENT.
+- `token_runtime.rs` — §8.2 token birth lifecycle state machine + wake gate
+  (dormant only enriches after wake; terminal ARCHIVED/TOMBSTONED never advance).
+- `caller_runtime.rs` — §8.5 caller intelligence: hit rate, average MFE,
+  reputation by regime, outcome window clamped to +21d.
+- `revival_runtime.rs` — §8.8 revival stage progression (wake → baseline →
+  activation gate → refresh → quality → evaluation); fail-closed on gate.
 
 Review findings (agent hermes, `tests/review_runtime_regressions.rs`) — 4 bugs
 found and fixed, with in-module regression tests added:
@@ -132,8 +138,8 @@ found and fixed, with in-module regression tests added:
 3. Oversell realized full proceeds instead of matched-only → proportional.
 4. Fallback idempotency key too aggressive → now `source + entity + event type
    + time bucket + raw hash` (§7.1); `RawPayload` gained `event_type`.
-- `cargo build` clean; `cargo test` = 159 passed (134 legacy `main.rs` + 4 agent
-  review + 21 in-module regression), 0 failed.
+- `cargo build` clean; `cargo test` = 176 passed (134 legacy `main.rs` + 4 agent
+  review + 38 in-module regression), 0 failed.
 
 ## 8. Known limitations
 
