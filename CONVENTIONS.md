@@ -147,3 +147,16 @@ All three blockers resolved. Remaining work:
 2. Wire `sf` runtime into `main.rs` (or a new bin).
 3. Implement remaining runtime: provider calls (`source.rs`), revival/funding
    graph, wallet swap reconstruction, and DB persistence for the three modules.
+
+## 10. Runtime implementation workflow (per-runtime, git-backed)
+
+Build/edit source of truth is the Windows copy (`C:/temp/swi-review-current/swi-src`);
+`hermes-master` is deploy-only and reads from this path directly (no per-file scp).
+
+Workflow per runtime module:
+1. Implement 1 runtime module.
+2. Review + fix bugs; add regression test for each bug.
+3. `cargo test` must be green before commit (never commit red).
+4. Commit one module per commit: message `sf(<module>): <short description>`.
+5. Bug fixes from review: separate commit `fix(<module>): <bug>`.
+

@@ -4,7 +4,34 @@ Tujuan: verifikasi seluruh artefak implementasi Signal Forge yang dihasilkan
 dari dokumen kanonis `PLAN SWI`. Semua path di host `hermes-master`
 (akses `root@hermes-master`). Ini review **read-only** — jangan ubah apa pun.
 
-## 0. Konteks singkat
+## ⚠️ Aturan main — anti over-review (WAJIB dibaca sebelum mulai)
+
+Kerjakan review **fokus & efisien**. Jangan melebar, jangan perfeksionis.
+
+### Prinsip
+- Fokus hanya pada **correctness & bug**, bukan gaya/nitpick.
+- Review **per-chunk kecil** (1 module runtime, atau 2–3 kalau erat).
+- **Stop begitu hijau** — jangan terus cari "perbaikan kosmetik".
+- Jangan ubah keputusan yang **sudah dibekukan** (PLAN SWI / CONVENTIONS.md).
+
+### Yang WAJIB dicek (kelas bug yang sudah dikenal)
+1. Field salah pakai (misal `amount_in` vs `amount_out`).
+2. Key idempotency / dedup terlalu agresif.
+3. Isolasi per `(chain, wallet, token)` / entity.
+4. Fail-closed & archive-not-delete tetap terjaga.
+
+### Yang JANGAN dilakukan (ini sumber over-review)
+- ❌ Jangan refactor/rewrite kode yang sudah benar.
+- ❌ Jangan tambah fitur di luar scope chunk yang ditugaskan.
+- ❌ Jangan nitpick nama variabel, formatting, komentar (formatter/linter otomatis).
+- ❌ Jangan ubah keputusan frozen tanpa instruksi eksplisit.
+- ❌ Jangan kerjakan module lain di luar chunk.
+
+### Definisi "selesai" (stop condition)
+- `cargo test` hijau, dan regression test ditambahkan untuk tiap bug.
+- Laporan **singkat**: bug ditemukan + fix + bukti test. Bukan esai panjang.
+
+---
 
 Dokumen arsitektur final (`PLAN-SWI-final-architecture-2026-08-29.md`) membekukan
 arsitektur "Signal Forge". Dari dokumen itu telah dihasilkan:
