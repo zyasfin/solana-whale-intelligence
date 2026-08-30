@@ -119,6 +119,11 @@ Runtime logic implemented (Phase 1), all in `src/sf/`:
   fail-closed on missing data).
 - `wallet_runtime.rs` — §8.6 exact swap reconstruction → wallet intelligence:
   average cost, realized/unrealized outcome, early-entry timing, recurrence.
+- `portfolio_runtime.rs` — §8.11 portfolio projections: total notional, per-kind
+  subtotals, correlated exposure (union-find, counted once per group), treasury
+  separation check.
+- `source_health_runtime.rs` — §8.12 source-health state machine
+  (UP/SILENT/DEGRADED/DOWN/RECOVERING/DISABLED); connected-but-silent = SILENT.
 
 Review findings (agent hermes, `tests/review_runtime_regressions.rs`) — 4 bugs
 found and fixed, with in-module regression tests added:
@@ -127,8 +132,8 @@ found and fixed, with in-module regression tests added:
 3. Oversell realized full proceeds instead of matched-only → proportional.
 4. Fallback idempotency key too aggressive → now `source + entity + event type
    + time bucket + raw hash` (§7.1); `RawPayload` gained `event_type`.
-- `cargo build` clean; `cargo test` = 148 passed (134 legacy `main.rs` + 4 agent
-  review + 10 in-module regression incl. `wallet_runtime`), 0 failed.
+- `cargo build` clean; `cargo test` = 159 passed (134 legacy `main.rs` + 4 agent
+  review + 21 in-module regression), 0 failed.
 
 ## 8. Known limitations
 
