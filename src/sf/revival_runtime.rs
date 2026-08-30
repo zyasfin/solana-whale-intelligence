@@ -76,7 +76,7 @@ pub fn run_revival(
 /// Whether a revival can proceed from one stage to the next (forward-only, no
 /// regression). `OpportunityEvaluation` is terminal for this flow.
 pub fn can_progress(current: RevivalStage, next: RevivalStage) -> bool {
-    stage_index(next) > stage_index(current)
+    stage_index(next) == stage_index(current) + 1
 }
 
 #[cfg(test)]
@@ -119,5 +119,7 @@ mod tests {
         assert!(can_progress(RevivalStage::Wake, RevivalStage::DormantBaselineComparison));
         assert!(!can_progress(RevivalStage::OpportunityEvaluation, RevivalStage::Wake));
         assert!(!can_progress(RevivalStage::ActivationGate, RevivalStage::ActivationGate));
+        // REV-003-F01: cannot skip stages.
+        assert!(!can_progress(RevivalStage::Wake, RevivalStage::OpportunityEvaluation));
     }
 }
