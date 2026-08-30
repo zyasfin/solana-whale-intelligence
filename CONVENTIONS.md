@@ -140,6 +140,14 @@ Runtime logic implemented (Phase 1), all in `src/sf/`:
   = N/A), range-chamber assembly.
 - `strategy_runtime.rs` — §13 strategy lifecycle (DRAFT→…→RETIRED) + shadow/paper
   evaluation, pause/resume toggle, negative-findings retention.
+- `execution_runtime.rs` — §16 execution state machine + §19 kill-switch gating
+  + §17 signer policy checklist; UNKNOWN_RECONCILIATION blocks new submission.
+- `autonomy_runtime.rs` — §14/§15 AUTO_BOUNDED rollout ladder; claim/close
+  matures before open/reseed; limit raise needs guard + human approval.
+- `browser_runtime.rs` — §4.3 browser worker: capture usability, challenge/
+  session health, cheap-first enrichment gating.
+- `decision_runtime.rs` — §12 decision gating: mandatory component fail-closed,
+  missing capability blocks, reproducibility (evidence required).
 
 Review findings (agent hermes, `tests/review_runtime_regressions.rs`) — 4 bugs
 found and fixed, with in-module regression tests added:
@@ -148,8 +156,8 @@ found and fixed, with in-module regression tests added:
 3. Oversell realized full proceeds instead of matched-only → proportional.
 4. Fallback idempotency key too aggressive → now `source + entity + event type
    + time bucket + raw hash` (§7.1); `RawPayload` gained `event_type`.
-- `cargo build` clean; `cargo test` = 196 passed (134 legacy `main.rs` + 4 agent
-  review + 58 in-module regression), 0 failed.
+- `cargo build` clean; `cargo test` = 218 passed (134 legacy `main.rs` + 4 agent
+  review + 80 in-module regression), 0 failed.
 
 ## 8. Known limitations
 
