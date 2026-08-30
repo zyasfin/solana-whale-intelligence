@@ -1,0 +1,87 @@
+# Solana Whale Intelligence runtime configuration.
+# Runtime profile: "low" (2 vCPU / 4 GB) or "scale" (8 vCPU / 16 GB app workers).
+runtime_profile = "low"
+
+[chains.solana]
+enabled = true
+
+[chains.robinhood]
+enabled = true
+# All Robinhood values are configurable; none are hard-coded network facts.
+# eth_chainId is validated at startup against robinhood_chain_id.
+chain_id = ""              # hex string WITHOUT 0x, e.g. "1a2b3c" (empty => adapter disabled until configured)
+# Helius multi-chain path slug; EVM endpoint derives from [helius].base_url as
+# "{base_url}/v1/{helius_slug}/?api-key=HELIUS_KEY_1" (no separate RPC env var).
+helius_slug = "robinhood"
+native_symbol = ""         # e.g. "ETH"-style native asset symbol when known
+native_decimals = 18
+explorer_url = ""
+start_block = 0
+
+[helius]
+# Free plan per-key defaults per API class. Adjust to your documented plan limits.
+# Shared multi-chain base URL. Solana JSON-RPC/WS and every EVM chain endpoint
+# are derived from it; the default matches the previous hardcoded behavior.
+# base_url = "https://mainnet.helius-rpc.com"
+rpc_rate_per_second = 10
+enhanced_rate_per_second = 2
+wallet_rate_per_second = 2
+max_retries = 3
+timeout_seconds = 30
+
+[gmgn]
+base_url = "https://openapi.gmgn.ai"
+# Weighted token bucket: capacity 20, refill 20/s unless documented otherwise.
+bucket_capacity = 20
+bucket_refill_per_second = 20
+timeout_seconds = 30
+enabled_routes = ["trenches", "trending", "signal", "smartmoney", "kol", "info", "security", "pool", "holders", "traders", "stats", "profits", "activity", "created_tokens"]
+
+[telegram]
+enabled = true
+# Allowlist of public channel usernames. No auto-join; channel must be public/resolvable.
+allowlist = []
+# Global history-fetch concurrency (low profile: 4, scale profile: 32)
+concurrency = 4
+backfill_limit_per_channel = 1000
+
+[funding_radar]
+large_funding_min_sol = 100
+large_funding_min_usd = 10000
+percentile_floor_sol = 10
+percentile = 0.99
+recipient_max_age_days = 7
+preparation_window_days = 7
+fanout_threshold = 3
+preparation_evidence_required = 2
+preparation_alert_confidence = 70
+
+[scoring]
+min_meaningful_trades = 20
+min_tokens_traded = 5
+full_skill_score = 70
+full_copyability_score = 60
+history_completeness_floor = 0.80
+conviction_cap_below_completeness = 49
+
+[signals]
+entry_max_token_age_hours = 24
+entry_min_liquidity_usd = 20000
+market_max_age_seconds = 300
+exit_liquidity_drop_ratio = 0.30
+
+[narrative]
+gmgn_only_confidence_cap = 49
+
+[retention]
+raw_events_days_low = 14
+raw_events_days_scale = 90
+
+[queues]
+# Fixed precedence, highest first. Pause from the bottom upward under pressure.
+precedence = ["live_watch", "funding_radar", "telegram_ingest", "seed_sync", "historical_backfill"]
+historical_backfill_pause_lag_seconds = 60
+
+[server]
+webhook_bind = "127.0.0.1:8787"
+webhook_auth_token = ""

@@ -1,0 +1,50 @@
+[package]
+name = "solana-whale-intelligence"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Solana-first multi-chain on-chain whale intelligence, funding radar, and research signal service"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "rust_decimal", "migrate", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace", "fs"] }
+axum-extra = { version = "0.10", features = ["cookie", "cookie-signed"] }
+uuid = { version = "1", features = ["v4"] }
+hex = "0.4"
+sha2 = "0.10"
+aes-gcm = "0.10"
+bcrypt = "0.17"
+bs58 = "0.5"
+base64 = "0.22"
+rand = "0.8"
+grammers-client = "0.10.0"
+grammers-session = "0.10.0"
+grammers-mtsender = "0.10.0"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+[features]
+# Postgres integration tests (require DATABASE_URL / TEST_DATABASE_URL).
+pg_tests = []
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
