@@ -37,3 +37,7 @@ pub mod dashboard_runtime;
 pub mod graph_runtime;
 pub mod lp_runtime;
 pub mod strategy_runtime;
+pub mod execution_runtime;
+pub mod autonomy_runtime;
+pub mod browser_runtime;
+pub mod decision_runtime;
