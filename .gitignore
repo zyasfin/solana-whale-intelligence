@@ -1,4 +1,5 @@
 /target
+/target-msrv-189
 .env
 *.bin
 tg-session*
