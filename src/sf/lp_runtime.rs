@@ -27,18 +27,22 @@ pub fn fee_to_tvl(fees: Option<&str>, tvl: Option<&str>) -> Option<f64> {
     Some((fees / tvl).to_string().parse::<f64>().ok().unwrap_or(0.0))
 }
 
-/// Whether a pool is in an unsupported protocol scope (Ethereum/Base/BSC are
-/// N/A per frozen §1). This is a scope gate, not a health signal.
+/// Whether a pool's (chain, protocol) is in the frozen LP scope (§1 line 42-47,
+/// §25 line 1358):
+/// - Solana -> Meteora DLMM only.
+/// - Robinhood Chain (`robinhood`/`rh`) -> Uniswap V2/V3/V4 + PancakeSwap V2/V3.
+/// - Ethereum / Base / BSC -> N/A (always false).
+/// This is a scope gate, not a health signal.
 pub fn is_supported_scope(chain: &str, protocol: &LpProtocol) -> bool {
     let chain_l = chain.to_lowercase();
+    let is_robinhood = chain_l == "robinhood" || chain_l == "rh";
     match protocol {
         LpProtocol::MeteoraDlmm => chain_l == "solana",
-        // Robinhood adapters are Solana-indexed per frozen scope.
         LpProtocol::UniswapV2
         | LpProtocol::UniswapV3
         | LpProtocol::UniswapV4
         | LpProtocol::PancakeV2
-        | LpProtocol::PancakeV3 => false, // Ethereum/Base/BSC LP = N/A (frozen §1)
+        | LpProtocol::PancakeV3 => is_robinhood,
     }
 }
 
@@ -100,9 +104,16 @@ mod tests {
     }
 
     #[test]
-    fn scope_gate_rejects_unsupported() {
+    fn scope_gate_matches_frozen_scope() {
         assert!(is_supported_scope("solana", &LpProtocol::MeteoraDlmm));
+        // Robinhood supports Uniswap + Pancake.
+        assert!(is_supported_scope("robinhood", &LpProtocol::UniswapV3));
+        assert!(is_supported_scope("robinhood", &LpProtocol::PancakeV2));
+        assert!(is_supported_scope("rh", &LpProtocol::UniswapV4));
+        // Ethereum/Base/BSC = N/A; Solana is Meteora-only.
         assert!(!is_supported_scope("ethereum", &LpProtocol::UniswapV3));
+        assert!(!is_supported_scope("base", &LpProtocol::PancakeV3));
+        assert!(!is_supported_scope("bsc", &LpProtocol::UniswapV2));
         assert!(!is_supported_scope("solana", &LpProtocol::UniswapV3));
     }
 
