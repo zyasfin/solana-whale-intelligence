@@ -44,7 +44,7 @@ pub fn can_transition(current: StrategyLifecycle, next: StrategyLifecycle) -> bo
     {
         return true;
     }
-    stage_index(next) > stage_index(current)
+    stage_index(next) == stage_index(current) + 1
 }
 
 /// Whether a strategy version is ready to go live: it must be APPROVED (or
@@ -90,6 +90,8 @@ mod tests {
         assert!(!can_transition(StrategyLifecycle::Active, StrategyLifecycle::Draft)); // regression
         assert!(can_transition(StrategyLifecycle::Active, StrategyLifecycle::Paused));
         assert!(can_transition(StrategyLifecycle::Paused, StrategyLifecycle::Active));
+        // REV-003-F05: cannot skip gates (Draft -> Active rejected).
+        assert!(!can_transition(StrategyLifecycle::Draft, StrategyLifecycle::Active));
     }
 
     #[test]
