@@ -41,9 +41,11 @@ arsitektur "Signal Forge". Dari dokumen itu telah dihasilkan:
 
 Status: ini adalah **fondasi/scaffold + runtime parsial**, bukan sistem jadi.
 Tiga blocker arsitektur sudah dibekukan (RESOLVED). Implementasi runtime sudah
-mencakup 7 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime,
-portfolio_runtime, source_health_runtime, plus `source::select_provider`),
-sisanya masih tipe domain.
+mencakup 15 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime,
+portfolio_runtime, source_health_runtime, token_runtime, caller_runtime,
+revival_runtime, narrative_runtime, dashboard_runtime, graph_runtime,
+lp_runtime, strategy_runtime, plus `source::select_provider`), sisanya masih
+tipe domain.
 
 ## 1. Daftar artefak (path lengkap)
 
@@ -86,6 +88,14 @@ execution.rs  autonomy.rs
 /root/swi-src/src/sf/wallet_runtime.rs   — §8.6 swap reconstruction → wallet intel
 /root/swi-src/src/sf/portfolio_runtime.rs — §8.11 portfolio projections + risk
 /root/swi-src/src/sf/source_health_runtime.rs — §8.12 source-health state machine
+/root/swi-src/src/sf/token_runtime.rs        — §8.2 token lifecycle + wake gate
+/root/swi-src/src/sf/caller_runtime.rs       — §8.5 caller intelligence
+/root/swi-src/src/sf/revival_runtime.rs      — §8.8 revival stage progression
+/root/swi-src/src/sf/narrative_runtime.rs    — §8.4 name/meme provenance
+/root/swi-src/src/sf/dashboard_runtime.rs    — §21/§22 dashboard + retention
+/root/swi-src/src/sf/graph_runtime.rs        — §9 entity edges + false confluence
+/root/swi-src/src/sf/lp_runtime.rs           — §8.9 LP pool metrics
+/root/swi-src/src/sf/strategy_runtime.rs     — §13 strategy lifecycle + evaluation
 ```
 
 ### Migration SQL (`/root/swi-deploy/migrations/`)
@@ -151,15 +161,51 @@ helius.rs  telegram_ingest.rs  gmgn.rs  narrative.rs  graph.rs  dll.
     - schema_stale → DEGRADED; consecutive_failures ≥ 3 → DOWN; satu sample
       bagus setelah degraded → RECOVERING (bukan langsung UP); disabled → DISABLED.
     - `apply` harus mutate `ProviderHealth` konsisten dengan `transition`.
+11. `token_runtime.rs` (§8.2) — cek hal berikut:
+    - State verbatim: CREATED/PRE_GRADUATION/MIGRATED/FIRST_LIQUIDITY/ACTIVE/
+      COOLING/DORMANT/ARCHIVED/TOMBSTONED.
+    - `can_advance` forward-only; ARCHIVED & TOMBSTONED terminal (tak bisa lanjut).
+    - `wake_gate` fail-closed: signal harus > baseline; data absen = no wake.
+12. `caller_runtime.rs` (§8.5) — cek hal berikut:
+    - `hit_rate` hanya atas call ber-outcome; tanpa outcome → None (jangan fabricate).
+    - `average_mfe` hanya atas outcome ber-MFE.
+    - `clamp_window_days` cap +21d.
+    - `build_reputation` confidence monotonik (0..1, tak pernah 1.0 persis).
+13. `revival_runtime.rs` (§8.8) — cek hal berikut:
+    - Stage urut: Wake → DormantBaselineComparison → ActivationGate → Refresh →
+      RevivalQuality → OpportunityEvaluation.
+    - Gate fail → berhenti di ActivationGate + failure memory dibawa.
+    - No wake → stay di Wake.
+14. `narrative_runtime.rs` (§8.4) — cek hal berikut:
+    - Stage verbatim (perhatikan `WebXTiktokSearch`, X kapital).
+    - `resolve` ekstrak role originator/adopter/spread; tanpa evidence → stay
+      DeployFirstLiquidity (fail-closed).
+15. `dashboard_runtime.rs` (§21/§22) — cek hal berikut:
+    - `retention_tier`: active → Hot; open window → Warm; else Cold.
+    - `is_operational`: hanya Hot + opportunity_first.
+16. `graph_runtime.rs` (§9) — cek hal berikut:
+    - `is_edge_valid` pakai valid_from/until; timestamp unparseable → false.
+    - `is_false_confluence`: disjoint evidence + low confidence + non-Confirmed.
+    - `neighbor_count` distinct (HashSet).
+17. `lp_runtime.rs` (§8.9) — cek hal berikut:
+    - `fee_to_tvl`: None bila data absen atau TVL=0 (jangan bagi nol).
+    - `is_supported_scope`: ETH/Base/BSC = N/A (Uniswap/Pancake false).
+18. `strategy_runtime.rs` (§13) — cek hal berikut:
+    - Lifecycle verbatim: DRAFT/SHADOW/PAPER/VALIDATED/APPROVED/CANARY/ACTIVE/
+      PAUSED/RETIRED.
+    - `can_transition` forward-only + pause/resume toggle (ACTIVE↔PAUSED); RETIRED
+      terminal.
+    - `shadow_passed` fail-closed: ada rejected candidate = FAIL.
+    - `negative_findings` menjumlah rejected candidates (retention req #13).
 
 ### C. Kualitas SQL
-11. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
-12. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
-13. Enum/CHECK konsisten dengan enum Rust di atas.
+19. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
+20. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
+21. Enum/CHECK konsisten dengan enum Rust di atas.
 
 ### D. Integritas repo
-14. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
-15. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
+22. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
+23. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
     chrono, serde). Catatan: toolchain Rust TIDAK terpasang di host ini.
 
 ## 3. Batas yang diketahui (jangan dilaporkan sebagai bug)
