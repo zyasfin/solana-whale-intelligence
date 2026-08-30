@@ -40,8 +40,9 @@ arsitektur "Signal Forge". Dari dokumen itu telah dihasilkan:
 - 2 dokumen pendukung: `CONVENTIONS.md` + `REUSE_AUDIT.md`.
 
 Status: ini adalah **fondasi/scaffold + runtime parsial**, bukan sistem jadi.
-Tiga blocker arsitektur sudah dibekukan (RESOLVED). Implementasi runtime baru
-3 modul (cost_basis, ingest_runtime, signal_gate), sisanya masih tipe domain.
+Tiga blocker arsitektur sudah dibekukan (RESOLVED). Implementasi runtime sudah
+mencakup 5 modul (cost_basis, ingest_runtime, signal_gate, wallet_runtime, plus
+`source::select_provider`), sisanya masih tipe domain.
 
 ## 1. Daftar artefak (path lengkap)
 
@@ -81,6 +82,7 @@ execution.rs  autonomy.rs
 /root/swi-src/src/sf/cost_basis.rs       — FIFO cost-basis matching
 /root/swi-src/src/sf/ingest_runtime.rs   — ingestion pipeline §7.2
 /root/swi-src/src/sf/signal_gate.rs      — entry signal gate model
+/root/swi-src/src/sf/wallet_runtime.rs   — §8.6 swap reconstruction → wallet intel
 ```
 
 ### Migration SQL (`/root/swi-deploy/migrations/`)
@@ -123,15 +125,25 @@ helius.rs  telegram_ingest.rs  gmgn.rs  narrative.rs  graph.rs  dll.
    invalid, idempotency 2-mode, malformed counted not fatal.
 7. `signal_gate.rs::evaluate_entry_gate` — first-failure-wins, 10 gate berurutan,
    fail-closed pada None (age/liquidity/market), wash vs critical terpisah.
+8. `wallet_runtime.rs` (§8.6) — cek hal berikut:
+   - `reconstruct_swaps` — average cost = open_cost / open_amount (0 jika tak
+     ada lot), realized PnL = Σ matched proceeds − Σ consumed cost, unrealized
+     PnL = mark − residual cost (tanpa mark → −cost, JANGAN fabricate harga).
+   - Reuse `fifo_match` (bukan duplikasi logika FIFO); isolasi per
+     `(chain, wallet, token)` terjaga lewat engine yang sama.
+   - `early_entry_timing` — `wallet_first − token_birth_ts`; `None` bila salah
+     satu timestamp absen (jangan infer timestamp).
+   - `compute_recurrence` — tokens_traded & distinct_clusters dihitung dari
+     `HashSet` (distinct, bukan total swap).
 
 ### C. Kualitas SQL
-8. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
-9. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
-10. Enum/CHECK konsisten dengan enum Rust di atas.
+9. Tidak ada forward-reference FK (tabel dirujuk sebelum di-CREATE).
+10. Migration immutable (tidak mengubah migration yang sudah ada — hanya ADD).
+11. Enum/CHECK konsisten dengan enum Rust di atas.
 
 ### D. Integritas repo
-11. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
-12. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
+12. `lib.rs` valid (`pub mod sf`), `sf/mod.rs` mencantumkan semua module.
+13. `Cargo.toml` punya dependency yang dibutuhkan runtime (rust_decimal,
     chrono, serde). Catatan: toolchain Rust TIDAK terpasang di host ini.
 
 ## 3. Batas yang diketahui (jangan dilaporkan sebagai bug)
