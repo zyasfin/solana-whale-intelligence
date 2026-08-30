@@ -16,51 +16,20 @@
 //! `PolicyLimits`) and introduces no new frozen state.
 
 use super::execution::{KillSwitch, KillSwitchMode, LpAction, SignerPolicy, TradeAction};
+use super::intent::IntentState;
 
-/// Execution states (§16). Reconciliation is a distinct, blocking state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionState {
-    Proposed,
-    Reserved,
-    Quoted,
-    Simulated,
-    Signed,
-    Submitted,
-    Confirmed,
-    FailedSafe,
-    UnknownReconciliation,
-    Cancelled,
-}
+/// Re-export the frozen intent state (doc §16). The execution state machine is
+/// the intent state machine — we do NOT duplicate the transition table
+/// (REV-005-F01): `can_transition` delegates to the frozen
+/// `IntentState::can_transition_to`.
+pub use super::intent::IntentState as ExecutionState;
 
-/// Whether an execution state can transition `current -> next` (forward-only).
-/// UNKNOWN_RECONCILIATION is a blocking state: while UNKNOWN, no new submission
-/// is allowed (doc §16 "No new submission while UNKNOWN").
-pub fn can_transition(current: ExecutionState, next: ExecutionState) -> bool {
-    use ExecutionState::*;
-    // Blocking reconciliation state.
-    if current == UnknownReconciliation {
-        return false;
-    }
-    let idx = |s: ExecutionState| -> u8 {
-        match s {
-            Proposed => 0,
-            Reserved => 1,
-            Quoted => 2,
-            Simulated => 3,
-            Signed => 4,
-            Submitted => 5,
-            Confirmed => 6,
-            FailedSafe => 6, // terminal-ish (sibling of Confirmed)
-            UnknownReconciliation => 6,
-            Cancelled => 6,
-        }
-    };
-    // CANCELLED / FAILED_SAFE are terminal (only reachable, no forward).
-    if matches!(current, Cancelled | FailedSafe) {
-        return false;
-    }
-    // Forward to next stage OR a terminal outcome.
-    idx(next) >= idx(current) && next != current
+/// Whether an execution state can transition `current -> next`, delegated to the
+/// frozen transition table in `intent.rs` (REV-005-F01). This preserves the
+/// reconciliation gate (UNKNOWN_RECONCILIATION only -> CONFIRMED/FAILED_SAFE/
+/// CANCELLED) and the terminal-state rules exactly as frozen.
+pub fn can_transition(current: IntentState, next: IntentState) -> bool {
+    current.can_transition_to(next)
 }
 
 /// Whether a kill switch is halted (blocks new entries/signatures).
@@ -144,18 +113,32 @@ mod tests {
     }
 
     #[test]
-    fn execution_forward_and_terminal() {
-        assert!(can_transition(ExecutionState::Proposed, ExecutionState::Reserved));
+    fn execution_forward_matches_frozen_table() {
+        // Frozen forward path (intent.rs): Proposed -> Approved -> Reserved ->
+        // Built -> Simulated -> Signed -> Submitted -> Confirmed.
+        assert!(can_transition(ExecutionState::Proposed, ExecutionState::Approved));
+        assert!(can_transition(ExecutionState::Approved, ExecutionState::Reserved));
+        assert!(can_transition(ExecutionState::Reserved, ExecutionState::Built));
         assert!(can_transition(ExecutionState::Signed, ExecutionState::Submitted));
         assert!(can_transition(ExecutionState::Submitted, ExecutionState::Confirmed));
-        assert!(!can_transition(ExecutionState::Confirmed, ExecutionState::Proposed)); // regression
-        assert!(!can_transition(ExecutionState::Cancelled, ExecutionState::Confirmed)); // terminal
+        // REV-005-F01: state skip is illegal.
+        assert!(!can_transition(ExecutionState::Proposed, ExecutionState::Submitted));
+        assert!(!can_transition(ExecutionState::Proposed, ExecutionState::Reserved));
+        // Terminal states have no outgoing transition.
+        assert!(!can_transition(ExecutionState::Confirmed, ExecutionState::Proposed));
+        assert!(!can_transition(ExecutionState::Cancelled, ExecutionState::Confirmed));
     }
 
     #[test]
-    fn unknown_reconciliation_blocks_new_submission() {
-        assert!(!can_transition(ExecutionState::UnknownReconciliation, ExecutionState::Proposed));
+    fn reconciliation_allows_only_three_outcomes() {
+        // Frozen: UNKNOWN_RECONCILIATION -> CONFIRMED | FAILED_SAFE | CANCELLED.
+        assert!(can_transition(ExecutionState::Submitted, ExecutionState::UnknownReconciliation));
+        assert!(can_transition(ExecutionState::UnknownReconciliation, ExecutionState::Confirmed));
+        assert!(can_transition(ExecutionState::UnknownReconciliation, ExecutionState::FailedSafe));
+        assert!(can_transition(ExecutionState::UnknownReconciliation, ExecutionState::Cancelled));
+        // No new submission while UNKNOWN.
         assert!(!can_transition(ExecutionState::UnknownReconciliation, ExecutionState::Submitted));
+        assert!(!can_transition(ExecutionState::UnknownReconciliation, ExecutionState::Proposed));
     }
 
     #[test]
