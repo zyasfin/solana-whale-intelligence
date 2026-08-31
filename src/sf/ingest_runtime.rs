@@ -100,13 +100,19 @@ pub fn run_pipeline(
     }
     stages.push(StageResult::Ok(IngestionStage::EnvelopeValidation));
 
-    // 4. Idempotent append — two-phase (REV-011-F05). No durable append backend
-    // in this pure-logic slice: we only CHECK `contains` (read-only), never
-    // `commit`. A retry of a never-persisted payload is not falsely deduped.
+    // 4. Idempotent append — two-phase (REV-011-F05). In this pure-logic slice
+    // there is no durable append backend, so we only CHECK `contains` (read-only)
+    // and never `commit`.
     let key = idempotency_key(raw);
-    let already_seen = idem.contains(&key);
-    if already_seen {
+    if idem.contains(&key) {
+        // REV-013-F02: a committed duplicate stops here — no normalization or
+        // downstream stage processing is repeated.
         deduped = true;
+        stages.push(StageResult::Skipped(
+            IngestionStage::IdempotentAppend,
+            "duplicate committed idempotency key".into(),
+        ));
+        return PipelineOutcome { stages, accepted, deduped };
     }
     stages.push(StageResult::Skipped(
         IngestionStage::IdempotentAppend,
@@ -232,9 +238,14 @@ mod tests {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
         let key = idempotency_key(&one);
-        // Simulate a durable append having committed the key.
         idem.commit(&key);
         let retry = run_pipeline(&one, &mut idem);
         assert!(retry.deduped);
+        // REV-013-F02: a committed duplicate must NOT run normalization/downstream.
+        let has_normalization = retry
+            .stages
+            .iter()
+            .any(|s| matches!(s, StageResult::Ok(IngestionStage::Normalization)));
+        assert!(!has_normalization, "duplicate must not re-run normalization");
     }
 }

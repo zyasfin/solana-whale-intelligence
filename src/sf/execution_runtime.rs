@@ -264,10 +264,18 @@ mod tests {
         let cases: Vec<SignerPolicy> = vec![
             SignerPolicy { workspace_binding_valid: false, ..pass.clone() },
             SignerPolicy { wallet_binding_valid: false, ..pass.clone() },
+            SignerPolicy { policy_binding_valid: false, ..pass.clone() },
             SignerPolicy { idempotency_binding_valid: false, ..pass.clone() },
             SignerPolicy { factory_allowed: false, ..pass.clone() },
+            SignerPolicy { manager_allowed: false, ..pass.clone() },
+            SignerPolicy { pool_verified: false, ..pass.clone() },
             SignerPolicy { authority_verified: false, ..pass.clone() },
             SignerPolicy { gas_ok: false, ..pass.clone() },
+            SignerPolicy { priority_fee_ok: false, ..pass.clone() },
+            SignerPolicy { tip_ok: false, ..pass.clone() },
+            SignerPolicy { rent_ok: false, ..pass.clone() },
+            SignerPolicy { writable_accounts_allowed: false, ..pass.clone() },
+            SignerPolicy { approvals_bounded: false, ..pass.clone() },
             SignerPolicy { instructions_decoded: false, ..pass.clone() },
             SignerPolicy { no_unrelated_operations: false, ..pass.clone() },
         ];

@@ -76,9 +76,21 @@ pub fn resolve(
     }
 
     // REV-011-F07: derive the furthest CONTIGUOUS completed stage from the
-    // resolver's explicit `completed_stages` trace. We stop at the first gap;
-    // a single Exact edge can no longer imply the whole workflow completed.
-    let resolved_stage = contiguous_stage(completed_stages);
+    // resolver's explicit `completed_stages` trace. We stop at the first gap.
+    let mut resolved_stage = contiguous_stage(completed_stages);
+
+    // REV-013-F03: EarliestEvidence (and the final graph) require actual
+    // evidence. If the resolved stage reaches EarliestEvidence or beyond but no
+    // edge carries a non-empty evidence_ref, clamp back to the OCR/ASR stage
+    // (one before EarliestEvidence) — evidence-bound completion.
+    let has_evidence = edges
+        .iter()
+        .any(|e| e.evidence_ref.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false));
+    if stage_index(resolved_stage) >= stage_index(ProvenanceStage::EarliestEvidence)
+        && !has_evidence
+    {
+        resolved_stage = ProvenanceStage::OcrAsrImagePhoneticExpansion;
+    }
 
     NarrativeResolution {
         narrative_key: narrative_key.to_string(),
@@ -170,5 +182,22 @@ mod tests {
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
+    }
+
+    // REV-013-F03: all stages completed but NO edges/evidence -> stop before
+    // EarliestEvidence (clamp to OCR/ASR).
+    #[test]
+    fn all_stages_without_evidence_stops_before_earliest_evidence() {
+        let all_stages = [
+            ProvenanceStage::DeployFirstLiquidity,
+            ProvenanceStage::MetadataFingerprint,
+            ProvenanceStage::LocalArchiveSearch,
+            ProvenanceStage::ExactAliasWebXTiktokSearch,
+            ProvenanceStage::OcrAsrImagePhoneticExpansion,
+            ProvenanceStage::EarliestEvidence,
+            ProvenanceStage::OriginAdoptionPropagationGraph,
+        ];
+        let r = resolve("narr1", &[], &all_stages);
+        assert_eq!(r.resolved_stage, ProvenanceStage::OcrAsrImagePhoneticExpansion);
     }
 }

@@ -15,6 +15,7 @@
 use super::autonomy::{
     AutonomyGuard, AutonomousCycle, RolloutPhase, RolloutThresholds, TradingMode,
 };
+use super::execution::{Action, LpAction};
 
 /// Whether a trading mode permits any autonomous action (AUTO_BOUNDED only).
 /// READ_ONLY/SHADOW/PAPER/CONFIRM_EACH are non-autonomous; PAUSED/HALTED block.
@@ -52,18 +53,14 @@ pub fn limit_raise_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool
         && !guard.evidence_refs.is_empty()
         && guard.can_raise_limit()
 }
-
-/// Single autonomous-action gate (REV-007-F06 + REV-009-F03): gates on
-/// `(mode, phase, action-kind, guard)`.
-/// - mode MUST be AUTO_BOUNDED.
-/// - frozen thresholds MUST be sane (`thresholds_sane`).
-/// - guard must pass (numeric thresholds + human approval + evidence).
-/// - `is_open` (open/reseed actions) requires `AutoBoundedOpenReseed` or later;
-///   claim/close may use the earlier `AutoBoundedClaimClose` rung.
+/// Single authoritative autonomous-action gate (REV-013-F01): gates on
+/// `(mode, phase, action, canary, guard)`. Open/reseed is DERIVED from the typed
+/// `Action` (not a caller boolean), so `Lp(OpenPosition|ReseedPosition)` can
+/// never run at the earlier claim/close rung.
 pub fn autonomous_action_permitted(
     mode: TradingMode,
     phase: RolloutPhase,
-    is_open: bool,
+    action: Action,
     canary: bool,
     guard: &AutonomyGuard,
 ) -> bool {
@@ -76,6 +73,10 @@ pub fn autonomous_action_permitted(
     if !thresholds_sane(&guard.thresholds) {
         return false;
     }
+    let is_open = matches!(
+        action,
+        Action::Lp(LpAction::OpenPosition) | Action::Lp(LpAction::ReseedPosition)
+    );
     let phase_ok = if is_open {
         can_open(phase)
     } else {
@@ -98,16 +99,19 @@ pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
 }
 
 /// Whether an autonomous cycle is ready to run (REV-011-F03): delegates to the
-/// single authoritative `autonomous_action_permitted` gate.
+/// single authoritative `autonomous_action_permitted` gate. The cycle has no
+/// typed action of its own, so it uses a claim/close action as the readiness
+/// floor (mature enough to claim/close).
 pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
     autonomous_action_permitted(
         cycle.mode,
         cycle.phase,
-        false, // claim/close readiness (cycle itself is not an open action)
+        Action::Lp(LpAction::ClaimFees),
         cycle.canary,
         &cycle.guard,
     )
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,11 +209,25 @@ mod tests {
     #[test]
     fn autonomous_action_gate_distinguishes_action_kind() {
         let g = guard(true, 30);
-        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, false, true, &g));
-        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, true, true, &g));
-        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, true, &g));
-        assert!(!autonomous_action_permitted(TradingMode::Paper, RolloutPhase::AutoBoundedOpenReseed, true, true, &g));
-        // REV-011-F03: canary=false must fail the authoritative gate.
-        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, false, &g));
+        // claim/close (ClaimFees) at claim/close rung -> ok.
+        assert!(autonomous_action_permitted(
+            TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose,
+            Action::Lp(LpAction::ClaimFees), true, &g));
+        // open/reseed (OpenPosition) at claim/close rung -> rejected.
+        assert!(!autonomous_action_permitted(
+            TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose,
+            Action::Lp(LpAction::OpenPosition), true, &g));
+        // open at open rung -> ok.
+        assert!(autonomous_action_permitted(
+            TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed,
+            Action::Lp(LpAction::OpenPosition), true, &g));
+        // non-AUTO_BOUNDED -> rejected.
+        assert!(!autonomous_action_permitted(
+            TradingMode::Paper, RolloutPhase::AutoBoundedOpenReseed,
+            Action::Lp(LpAction::OpenPosition), true, &g));
+        // REV-013-F01: canary=false must fail.
+        assert!(!autonomous_action_permitted(
+            TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed,
+            Action::Lp(LpAction::OpenPosition), false, &g));
     }
 }
