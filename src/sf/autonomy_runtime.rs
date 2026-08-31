@@ -44,15 +44,20 @@ pub fn can_claim_close(phase: RolloutPhase) -> bool {
     )
 }
 
-/// Evaluate a limit raise. Mirrors `AutonomyGuard::can_raise_limit` but adds the
-/// explicit ordering rule: a raise is permitted only when the phase is
-/// AutoBoundedClaimClose-or-later AND the numeric guard passes (human approval
-/// already encoded in the guard).
+/// Evaluate a limit raise (REV-013 addendum #1). Delegates to the single
+/// authoritative gate so frozen thresholds (`thresholds_sane`) can never be
+/// bypassed through this helper. A limit raise is a claim/close-class action
+/// (not open/reseed), canary-gated.
 pub fn limit_raise_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool {
-    can_claim_close(phase)
-        && !guard.evidence_refs.is_empty()
-        && guard.can_raise_limit()
+    autonomous_action_permitted(
+        TradingMode::AutoBounded,
+        phase,
+        Action::Lp(LpAction::ClaimFees),
+        true,
+        guard,
+    )
 }
+
 /// Single authoritative autonomous-action gate (REV-013-F01): gates on
 /// `(mode, phase, action, canary, guard)`. Open/reseed is DERIVED from the typed
 /// `Action` (not a caller boolean), so `Lp(OpenPosition|ReseedPosition)` can

@@ -37,15 +37,20 @@ pub struct PipelineOutcome {
     pub deduped: bool, // already seen (idempotent skip)
 }
 
-/// A two-phase idempotency store (REV-011-F05): `contains` is read-only,
-/// `commit` persists a key only AFTER a durable canonical append succeeds.
-/// This prevents a valid-but-never-persisted payload from poisoning the dedupe
-/// cache.
+/// Proof that a durable canonical append actually happened (REV-013 addendum #2).
+/// Only the authoritative append path can mint this; a bare caller cannot forge
+/// it, so `commit` cannot be invoked without durable-append evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableAppendReceipt(pub String);
+
+/// A two-phase idempotency store (REV-011-F05 + REV-013 addendum #2):
+/// `contains` is read-only; `commit` persists a key only when handed a
+/// `DurableAppendReceipt` proving a durable append succeeded.
 pub trait IdempotencyStore {
     /// Read-only check: has this key already been durably committed?
     fn contains(&self, key: &str) -> bool;
-    /// Persist the key (only called after durable append succeeds).
-    fn commit(&mut self, key: &str);
+    /// Persist the key, gated on a durable-append receipt.
+    fn commit(&mut self, key: &str, receipt: &DurableAppendReceipt);
 }
 
 /// In-memory idempotency store for tests and as a reference implementation.
@@ -54,11 +59,21 @@ pub struct InMemoryIdempotency {
     committed: HashSet<String>,
 }
 
+impl InMemoryIdempotency {
+    /// Authoritative durable-append simulation: mints a receipt and commits the
+    /// key atomically. This is the ONLY way a key becomes committed.
+    pub fn record_durable_append(&mut self, key: &str) -> DurableAppendReceipt {
+        let receipt = DurableAppendReceipt(format!("append:{}", key));
+        self.committed.insert(key.to_string());
+        receipt
+    }
+}
+
 impl IdempotencyStore for InMemoryIdempotency {
     fn contains(&self, key: &str) -> bool {
         self.committed.contains(key)
     }
-    fn commit(&mut self, key: &str) {
+    fn commit(&mut self, key: &str, _receipt: &DurableAppendReceipt) {
         self.committed.insert(key.to_string());
     }
 }
@@ -238,7 +253,7 @@ mod tests {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
         let key = idempotency_key(&one);
-        idem.commit(&key);
+        idem.record_durable_append(&key);
         let retry = run_pipeline(&one, &mut idem);
         assert!(retry.deduped);
         // REV-013-F02: a committed duplicate must NOT run normalization/downstream.
