@@ -58,10 +58,40 @@ pub fn limit_raise_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool
     )
 }
 
-/// Single authoritative autonomous-action gate (REV-013-F01): gates on
-/// `(mode, phase, action, canary, guard)`. Open/reseed is DERIVED from the typed
-/// `Action` (not a caller boolean), so `Lp(OpenPosition|ReseedPosition)` can
-/// never run at the earlier claim/close rung.
+/// Action maturity class (REV-015-F01). Risk-reducing claim/close matures before
+/// risk-adding open/reseed. A risk-ADDING action (buy/add/compound) is NOT a
+/// claim/close action and requires open-rung maturity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionMaturity {
+    ClaimClose,
+    Open,
+}
+
+/// Classify an action's maturity, or `None` when the action is not an
+/// autonomous action at all (unknown/unclassified -> reject, fail-closed).
+fn classify_action(action: Action) -> Option<ActionMaturity> {
+    use super::execution::{LpAction, TradeAction};
+    match action {
+        // Risk-reducing claim/close: earliest rung.
+        Action::Lp(LpAction::ClaimFees)
+        | Action::Lp(LpAction::ClosePosition)
+        | Action::Lp(LpAction::PartialWithdraw)
+        | Action::Lp(LpAction::SwapResiduals)
+        | Action::Lp(LpAction::EmergencyExit)
+        | Action::Trade(TradeAction::Sell)
+        | Action::Trade(TradeAction::PartialSell)
+        | Action::Trade(TradeAction::Close)
+        | Action::Trade(TradeAction::EmergencyExit) => Some(ActionMaturity::ClaimClose),
+        // Risk-adding open/reseed: latest rung.
+        Action::Lp(LpAction::OpenPosition)
+        | Action::Lp(LpAction::ReseedPosition)
+        | Action::Lp(LpAction::AddLiquidity)
+        | Action::Lp(LpAction::CompoundFees)
+        | Action::Trade(TradeAction::Buy) => Some(ActionMaturity::Open),
+    }
+}
+
+/// Single authoritative autonomous-action gate (REV-013-F01 + REV-015-F01).
 pub fn autonomous_action_permitted(
     mode: TradingMode,
     phase: RolloutPhase,
@@ -78,14 +108,13 @@ pub fn autonomous_action_permitted(
     if !thresholds_sane(&guard.thresholds) {
         return false;
     }
-    let is_open = matches!(
-        action,
-        Action::Lp(LpAction::OpenPosition) | Action::Lp(LpAction::ReseedPosition)
-    );
-    let phase_ok = if is_open {
-        can_open(phase)
-    } else {
-        can_claim_close(phase)
+    // REV-015-F01: fail-closed on any unclassified action.
+    let Some(maturity) = classify_action(action) else {
+        return false;
+    };
+    let phase_ok = match maturity {
+        ActionMaturity::Open => can_open(phase),
+        ActionMaturity::ClaimClose => can_claim_close(phase),
     };
     phase_ok && !guard.evidence_refs.is_empty() && guard.can_raise_limit()
 }
@@ -234,5 +263,28 @@ mod tests {
         assert!(!autonomous_action_permitted(
             TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed,
             Action::Lp(LpAction::OpenPosition), false, &g));
+    }
+
+    // REV-015-F01: risk-ADDING actions must NOT pass at claim/close rung.
+    #[test]
+    fn risk_adding_actions_rejected_at_claim_close_rung() {
+        let g = guard(true, 30);
+        for action in [
+            Action::Trade(super::super::execution::TradeAction::Buy),
+            Action::Lp(LpAction::AddLiquidity),
+            Action::Lp(LpAction::CompoundFees),
+        ] {
+            assert!(
+                !autonomous_action_permitted(
+                    TradingMode::AutoBounded,
+                    RolloutPhase::AutoBoundedClaimClose,
+                    action,
+                    true,
+                    &g
+                ),
+                "{:?} must not pass at claim/close rung",
+                action
+            );
+        }
     }
 }

@@ -28,6 +28,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-012 | 2026-08-31 | re-review logic fixes F01–F07 | LOGIC APPROVED | 232 passed, 0 failed |
 | REV-013 | 2026-08-31 | independent verification of REV-012 | CHANGES REQUIRED: 4 fixed, 3 partial | 232 passed; Rust 1.89 PASS |
 | REV-014 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 233 passed, 0 failed |
+| REV-015 | 2026-08-31 | independent verification of REV-014 | CHANGES REQUIRED: 2 fixed, 3 partial | 233 passed; Rust 1.89 PASS |
 
 ---
 
@@ -1246,3 +1247,78 @@ cargo test — 233 passed, 0 failed (95 module + 134 legacy + 4 regression)
 ### Verdict
 
 **LOGIC APPROVED** — addendum #1 dan #2 diperbaiki.
+
+---
+
+## REV-015 — Independent verification of REV-014
+
+**Tanggal:** 2026-08-31 08:58 UTC  
+**Mode:** Read-only fix re-review  
+**Git HEAD:** `3ccf180`  
+**Fix commits:** `11bcacb`, `678874b`  
+**Scope:** REV-013 partial findings/addendum + signer test gap only.
+
+### Verdict
+
+**CHANGES REQUIRED.** Beberapa fix benar, tiga authoritative-boundary issue masih terbuka.
+
+```text
+FIXED:   duplicate early return, signer test 16/16
+PARTIAL: autonomy action maturity, durable receipt authority, narrative graph proof
+```
+
+### Accepted fixes
+
+#### Signer test gap — FIXED
+
+Negative table mencakup seluruh 16 field baru; setiap `false` harus membuat `signer_policy_passes` gagal.
+
+#### Duplicate processing — FIXED
+
+Committed duplicate return segera setelah `IdempotentAppend=Skipped`; normalization/downstream tidak dijalankan.
+
+#### Frozen threshold helper bypass — FIXED
+
+`limit_raise_permitted` mendelegasikan ke `autonomous_action_permitted`; frozen `thresholds_sane`, evidence, approval, phase, dan canary tidak lagi dilewati.
+
+### Remaining findings
+
+#### REV-015-F01 — HIGH — Early autonomy rung still allows non-claim/close risk-adding actions
+
+**Location:** `src/sf/autonomy_runtime.rs::autonomous_action_permitted`, lines 58–92.
+
+Typed `Action` menggantikan caller boolean, tetapi classifier hanya menganggap `Lp(OpenPosition|ReseedPosition)` sebagai open. Semua action lain dianggap claim/close dan dapat lolos pada `AutoBoundedClaimClose`, termasuk `Trade(Buy)`, `Lp(AddLiquidity)`, dan `Lp(CompoundFees)`. Frozen rollout menyatakan claim/close matang sebelum open/reseed; early rung tidak boleh menjadi catch-all untuk setiap non-open action.
+
+**Fix:** classify explicit action maturity fail-closed. Early rung hanya action claim/close/risk-reducing yang disetujui; risk-adding token/LP action butuh rung sesuai maturity. Unknown/unclassified action reject. Add regressions for Trade Buy, AddLiquidity, CompoundFees at claim/close rung.
+
+#### REV-015-F02 — HIGH — DurableAppendReceipt forgeable and not bound to key
+
+**Location:** `src/sf/ingest_runtime.rs::DurableAppendReceipt`, lines 40–43; `IdempotencyStore::commit`, lines 49–53; `InMemoryIdempotency::commit`, lines 75–77.
+
+`DurableAppendReceipt(pub String)` has a public tuple field, so any caller can construct it. `commit(key, receipt)` ignores receipt contents and does not verify receipt belongs to the same key. Therefore premature/arbitrary canonical dedupe commit remains possible despite the new type.
+
+**Fix:** make receipt internals private and mint only from authoritative durable append operation; bind receipt cryptographically/structurally to the committed key/backend transaction; `commit` verifies matching receipt or combine append+commit atomically so callers cannot invoke commit independently. Add forged-receipt and cross-key receipt negative tests.
+
+#### REV-015-F03 — MEDIUM — Narrative final graph completion accepts unrelated evidence
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 44–101.
+
+No-evidence trace is now clamped correctly. However one arbitrary edge with any non-empty `evidence_ref` plus a caller-supplied full stage list still yields `OriginAdoptionPropagationGraph`. The gate does not prove `EarliestEvidence` evidence is relevant, nor that final graph assembly has its own completion record/proof.
+
+**Fix:** use typed stage trace carrying evidence/proof per stage. `EarliestEvidence` requires its own evidence ref; `OriginAdoptionPropagationGraph` requires explicit graph-stage completion proof/record. Add regression: full stages + one unrelated evidence edge must not complete final graph.
+
+### Verification
+
+```text
+cargo test --locked
+233 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS
+```
+
+Source files unchanged during review. Temporary review target removed after verification.
+
+### Final status
+
+**CHANGES REQUIRED** — REV-014 must not be treated as independently approved yet.

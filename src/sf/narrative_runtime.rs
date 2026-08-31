@@ -44,7 +44,7 @@ pub fn can_advance(current: ProvenanceStage, next: ProvenanceStage) -> bool {
 pub fn resolve(
     narrative_key: &str,
     edges: &[NarrativeEdge],
-    completed_stages: &[ProvenanceStage],
+    completed_stages: &[(ProvenanceStage, bool)],
 ) -> NarrativeResolution {
     let mut originator: Option<String> = None;
     let mut official_adopter: Option<String> = None;
@@ -75,22 +75,10 @@ pub fn resolve(
         }
     }
 
-    // REV-011-F07: derive the furthest CONTIGUOUS completed stage from the
-    // resolver's explicit `completed_stages` trace. We stop at the first gap.
-    let mut resolved_stage = contiguous_stage(completed_stages);
-
-    // REV-013-F03: EarliestEvidence (and the final graph) require actual
-    // evidence. If the resolved stage reaches EarliestEvidence or beyond but no
-    // edge carries a non-empty evidence_ref, clamp back to the OCR/ASR stage
-    // (one before EarliestEvidence) — evidence-bound completion.
-    let has_evidence = edges
-        .iter()
-        .any(|e| e.evidence_ref.as_deref().map(|r| !r.trim().is_empty()).unwrap_or(false));
-    if stage_index(resolved_stage) >= stage_index(ProvenanceStage::EarliestEvidence)
-        && !has_evidence
-    {
-        resolved_stage = ProvenanceStage::OcrAsrImagePhoneticExpansion;
-    }
+    // REV-015-F03: derive furthest CONTIGUOUS completed stage, where the bool
+    // per stage is its completion proof. EarliestEvidence and the final graph
+    // REQUIRE their own proof=true; a proof-less entry stops progress there.
+    let resolved_stage = contiguous_stage(completed_stages);
 
     NarrativeResolution {
         narrative_key: narrative_key.to_string(),
@@ -103,18 +91,22 @@ pub fn resolve(
 }
 
 /// Furthest stage reached with NO gap, starting from `DeployFirstLiquidity`.
-/// Stages must appear in order; stop at the first missing stage.
-fn contiguous_stage(completed: &[ProvenanceStage]) -> ProvenanceStage {
+/// Each entry is `(stage, has_proof)`. EarliestEvidence (index 5) and the final
+/// graph (index 6) require `has_proof == true`; otherwise progress stops there.
+fn contiguous_stage(completed: &[(ProvenanceStage, bool)]) -> ProvenanceStage {
     let mut expected = 0u8;
     let mut last = ProvenanceStage::DeployFirstLiquidity;
-    for &s in completed {
-        if stage_index(s) == expected {
-            last = s;
-            expected += 1;
-        } else {
-            // Out-of-order or duplicate -> stop (gap detected).
+    for &(s, has_proof) in completed {
+        if stage_index(s) != expected {
+            // Gap or out-of-order -> stop.
             break;
         }
+        // Evidence-bound stages require proof.
+        if stage_index(s) >= stage_index(ProvenanceStage::EarliestEvidence) && !has_proof {
+            break;
+        }
+        last = s;
+        expected += 1;
     }
     last
 }
@@ -149,13 +141,13 @@ mod tests {
             edge("adopter", ProvenanceRole::OfficialAdopter, ProvenanceTruthStatus::Exact),
         ];
         let all_stages = [
-            ProvenanceStage::DeployFirstLiquidity,
-            ProvenanceStage::MetadataFingerprint,
-            ProvenanceStage::LocalArchiveSearch,
-            ProvenanceStage::ExactAliasWebXTiktokSearch,
-            ProvenanceStage::OcrAsrImagePhoneticExpansion,
-            ProvenanceStage::EarliestEvidence,
-            ProvenanceStage::OriginAdoptionPropagationGraph,
+            (ProvenanceStage::DeployFirstLiquidity, true),
+            (ProvenanceStage::MetadataFingerprint, true),
+            (ProvenanceStage::LocalArchiveSearch, true),
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
+            (ProvenanceStage::OcrAsrImagePhoneticExpansion, true),
+            (ProvenanceStage::EarliestEvidence, true),
+            (ProvenanceStage::OriginAdoptionPropagationGraph, true),
         ];
         let r = resolve("narr1", &edges, &all_stages);
         assert_eq!(r.originator.as_deref(), Some("originator_wallet"));
@@ -174,30 +166,28 @@ mod tests {
     // REV-011-F07: a gap in completed_stages stops contiguous progress.
     #[test]
     fn gap_in_stages_stops_before_gap() {
-        // Missing MetadataFingerprint (index 1) -> only DeployFirstLiquidity counted.
         let stages = [
-            ProvenanceStage::DeployFirstLiquidity,
-            ProvenanceStage::LocalArchiveSearch, // gap: skipped MetadataFingerprint
-            ProvenanceStage::ExactAliasWebXTiktokSearch,
+            (ProvenanceStage::DeployFirstLiquidity, true),
+            (ProvenanceStage::LocalArchiveSearch, true), // gap: skipped MetadataFingerprint
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
     }
 
-    // REV-013-F03: all stages completed but NO edges/evidence -> stop before
-    // EarliestEvidence (clamp to OCR/ASR).
+    // REV-015-F03: EarliestEvidence/final graph WITHOUT proof stops there.
     #[test]
-    fn all_stages_without_evidence_stops_before_earliest_evidence() {
-        let all_stages = [
-            ProvenanceStage::DeployFirstLiquidity,
-            ProvenanceStage::MetadataFingerprint,
-            ProvenanceStage::LocalArchiveSearch,
-            ProvenanceStage::ExactAliasWebXTiktokSearch,
-            ProvenanceStage::OcrAsrImagePhoneticExpansion,
-            ProvenanceStage::EarliestEvidence,
-            ProvenanceStage::OriginAdoptionPropagationGraph,
+    fn earliest_evidence_without_proof_stops() {
+        let stages = [
+            (ProvenanceStage::DeployFirstLiquidity, true),
+            (ProvenanceStage::MetadataFingerprint, true),
+            (ProvenanceStage::LocalArchiveSearch, true),
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
+            (ProvenanceStage::OcrAsrImagePhoneticExpansion, true),
+            (ProvenanceStage::EarliestEvidence, false), // no proof
+            (ProvenanceStage::OriginAdoptionPropagationGraph, true),
         ];
-        let r = resolve("narr1", &[], &all_stages);
+        let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::OcrAsrImagePhoneticExpansion);
     }
 }

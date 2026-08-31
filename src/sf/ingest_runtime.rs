@@ -37,19 +37,28 @@ pub struct PipelineOutcome {
     pub deduped: bool, // already seen (idempotent skip)
 }
 
-/// Proof that a durable canonical append actually happened (REV-013 addendum #2).
-/// Only the authoritative append path can mint this; a bare caller cannot forge
-/// it, so `commit` cannot be invoked without durable-append evidence.
+/// Proof that a durable canonical append actually happened (REV-013 addendum #2,
+/// REV-015-F02). The field is PRIVATE and the receipt is bound to a specific
+/// key, so a bare caller cannot forge one or reuse it for a different key.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableAppendReceipt(pub String);
+pub struct DurableAppendReceipt {
+    key: String,
+}
 
-/// A two-phase idempotency store (REV-011-F05 + REV-013 addendum #2):
+impl DurableAppendReceipt {
+    /// Whether this receipt was minted for the given key.
+    pub fn matches(&self, key: &str) -> bool {
+        self.key == key
+    }
+}
+
+/// A two-phase idempotency store (REV-011-F05 + REV-015-F02):
 /// `contains` is read-only; `commit` persists a key only when handed a
-/// `DurableAppendReceipt` proving a durable append succeeded.
+/// `DurableAppendReceipt` bound to that same key.
 pub trait IdempotencyStore {
     /// Read-only check: has this key already been durably committed?
     fn contains(&self, key: &str) -> bool;
-    /// Persist the key, gated on a durable-append receipt.
+    /// Persist the key, gated on a key-matching durable-append receipt.
     fn commit(&mut self, key: &str, receipt: &DurableAppendReceipt);
 }
 
@@ -60,10 +69,10 @@ pub struct InMemoryIdempotency {
 }
 
 impl InMemoryIdempotency {
-    /// Authoritative durable-append simulation: mints a receipt and commits the
-    /// key atomically. This is the ONLY way a key becomes committed.
+    /// Authoritative durable-append simulation: mints a key-bound receipt and
+    /// commits the key atomically. This is the ONLY way a key becomes committed.
     pub fn record_durable_append(&mut self, key: &str) -> DurableAppendReceipt {
-        let receipt = DurableAppendReceipt(format!("append:{}", key));
+        let receipt = DurableAppendReceipt { key: key.to_string() };
         self.committed.insert(key.to_string());
         receipt
     }
@@ -73,8 +82,11 @@ impl IdempotencyStore for InMemoryIdempotency {
     fn contains(&self, key: &str) -> bool {
         self.committed.contains(key)
     }
-    fn commit(&mut self, key: &str, _receipt: &DurableAppendReceipt) {
-        self.committed.insert(key.to_string());
+    fn commit(&mut self, key: &str, receipt: &DurableAppendReceipt) {
+        // REV-015-F02: reject a receipt that is not bound to this key.
+        if receipt.matches(key) {
+            self.committed.insert(key.to_string());
+        }
     }
 }
 
@@ -262,5 +274,16 @@ mod tests {
             .iter()
             .any(|s| matches!(s, StageResult::Ok(IngestionStage::Normalization)));
         assert!(!has_normalization, "duplicate must not re-run normalization");
+    }
+
+    // REV-015-F02: a receipt minted for one key must not commit a different key.
+    #[test]
+    fn cross_key_receipt_is_rejected() {
+        let mut idem = InMemoryIdempotency::default();
+        let receipt = idem.record_durable_append("key-A");
+        // Attempt to commit a different key with the same receipt.
+        idem.commit("key-B", &receipt);
+        assert!(!idem.contains("key-B"), "cross-key receipt must not commit");
+        assert!(idem.contains("key-A"));
     }
 }
