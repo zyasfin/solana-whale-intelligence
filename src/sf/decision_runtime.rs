@@ -21,24 +21,41 @@ pub enum Disposition {
     InsufficientEvidence,
 }
 
-/// Evaluate a decision bundle:
-/// - A missing capability always blocks (fail-closed).
-/// - Any mandatory component with `pass == false` (or `None`, i.e. not resolved)
-///   -> Reject (mandatory gate, §12.2).
+/// Evaluate a decision bundle (fail-closed):
+/// - No evidence snapshot -> InsufficientEvidence (gate #2: reproducible only
+///   from an immutable point-in-time bundle).
+/// - A missing capability -> MissingCapability.
+/// - Any MANDATORY_PASS component not `pass == Some(true)` -> Reject (fail-closed).
+/// - Any HALT_INPUT component with `pass == Some(true)` (a halt signal fired)
+///   -> Reject (source degradation/drawdown/reconciliation incident halt).
 /// - Otherwise -> Approve.
 ///
-/// `pass == None` on a mandatory component is treated as failure (fail-closed);
-/// `None` on a non-mandatory component is tolerated.
+/// SIZING_INPUT and STRATEGY_INPUT are informative only (do not gate).
 pub fn evaluate(bundle: &DecisionBundle) -> Disposition {
+    // REV-007-F04: no evidence -> insufficient (never approve on empty bundle).
+    if bundle.evidence_snapshot_ids.is_empty() {
+        return Disposition::InsufficientEvidence;
+    }
+
     if !bundle.missing_capabilities.is_empty() {
         return Disposition::MissingCapability;
     }
 
     for c in &bundle.component_results {
-        if c.component_class == ComponentClass::Mandatory {
-            match c.pass {
-                Some(true) => {} // mandatory passed
-                Some(false) | None => return Disposition::Reject,
+        match c.component_class {
+            ComponentClass::MandatoryPass => {
+                if c.pass != Some(true) {
+                    return Disposition::Reject;
+                }
+            }
+            ComponentClass::HaltInput => {
+                // A halt input that fires (pass == true) halts the decision.
+                if c.pass == Some(true) {
+                    return Disposition::Reject;
+                }
+            }
+            ComponentClass::SizingInput | ComponentClass::StrategyInput => {
+                // Informative only — no gating.
             }
         }
     }
@@ -52,13 +69,13 @@ pub fn is_reproducible(bundle: &DecisionBundle) -> bool {
     !bundle.evidence_snapshot_ids.is_empty()
 }
 
-/// Count missing mandatory components (those that are Mandatory and unresolved).
+/// Count unresolved MANDATORY_PASS components (those not `pass == Some(true)`).
 /// Useful for the "missingness" metric (doc §20 metrics).
 pub fn unresolved_mandatory(bundle: &DecisionBundle) -> usize {
     bundle
         .component_results
         .iter()
-        .filter(|c| c.component_class == ComponentClass::Mandatory && c.pass != Some(true))
+        .filter(|c| c.component_class == ComponentClass::MandatoryPass && c.pass != Some(true))
         .count()
 }
 
@@ -93,7 +110,16 @@ mod tests {
 
     fn mandatory(name: &str, pass: Option<bool>) -> ComponentResult {
         ComponentResult {
-            component_class: ComponentClass::Mandatory,
+            component_class: ComponentClass::MandatoryPass,
+            component_name: name.into(),
+            pass,
+            result: serde_json::json!({}),
+        }
+    }
+
+    fn halt(name: &str, pass: Option<bool>) -> ComponentResult {
+        ComponentResult {
+            component_class: ComponentClass::HaltInput,
             component_name: name.into(),
             pass,
             result: serde_json::json!({}),
@@ -104,6 +130,13 @@ mod tests {
     fn missing_capability_blocks() {
         let b = bundle(vec!["provider".into()], vec![], vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::MissingCapability);
+    }
+
+    #[test]
+    fn empty_evidence_is_insufficient() {
+        // REV-007-F04: no evidence -> InsufficientEvidence, never Approve.
+        let b = bundle(vec![], vec![mandatory("gate1", Some(true))], vec![]);
+        assert_eq!(evaluate(&b), Disposition::InsufficientEvidence);
     }
 
     #[test]
@@ -119,8 +152,15 @@ mod tests {
     }
 
     #[test]
+    fn halt_input_firing_rejects() {
+        // REV-007-F03: a HALT_INPUT that fires (pass == true) halts the decision.
+        let b = bundle(vec![], vec![mandatory("gate1", Some(true)), halt("drawdown", Some(true))], vec!["e1".into()]);
+        assert_eq!(evaluate(&b), Disposition::Reject);
+    }
+
+    #[test]
     fn all_mandatory_pass_approves() {
-        let b = bundle(vec![], vec![mandatory("gate1", Some(true))], vec!["e1".into()]);
+        let b = bundle(vec![], vec![mandatory("gate1", Some(true)), halt("drawdown", Some(false))], vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::Approve);
     }
 

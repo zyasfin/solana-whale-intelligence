@@ -9,15 +9,20 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum NodeType {
     Token,
+    Contract, // synonym of Token (doc §9 "Token/Contract")
     TokenFamily,
     Wallet,
     WalletCluster,
     Caller,
+    SourceAccount, // synonym of Caller (doc §9 "Caller/SourceAccount")
     Post,
+    Message,       // synonym of Post (doc §9 "Post/Message/ExternalEvent")
+    ExternalEvent, // synonym of Post
     Narrative,
     Pool,
     Position,
     Strategy,
+    Policy, // synonym of Strategy (doc §9 "Strategy/Policy")
     Decision,
     Intent,
     Execution,

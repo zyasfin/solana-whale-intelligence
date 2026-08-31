@@ -35,9 +35,9 @@ pub struct NarrativeEdge {
 #[serde(rename_all = "snake_case")]
 pub enum ProvenanceStage {
     DeployFirstLiquidity,
-    WebXTiktokSearch,
+    MetadataFingerprint, // doc §8.4: metadata fingerprint (was missing, REV-007-F16)
     LocalArchiveSearch,
-    ExactAliasSearch,
+    ExactAliasWebXTiktokSearch, // doc §8.4: exact/alias/web/X/TikTok search
     OcrAsrImagePhoneticExpansion,
     EarliestEvidence,
     OriginAdoptionPropagationGraph,

@@ -4,14 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Component class (doc §12.2). `Mandatory` components gate execution
-/// (fail-closed), `Sizing` components inform position size.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ComponentClass {
-    Mandatory,
-    SizingInput,
-}
+/// Component class (doc §12.2). Re-exported from `portfolio.rs` so there is ONE
+/// canonical four-class taxonomy (REV-007-F03): mandatory/sizing/strategy/halt.
+pub use super::portfolio::ComponentClass;
 
 /// A decision bundle (doc §12.1): immutable point-in-time decision snapshot.
 /// Every decision is reproducible from an immutable point-in-time bundle

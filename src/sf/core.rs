@@ -104,11 +104,12 @@ impl EventEnvelope {
     }
 }
 
-/// A minimal time-bucket helper for the fallback idempotency key. The exact
-/// bucket granularity is a frozen-decision candidate; a conservative hourly
-/// bucket is used here pending a decision.
-fn time_bucket(_observed_at: &str) -> String {
-    // Placeholder: derive a coarse bucket from the timestamp. Kept as a stub so
-    // the scaffold compiles without a chrono dependency in this module.
-    String::new()
+/// An hourly time-bucket for the fallback idempotency key (doc §7.1). Parses an
+/// RFC3339 timestamp; a malformed/empty timestamp fails closed to an empty
+/// bucket, which the caller must treat as "no bucket" (REV-007-F13).
+fn time_bucket(observed_at: &str) -> String {
+    observed_at
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .map(|dt| (dt.timestamp().div_euclid(3600)).to_string())
+        .unwrap_or_default()
 }

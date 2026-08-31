@@ -32,16 +32,20 @@ fn stage_index(s: RevivalStage) -> u8 {
 ///
 /// `wake` — whether the global wake signal fired (stage 0 -> 1 requires this).
 /// `passed_gate` — whether the cheap activation gate passed (stage 2 -> 3
-/// requires this). Both are caller-computed signals; this function only enforces
-/// the gating order and never invents a signal.
+/// requires this). Both are caller-computed signals. Revival quality, evidence,
+/// and failure memory are caller-provided — nothing is fabricated (REV-007-F10).
+/// `token` MUST equal `baseline.token` (reject mismatch). Prior failure memory
+/// stays attached on every path (doc §8.8).
 pub fn run_revival(
     token: &str,
     baseline: &DormantBaseline,
     wake: bool,
     passed_gate: bool,
+    revival_quality: Option<f64>,
+    evidence_refs: Vec<String>,
 ) -> RevivalResult {
-    if !wake {
-        // No wake -> stay at Wake; nothing to refresh.
+    // REV-007-F10: reject a token/baseline mismatch.
+    if token != baseline.token {
         return RevivalResult {
             token: token.to_string(),
             reached_stage: RevivalStage::Wake,
@@ -51,9 +55,17 @@ pub fn run_revival(
         };
     }
 
+    if !wake {
+        return RevivalResult {
+            token: token.to_string(),
+            reached_stage: RevivalStage::Wake,
+            revival_quality: None,
+            passed_activation_gate: false,
+            evidence_refs: baseline.failure_memory.clone(),
+        };
+    }
+
     if !passed_gate {
-        // Fail-closed: activation gate failed -> stop at ActivationGate,
-        // carrying prior failure memory forward (doc §8.8).
         return RevivalResult {
             token: token.to_string(),
             reached_stage: RevivalStage::ActivationGate,
@@ -63,13 +75,12 @@ pub fn run_revival(
         };
     }
 
-    // Gate passed -> proceed through refresh, quality, evaluation.
     RevivalResult {
         token: token.to_string(),
         reached_stage: RevivalStage::OpportunityEvaluation,
-        revival_quality: Some(1.0), // caller-computed quality; 1.0 = full pass placeholder
+        revival_quality,
         passed_activation_gate: true,
-        evidence_refs: vec![format!("wake:{}", token)],
+        evidence_refs,
     }
 }
 
@@ -94,14 +105,16 @@ mod tests {
 
     #[test]
     fn no_wake_stays_at_wake() {
-        let r = run_revival("T1", &baseline(), false, true);
+        let r = run_revival("T1", &baseline(), false, true, None, vec![]);
         assert_eq!(r.reached_stage, RevivalStage::Wake);
         assert!(!r.passed_activation_gate);
+        // Failure memory preserved even on the no-wake path.
+        assert_eq!(r.evidence_refs, vec!["prev_fail".to_string()]);
     }
 
     #[test]
     fn failed_gate_stops_and_carries_failure_memory() {
-        let r = run_revival("T1", &baseline(), true, false);
+        let r = run_revival("T1", &baseline(), true, false, None, vec![]);
         assert_eq!(r.reached_stage, RevivalStage::ActivationGate);
         assert!(!r.passed_activation_gate);
         assert_eq!(r.evidence_refs, vec!["prev_fail".to_string()]);
@@ -109,9 +122,19 @@ mod tests {
 
     #[test]
     fn passed_gate_reaches_evaluation() {
-        let r = run_revival("T1", &baseline(), true, true);
+        let r = run_revival("T1", &baseline(), true, true, Some(0.8), vec!["ev1".into()]);
         assert_eq!(r.reached_stage, RevivalStage::OpportunityEvaluation);
         assert!(r.passed_activation_gate);
+        assert_eq!(r.revival_quality, Some(0.8));
+        assert_eq!(r.evidence_refs, vec!["ev1".to_string()]);
+    }
+
+    // REV-007-F10: token/baseline mismatch must be rejected.
+    #[test]
+    fn token_mismatch_rejected() {
+        let r = run_revival("OTHER", &baseline(), true, true, Some(0.8), vec![]);
+        assert_eq!(r.reached_stage, RevivalStage::Wake);
+        assert!(!r.passed_activation_gate);
     }
 
     #[test]

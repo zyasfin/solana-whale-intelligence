@@ -37,12 +37,14 @@ pub struct SwapReconstruction {
     pub average_cost: HashMap<String, Decimal>,
     /// Realized PnL summed across all closed positions (USD).
     pub realized_pnl: Decimal,
+    /// Realized PnL per token (REV-007-F14): a token's own PnL, not the
+    /// wallet-wide total, so `CostBasis.realized_pnl` is never mis-attributed.
+    pub realized_pnl_by_token: HashMap<String, Decimal>,
     /// Unrealized PnL = current mark value of open lots minus their cost.
     pub unrealized_pnl: Decimal,
     /// Number of tokens this wallet traded (recurrence).
     pub tokens_traded: u32,
-    /// Distinct entity clusters touched (derived from cluster assignment, if
-    /// provided — see `build_wallet_intelligence`).
+    /// Distinct entity clusters touched (derived from cluster assignment).
     pub distinct_clusters: u32,
 }
 
@@ -74,9 +76,10 @@ pub fn reconstruct_swaps(
     let (positions, residual) = fifo_match(&scored);
 
     let realized_pnl: Decimal = positions.iter().map(|p| p.realized_pnl).sum();
-
-    // Average cost per (chain, wallet, token): open cost / open amount
-    // (0 when nothing open).
+    let mut realized_pnl_by_token: HashMap<String, Decimal> = HashMap::new();
+    for p in &positions {
+        *realized_pnl_by_token.entry(p.token.clone()).or_insert(Decimal::ZERO) += p.realized_pnl;
+    }
     let mut average_cost = HashMap::new();
     for ((_chain, _wallet, token), (amount, cost)) in &residual.per_token {
         let avg = if *amount != Decimal::ZERO {
@@ -108,6 +111,7 @@ pub fn reconstruct_swaps(
     SwapReconstruction {
         average_cost,
         realized_pnl,
+        realized_pnl_by_token,
         unrealized_pnl,
         tokens_traded,
         distinct_clusters: 0, // filled by build_wallet_intelligence if clusters provided
@@ -185,7 +189,11 @@ pub fn build_wallet_intelligence(
         .map(|(token, avg)| CostBasis {
             token: token.clone(),
             average_cost: avg.to_string(),
-            realized_pnl: Some(rec.realized_pnl.to_string()),
+            // REV-007-F14: this token's OWN PnL, not the wallet-wide total.
+            realized_pnl: rec
+                .realized_pnl_by_token
+                .get(token)
+                .map(|v| v.to_string()),
         });
 
     // `early_entry_timing` is exposed as a standalone function (the frozen

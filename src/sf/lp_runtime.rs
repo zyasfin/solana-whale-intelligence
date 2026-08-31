@@ -17,13 +17,12 @@ use super::lp::{LpPoolIntelligence, LpProtocol, LpRangeChamber};
 /// when either value is absent or TVL is zero (fail-closed: never divide by
 /// zero or fabricate a ratio from missing data).
 pub fn fee_to_tvl(fees: Option<&str>, tvl: Option<&str>) -> Option<f64> {
-    let fees = parse_decimal(fees?);
-    let tvl = parse_decimal(tvl?);
+    // REV-007-F18: a malformed numeric string is Insufficient (None), not zero.
+    let fees = parse_decimal(fees?)?;
+    let tvl = parse_decimal(tvl?)?;
     if tvl == Decimal::ZERO {
         return None;
     }
-    // ratio as f64 (lossy but acceptable for a display metric; exact math stays
-    // in decimal for accounting).
     Some((fees / tvl).to_string().parse::<f64>().ok().unwrap_or(0.0))
 }
 
@@ -64,11 +63,11 @@ pub fn build_range_chamber(
     }
 }
 
-/// Parse a decimal-string, tolerating empty/absent -> 0.
-fn parse_decimal(s: &str) -> Decimal {
-    s.parse::<Decimal>().unwrap_or(Decimal::ZERO)
+/// Parse a decimal-string (REV-007-F18): malformed -> None (Insufficient), never
+/// zero. Missing != zero (principle #3).
+fn parse_decimal(s: &str) -> Option<Decimal> {
+    s.parse::<Decimal>().ok()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +100,8 @@ mod tests {
         assert_eq!(fee_to_tvl(None, Some("100")), None);
         assert_eq!(fee_to_tvl(Some("10"), None), None);
         assert_eq!(fee_to_tvl(Some("10"), Some("0")), None); // divide by zero
+        // REV-007-F18: malformed numeric is Insufficient, not zero.
+        assert_eq!(fee_to_tvl(Some("invalid"), Some("100")), None);
     }
 
     #[test]

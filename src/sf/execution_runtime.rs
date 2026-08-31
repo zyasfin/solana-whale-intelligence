@@ -80,10 +80,67 @@ pub fn action_permitted(switches: &[KillSwitch], action: TradeAction) -> bool {
     is_risk_reducing(action)
 }
 
+/// Parse a free-form action string into a closed `TradeAction` or `LpAction`,
+/// returning `None` for unknown/arbitrary strings (REV-007-F07). This is the
+/// validator callers MUST use before persisting an intent/decision, so unknown
+/// actions are rejected instead of flowing through as free text.
+pub fn parse_action(s: &str) -> Option<Action> {
+    match s {
+        "buy" | "Buy" | "BUY" => Some(Action::Trade(TradeAction::Buy)),
+        "sell" | "Sell" | "SELL" => Some(Action::Trade(TradeAction::Sell)),
+        "partial_sell" | "PartialSell" | "PARTIAL_SELL" => {
+            Some(Action::Trade(TradeAction::PartialSell))
+        }
+        "close" | "Close" | "CLOSE" => Some(Action::Trade(TradeAction::Close)),
+        "emergency_exit" | "EmergencyExit" | "EMERGENCY_EXIT" => {
+            Some(Action::Trade(TradeAction::EmergencyExit))
+        }
+        "open_position" | "OpenPosition" | "OPEN_POSITION" => {
+            Some(Action::Lp(LpAction::OpenPosition))
+        }
+        "add_liquidity" | "AddLiquidity" | "ADD_LIQUIDITY" => {
+            Some(Action::Lp(LpAction::AddLiquidity))
+        }
+        "claim_fees" | "ClaimFees" | "CLAIM_FEES" => Some(Action::Lp(LpAction::ClaimFees)),
+        "compound_fees" | "CompoundFees" | "COMPOUND_FEES" => {
+            Some(Action::Lp(LpAction::CompoundFees))
+        }
+        "partial_withdraw" | "PartialWithdraw" | "PARTIAL_WITHDRAW" => {
+            Some(Action::Lp(LpAction::PartialWithdraw))
+        }
+        "close_position" | "ClosePosition" | "CLOSE_POSITION" => {
+            Some(Action::Lp(LpAction::ClosePosition))
+        }
+        "reseed_position" | "ReseedPosition" | "RESEED_POSITION" => {
+            Some(Action::Lp(LpAction::ReseedPosition))
+        }
+        "swap_residuals" | "SwapResiduals" | "SWAP_RESIDUALS" => {
+            Some(Action::Lp(LpAction::SwapResiduals))
+        }
+        _ => None,
+    }
+}
+
+/// A closed action: either a token trade or an LP action (REV-007-F07).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Trade(TradeAction),
+    Lp(LpAction),
+}
+
 /// Whether a signer policy checklist passes (every closed check must be true).
-/// A `None` boolean on a mandatory field is a failure (fail-closed).
+/// Mandatory fields are NON-OPTIONAL at sign time: a `None` on chain_id,
+/// chain_genesis, function_selector, max_native_debit, max_token_debit, or
+/// min_output fails closed (REV-007-F05). The signer validates the full
+/// transaction semantics — it never signs with absent mandatory context.
 pub fn signer_policy_passes(p: &SignerPolicy) -> bool {
-    p.policy_active
+    p.chain_id.is_some()
+        && p.chain_genesis.is_some()
+        && p.function_selector.is_some()
+        && p.max_native_debit.is_some()
+        && p.max_token_debit.is_some()
+        && p.min_output.is_some()
+        && p.policy_active
         && p.policy_not_expired
         && p.policy_not_halted
         && p.intent_hash_valid
@@ -162,15 +219,35 @@ mod tests {
     #[test]
     fn signer_policy_is_closed_checklist() {
         let pass = SignerPolicy {
-            chain_id: None, chain_genesis: None, policy_active: true, policy_not_expired: true,
-            policy_not_halted: true, intent_hash_valid: true, nonce_valid: true, router_allowed: true,
-            program_allowed: true, function_selector: None, token_pair_verified: true,
-            recipient_verified: true, max_native_debit: None, max_token_debit: None, min_output: None,
+            chain_id: Some("solana".into()), chain_genesis: Some("genesis".into()),
+            policy_active: true, policy_not_expired: true, policy_not_halted: true,
+            intent_hash_valid: true, nonce_valid: true, router_allowed: true,
+            program_allowed: true, function_selector: Some("0x...".into()),
+            token_pair_verified: true, recipient_verified: true,
+            max_native_debit: Some("1".into()), max_token_debit: Some("1".into()),
+            min_output: Some("0".into()),
             slippage_ok: true, price_impact_ok: true, deadline_ok: true, simulation_delta_ok: true,
         };
         assert!(signer_policy_passes(&pass));
 
         let fail = SignerPolicy { policy_active: false, ..pass.clone() };
         assert!(!signer_policy_passes(&fail));
+
+        // REV-007-F05: a mandatory field set to None must fail closed.
+        let missing_chain = SignerPolicy { chain_id: None, ..pass.clone() };
+        assert!(!signer_policy_passes(&missing_chain));
+        let missing_output = SignerPolicy { min_output: None, ..pass.clone() };
+        assert!(!signer_policy_passes(&missing_output));
+    }
+
+    // REV-007-F07: unknown/arbitrary action strings must be rejected.
+    #[test]
+    fn parse_action_rejects_unknown() {
+        assert_eq!(parse_action("buy"), Some(Action::Trade(TradeAction::Buy)));
+        assert_eq!(parse_action("EMERGENCY_EXIT"), Some(Action::Trade(TradeAction::EmergencyExit)));
+        assert_eq!(parse_action("claim_fees"), Some(Action::Lp(LpAction::ClaimFees)));
+        assert_eq!(parse_action("arbitrary_calldata"), None);
+        assert_eq!(parse_action("wallet_sweep"), None);
+        assert_eq!(parse_action(""), None);
     }
 }

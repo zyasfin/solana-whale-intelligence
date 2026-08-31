@@ -72,11 +72,17 @@ pub fn run_pipeline(
     // 2. Raw evidence write — raw-first (doc §7.2 + ingest.rs old).
     stages.push(StageResult::Ok(IngestionStage::RawEvidenceWrite));
 
-    // 3. Envelope validation — fail-closed (principle #7).
-    if raw.raw_hash.is_empty() || raw.payload_schema_version.is_empty() {
+    // 3. Envelope validation — fail-closed (principle #7). A canonical envelope
+    // requires raw_hash, schema version, a source name, and a non-empty event
+    // type (REV-007-F09: empty source/event type must not be accepted).
+    if raw.raw_hash.is_empty()
+        || raw.payload_schema_version.is_empty()
+        || raw.source_name.is_empty()
+        || raw.event_type.is_empty()
+    {
         stages.push(StageResult::Failed(
             IngestionStage::EnvelopeValidation,
-            "missing raw_hash or payload_schema_version".into(),
+            "incomplete envelope: raw_hash/schema_version/source_name/event_type required".into(),
         ));
         return PipelineOutcome { stages, accepted, deduped };
     }
@@ -94,21 +100,33 @@ pub fn run_pipeline(
     }
     stages.push(StageResult::Ok(IngestionStage::IdempotentAppend));
 
-    // 5. Normalization — parse derived claims. Malformed counts, not fatal
-    // (ingest.rs old): we mark Skipped but do not abort.
-    if let Some(entity_keys) = normalize_entity_keys(raw) {
+    // 5. Normalization — parse derived claims. Malformed counts, not fatal.
+    if let Some(_entity_keys) = normalize_entity_keys(raw) {
         stages.push(StageResult::Ok(IngestionStage::Normalization));
-        // 6. Entity resolution + 7. Graph edges — no-op in this pure slice; the
-        //    real runtime resolves against the entity graph and writes edges.
-        stages.push(StageResult::Ok(IngestionStage::EntityResolution));
-        stages.push(StageResult::Ok(IngestionStage::GraphEdges));
-        // 8. Scalar projections — no-op here.
-        stages.push(StageResult::Ok(IngestionStage::ScalarProjections));
-        // 9. Trigger evaluation — only if normalization produced entity keys.
-        stages.push(StageResult::Ok(IngestionStage::TriggerEvaluation));
-        // 10. Jobs/outbox — enqueue downstream work.
-        stages.push(StageResult::Ok(IngestionStage::JobsOutbox));
-        let _ = entity_keys; // consumed by later stages in the full runtime
+        // 6-10. Persistence-dependent stages are NOT executed in this pure-logic
+        // slice (REV-007-F09): they are marked Skipped, not Ok, so a no-op is
+        // never reported as success. The real runtime wires these to the
+        // evidence graph, projections, trigger, and jobs/outbox.
+        stages.push(StageResult::Skipped(
+            IngestionStage::EntityResolution,
+            "no graph backend (pure logic slice)".into(),
+        ));
+        stages.push(StageResult::Skipped(
+            IngestionStage::GraphEdges,
+            "no graph backend (pure logic slice)".into(),
+        ));
+        stages.push(StageResult::Skipped(
+            IngestionStage::ScalarProjections,
+            "no projection backend (pure logic slice)".into(),
+        ));
+        stages.push(StageResult::Skipped(
+            IngestionStage::TriggerEvaluation,
+            "no trigger backend (pure logic slice)".into(),
+        ));
+        stages.push(StageResult::Skipped(
+            IngestionStage::JobsOutbox,
+            "no jobs/outbox backend (pure logic slice)".into(),
+        ));
         accepted = true;
     } else {
         stages.push(StageResult::Skipped(

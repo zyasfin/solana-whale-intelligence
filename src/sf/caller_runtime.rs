@@ -27,16 +27,18 @@ pub fn clamp_window_days(days: u32) -> u32 {
 /// copy PnL, over calls that have an outcome. Returns `None` when there are no
 /// calls with a resolved outcome (no fabricated hit rate).
 pub fn hit_rate(calls: &[Call]) -> Option<f64> {
+    // Denominator = calls whose outcome has a concrete copy_pnl (REV-007-F15):
+    // a missing copy_pnl is NOT a miss (missing != zero, principle #3).
     let resolved: Vec<&Call> = calls
         .iter()
-        .filter(|c| c.outcome.is_some())
+        .filter(|c| c.outcome.as_ref().and_then(|o| o.copy_pnl).is_some())
         .collect();
     if resolved.is_empty() {
         return None;
     }
     let hits = resolved
         .iter()
-        .filter(|c| c.outcome.as_ref().unwrap().copy_pnl.unwrap_or(0.0) > 0.0)
+        .filter(|c| c.outcome.as_ref().unwrap().copy_pnl.unwrap() > 0.0)
         .count() as f64;
     Some(hits / resolved.len() as f64)
 }
@@ -114,6 +116,16 @@ mod tests {
     fn hit_rate_none_when_no_resolved() {
         let calls = vec![call(None, None), call(None, None)];
         assert_eq!(hit_rate(&calls), None);
+    }
+
+    // REV-007-F15: an outcome present but copy_pnl missing is NOT a miss.
+    #[test]
+    fn hit_rate_excludes_missing_copy_pnl() {
+        let mut no_pnl = call(Some(10.0), Some(20.0));
+        no_pnl.outcome.as_mut().unwrap().copy_pnl = None;
+        let calls = vec![call(Some(10.0), Some(20.0)), no_pnl];
+        let hr = hit_rate(&calls).unwrap();
+        assert_eq!(hr, 1.0); // only the concrete-pnl call counts (1/1)
     }
 
     #[test]

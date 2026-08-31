@@ -31,6 +31,9 @@ pub struct HealthSignal {
     pub consecutive_failures: u32,
     /// Whether the provider is explicitly disabled by policy.
     pub disabled: bool,
+    /// Current wall-clock time (unix seconds), used to judge recency. Without
+    /// this, two old-but-close timestamps would still look "on-time" (REV-007-F08).
+    pub now_secs: i64,
 }
 
 /// The next health state, computed from the current state + a fresh signal.
@@ -52,17 +55,13 @@ pub fn transition(current: &ProviderHealth, signal: &HealthSignal) -> SourceHeal
     if signal.consecutive_failures >= 3 {
         return SourceHealthState::Down;
     }
-
-    // Success-based rules: a recent success drives the "up" path.
     if let Some(success) = signal.last_success_secs {
+        // Cadence is judged by recency against NOW, not the delta between two
+        // historical timestamps (REV-007-F08): now - last_success must be
+        // within the expected cadence, otherwise the source has gone silent.
         let cadence_ok = signal
             .expected_cadence_secs
-            .map(|c| {
-                signal
-                    .last_request_secs
-                    .map(|req| req - success <= c)
-                    .unwrap_or(false)
-            })
+            .map(|c| signal.now_secs - success <= c)
             .unwrap_or(false);
 
         if cadence_ok && !signal.schema_stale {
@@ -118,108 +117,80 @@ mod tests {
         ProviderHealth::default()
     }
 
+    // Helper: a signal at time `now` with the given success/failures.
+    fn sig(now: i64, success: Option<i64>, failures: u32, disabled: bool) -> HealthSignal {
+        HealthSignal {
+            last_success_secs: success,
+            last_request_secs: Some(now),
+            expected_cadence_secs: Some(60),
+            parser_success_rate: success.map(|_| 1.0),
+            schema_stale: false,
+            consecutive_failures: failures,
+            disabled,
+            now_secs: now,
+        }
+    }
+
     #[test]
     fn connected_but_silent_is_not_healthy() {
-        // Requests keep flowing (last_request_secs recent) but no success and
-        // cadence broken -> SILENT, never UP.
-        let sig = HealthSignal {
-            last_success_secs: None,
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: None,
-            schema_stale: false,
-            consecutive_failures: 0,
-            disabled: false,
-        };
-        assert_eq!(transition(&base(), &sig), SourceHealthState::Silent);
+        // No success at all -> SILENT, never UP.
+        let s = sig(1000, None, 0, false);
+        assert_eq!(transition(&base(), &s), SourceHealthState::Silent);
     }
 
     #[test]
     fn on_time_success_is_up() {
-        let sig = HealthSignal {
-            last_success_secs: Some(1000),
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: false,
-            consecutive_failures: 0,
-            disabled: false,
+        // A provider already UP stays UP on on-time success.
+        let mut h = base();
+        h.state = SourceHealthState::Up;
+        let s = sig(1000, Some(1000), 0, false);
+        assert_eq!(transition(&h, &s), SourceHealthState::Up);
+    }
+
+    #[test]
+    fn stale_success_is_silent_not_up() {
+        // REV-007-F08: success was 3600s ago but cadence is 60s -> SILENT.
+        let s = HealthSignal {
+            now_secs: 5000,
+            ..sig(5000, Some(1000), 0, false)
         };
-        assert_eq!(transition(&base(), &sig), SourceHealthState::Up);
+        assert_eq!(transition(&base(), &s), SourceHealthState::Silent);
     }
 
     #[test]
     fn schema_stale_is_degraded() {
-        let sig = HealthSignal {
-            last_success_secs: Some(1000),
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: true,
-            consecutive_failures: 0,
-            disabled: false,
-        };
-        assert_eq!(transition(&base(), &sig), SourceHealthState::Degraded);
+        let mut s = sig(1000, Some(1000), 0, false);
+        s.schema_stale = true;
+        assert_eq!(transition(&base(), &s), SourceHealthState::Degraded);
     }
 
     #[test]
     fn hard_failures_are_down() {
-        let sig = HealthSignal {
-            last_success_secs: None,
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: None,
-            schema_stale: false,
-            consecutive_failures: 5,
-            disabled: false,
-        };
-        assert_eq!(transition(&base(), &sig), SourceHealthState::Down);
+        let s = sig(1000, None, 5, false);
+        assert_eq!(transition(&base(), &s), SourceHealthState::Down);
     }
 
     #[test]
     fn disabled_overrides_everything() {
-        let sig = HealthSignal {
-            last_success_secs: Some(1000),
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: false,
-            consecutive_failures: 0,
-            disabled: true,
-        };
-        assert_eq!(transition(&base(), &sig), SourceHealthState::Disabled);
+        let s = sig(1000, Some(1000), 0, true);
+        assert_eq!(transition(&base(), &s), SourceHealthState::Disabled);
     }
 
     #[test]
     fn degraded_recovers_not_instantly_up() {
         let mut h = base();
         h.state = SourceHealthState::Degraded;
-        let sig = HealthSignal {
-            last_success_secs: Some(1000),
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: false,
-            consecutive_failures: 0,
-            disabled: false,
-        };
+        let s = sig(1000, Some(1000), 0, false);
         // One good sample after degraded -> RECOVERING, not UP.
-        assert_eq!(transition(&h, &sig), SourceHealthState::Recovering);
+        assert_eq!(transition(&h, &s), SourceHealthState::Recovering);
     }
 
     #[test]
     fn apply_mutates_health_record() {
         let mut h = base();
-        let sig = HealthSignal {
-            last_success_secs: Some(1000),
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: false,
-            consecutive_failures: 0,
-            disabled: false,
-        };
-        let st = apply(&mut h, &sig);
+        h.state = SourceHealthState::Up;
+        let s = sig(1000, Some(1000), 0, false);
+        let st = apply(&mut h, &s);
         assert_eq!(st, SourceHealthState::Up);
         assert_eq!(h.state, SourceHealthState::Up);
         assert_eq!(h.last_success_at.as_deref(), Some("1000"));
@@ -232,20 +203,17 @@ mod tests {
     fn failures_dominate_historical_success() {
         let mut h = base();
         h.last_success_at = Some("900".to_string()); // historical success
-        let sig = HealthSignal {
-            last_success_secs: Some(900), // still Some (historical), but...
-            last_request_secs: Some(1000),
-            expected_cadence_secs: Some(60),
-            parser_success_rate: Some(1.0),
-            schema_stale: false,
-            consecutive_failures: 3, // 3 recent failures
-            disabled: false,
-        };
-        assert_eq!(transition(&h, &sig), SourceHealthState::Down);
-
+        let s = sig(1000, Some(900), 3, false);
+        assert_eq!(transition(&h, &s), SourceHealthState::Down);
         // apply must also produce DOWN and NOT reset the counter to 0.
-        let st = apply(&mut h, &sig);
+        let st = apply(&mut h, &s);
         assert_eq!(st, SourceHealthState::Down);
         assert_eq!(h.consecutive_failures, 3);
+    }
+
+    // REV-007-F08: default is SILENT, not UP.
+    #[test]
+    fn default_state_is_silent() {
+        assert_eq!(ProviderHealth::default().state, SourceHealthState::Silent);
     }
 }

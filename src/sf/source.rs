@@ -63,8 +63,11 @@ pub struct ProviderHealth {
 
 impl Default for ProviderHealth {
     fn default() -> Self {
+        // REV-007-F08: a fresh provider has no request/event/success yet, so it
+        // must NOT default to UP (connected-but-silent is not healthy). Start
+        // SILENT until the first on-time success is observed.
         Self {
-            state: SourceHealthState::Up,
+            state: SourceHealthState::Silent,
             last_request_at: None,
             last_event_at: None,
             last_success_at: None,

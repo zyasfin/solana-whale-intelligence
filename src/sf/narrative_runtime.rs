@@ -20,9 +20,9 @@ use super::token::{ProvenanceRole, ProvenanceTruthStatus};
 fn stage_index(s: ProvenanceStage) -> u8 {
     match s {
         ProvenanceStage::DeployFirstLiquidity => 0,
-        ProvenanceStage::WebXTiktokSearch => 1,
+        ProvenanceStage::MetadataFingerprint => 1,
         ProvenanceStage::LocalArchiveSearch => 2,
-        ProvenanceStage::ExactAliasSearch => 3,
+        ProvenanceStage::ExactAliasWebXTiktokSearch => 3,
         ProvenanceStage::OcrAsrImagePhoneticExpansion => 4,
         ProvenanceStage::EarliestEvidence => 5,
         ProvenanceStage::OriginAdoptionPropagationGraph => 6,
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn stage_advances_forward_only() {
-        assert!(can_advance(ProvenanceStage::DeployFirstLiquidity, ProvenanceStage::WebXTiktokSearch));
+        assert!(can_advance(ProvenanceStage::DeployFirstLiquidity, ProvenanceStage::MetadataFingerprint));
         assert!(!can_advance(ProvenanceStage::EarliestEvidence, ProvenanceStage::DeployFirstLiquidity));
     }
 

@@ -48,7 +48,19 @@ pub fn can_claim_close(phase: RolloutPhase) -> bool {
 /// AutoBoundedClaimClose-or-later AND the numeric guard passes (human approval
 /// already encoded in the guard).
 pub fn limit_raise_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool {
-    can_claim_close(phase) && guard.can_raise_limit()
+    can_claim_close(phase)
+        && !guard.evidence_refs.is_empty()
+        && guard.can_raise_limit()
+}
+
+/// Single autonomous-action gate (REV-007-F06): mode, phase maturity, frozen
+/// thresholds + evidence + human approval (all inside `can_raise_limit`).
+/// This is the one entry point callers should use to decide whether an
+/// autonomous action may run.
+pub fn autonomous_action_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool {
+    can_claim_close(phase)
+        && !guard.evidence_refs.is_empty()
+        && guard.can_raise_limit()
 }
 
 /// Validate frozen rollout thresholds are sane (min sample > 0, horizon > 0,
@@ -62,11 +74,16 @@ pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
         && t.requires_human_approval
 }
 
-/// Whether an autonomous cycle is ready to run: mode is AUTO_BOUNDED and the
-/// phase is at least claim/close. Canary (limited-scale first run) is required
-/// before full AUTO_BOUNDED.
+/// Whether an autonomous cycle is ready to run (REV-007-F06): mode is
+/// AUTO_BOUNDED, phase is at least claim/close, canary is set, AND the guard
+/// passes (numeric thresholds + human approval + evidence). A cycle with no
+/// evidence refs or a failing guard is NOT ready.
 pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
-    is_autonomous(cycle.mode) && can_claim_close(cycle.phase) && cycle.canary
+    is_autonomous(cycle.mode)
+        && can_claim_close(cycle.phase)
+        && cycle.canary
+        && !cycle.guard.evidence_refs.is_empty()
+        && cycle.guard.can_raise_limit()
 }
 
 #[cfg(test)]
@@ -80,7 +97,7 @@ mod tests {
             forward_horizon_days: 14,
             current_drawdown_pct: -5.0,
             ci_lower_bound: 0.1,
-            evidence_refs: vec![],
+            evidence_refs: vec!["ev1".into()],
             human_approved: approved,
         }
     }
@@ -130,6 +147,22 @@ mod tests {
         };
         assert!(cycle_ready(&c));
         c.canary = false;
+        assert!(!cycle_ready(&c));
+    }
+
+    // REV-007-F06: a cycle with no evidence refs is NOT ready, even if all
+    // other gates pass.
+    #[test]
+    fn cycle_ready_requires_evidence() {
+        let mut g = guard(true, 30);
+        g.evidence_refs = vec![];
+        let c = AutonomousCycle {
+            mode: TradingMode::AutoBounded,
+            phase: RolloutPhase::AutoBoundedClaimClose,
+            guard: g,
+            canary: true,
+            max_notional: None,
+        };
         assert!(!cycle_ready(&c));
     }
 }

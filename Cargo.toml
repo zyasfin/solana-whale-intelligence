@@ -2,7 +2,7 @@
 name = "solana-whale-intelligence"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Solana-first multi-chain on-chain whale intelligence, funding radar, and research signal service"
 
 [dependencies]
