@@ -237,7 +237,7 @@ mod tests {
         let fail = SignerPolicy { policy_active: false, ..pass.clone() };
         assert!(!signer_policy_passes(&fail));
         let missing_output = SignerPolicy { min_output: None, ..pass.clone() };
-        // REV-009 addendum #1: empty string must also fail.
+        assert!(!signer_policy_passes(&missing_output));
         let empty_chain = SignerPolicy { chain_id: Some("".into()), ..pass.clone() };
         assert!(!signer_policy_passes(&empty_chain));
     }
