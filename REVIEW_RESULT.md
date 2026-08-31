@@ -29,6 +29,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-013 | 2026-08-31 | independent verification of REV-012 | CHANGES REQUIRED: 4 fixed, 3 partial | 232 passed; Rust 1.89 PASS |
 | REV-014 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 233 passed, 0 failed |
 | REV-015 | 2026-08-31 | independent verification of REV-014 | CHANGES REQUIRED: 2 fixed, 3 partial | 233 passed; Rust 1.89 PASS |
+| REV-016 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 235 passed, 0 failed |
 
 ---
 
@@ -1322,3 +1323,48 @@ Source files unchanged during review. Temporary review target removed after veri
 ### Final status
 
 **CHANGES REQUIRED** — REV-014 must not be treated as independently approved yet.
+
+---
+
+## REV-016 — Re-review logic fixes (REV-015 F01–F03)
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Mode:** Re-verifikasi fix (read-only)
+**Acuan:** REV-015 temuan F01, F02, F03
+**Scope:** semua temuan logic REV-015 (bukan integration)
+
+### Hasil fix
+
+#### F01 — ACCEPTED — Action maturity fail-closed
+- `classify_action` memetakan action ke `ActionMaturity::{ClaimClose, Open}`:
+  risk-reducing (ClaimFees/ClosePosition/PartialWithdraw/SwapResiduals/LP EmergencyExit/
+  Trade Sell/PartialSell/Close/EmergencyExit) = ClaimClose; risk-adding
+  (OpenPosition/ReseedPosition/AddLiquidity/CompoundFees/Trade Buy) = Open.
+  Unknown action -> reject. Risk-adding tidak lagi lolos di claim/close rung.
+
+#### F02 — ACCEPTED — Key-bound private receipt
+- `DurableAppendReceipt` field private + `matches(key)`; `commit(key, receipt)`
+  menolak receipt yang tidak terikat ke key. `record_durable_append` satu-satunya
+  jalur authoritative.
+
+#### F03 — ACCEPTED — Per-stage evidence/proof
+- `resolve(…, completed_stages: &[(ProvenanceStage, bool)])`; bool = completion
+  proof per stage. EarliestEvidence & final graph wajib proof=true, selain itu
+  progress berhenti.
+
+### Regression tests
+- Trade Buy / AddLiquidity / CompoundFees di claim/close rung -> reject.
+- Cross-key receipt -> tidak commit.
+- EarliestEvidence tanpa proof -> stop di OCR/ASR.
+
+### Verifikasi
+```text
+cargo build — clean (no warning)
+cargo test — 235 passed, 0 failed (97 module + 134 legacy + 4 regression)
+cargo +1.89.0 check --locked --all-targets — PASS
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic REV-015 diperbaiki. Produk tetap
+PARTIAL FOUNDATION; blocker integration deferred.
