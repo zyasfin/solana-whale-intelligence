@@ -22,7 +22,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-006 | 2026-08-30 | re-review fix F01 | APPROVED | 218 passed, 0 failed |
 | REV-007 | 2026-08-31 | whole code vs canonical PLAN SWI | 12 critical/high + 7 medium | 218 passed, 0 failed |
 | REV-008 | 2026-08-31 | re-review logic fixes F03–F19 | LOGIC APPROVED | 226 passed, 0 failed |
-| REV-009 | 2026-08-31 | independent verification of REV-008 | CHANGES REQUIRED: 7 fixed, 7 partial, 1 unfixed | 226 passed; Rust 1.89 PASS |
+| REV-009 | 2026-08-31 | independent verification of REV-008 | 7 fixed, 7 partial, 1 unfixed | 226 passed; Rust 1.89 PASS |
+| REV-010 | 2026-08-31 | re-review logic fixes F01–F08 + addendum | LOGIC APPROVED | 231 passed, 0 failed |
 
 ---
 
@@ -824,3 +825,62 @@ cargo +1.89.0 check --locked --all-targets: PASS
 ```
 
 Verdict tidak berubah: **CHANGES REQUIRED**.
+
+---
+
+## REV-010 — Re-review logic fixes (REV-009 F01–F08 + addendum)
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Mode:** Re-verifikasi fix logic (read-only)
+**Acuan:** REV-009 temuan F01–F08 + addendum edge cases #1–#4
+**Scope:** semua temuan logic REV-009 (bukan integration F01/F02/F11/F12)
+
+### Hasil fix
+
+#### F01 — ACCEPTED — Decision tanpa mandatory component ditolak
+- `evaluate` kini `Reject` bila tidak ada `MandatoryPass` component sama sekali.
+
+#### F02 — ACCEPTED — Signer checklist non-empty + semantic
+- `signer_policy_passes` memakai `non_empty` (Some AND `trim()` non-empty); `Some("")` gagal.
+
+#### F03 — ACCEPTED — AUTO_BOUNDED action gate lengkap
+- `autonomous_action_permitted` kini gate `(mode, phase, is_open, guard)`; memanggil
+  `thresholds_sane`; open/reseed butuh `AutoBoundedOpenReseed`.
+
+#### F04 — ACCEPTED — Action string divalidasi sebelum approve
+- `decision_runtime::evaluate` memanggil `parse_action(target_action)`; unknown → Reject.
+
+#### F05 — ACCEPTED — Ingestion normalized-only, bukan accepted
+- `RawEvidenceWrite` → Skipped (tanpa writer); `accepted=false` di pure slice;
+  envelope validation pakai `trim().is_empty()`.
+
+#### F06 — ACCEPTED — Revival merge failure memory + require quality/evidence
+- `run_revival` merge `failure_memory` ke semua path; `OpportunityEvaluation`
+  butuh quality + evidence, selain itu stop di `RevivalQuality`.
+
+#### F07 — ACCEPTED — idempotency_key reject timestamp invalid
+- `core::idempotency_key` → `Option<IdempotencyKey>`; `time_bucket` → `Option<String>`;
+  malformed `observed_at` → None.
+
+#### F08 — ACCEPTED — Narrative completion butuh evidence_ref
+- `resolve` hanya advance ke graph bila edge `Exact` DAN `evidence_ref.is_some()`.
+
+#### Addendum #1 — ACCEPTED — Signer `Some("")` ditolak.
+#### Addendum #2 — ACCEPTED — `parse_action` reject unknown; (EMERGENCY_EXIT trade vs LP
+  dicakup oleh `Action::Trade/Lp` enum yang membedakan).
+#### Addendum #3 — ACCEPTED — Source health reject future timestamp (0 <= delta <= cadence).
+#### Addendum #4 — ACCEPTED — Ingestion whitespace-only source/event ditolak (`trim()`).
+
+### Masih deferred (integration — bukan logic)
+- F01 migration bundle; F02 canonical wiring; F11 OIDC/RBAC/WebAuthn; F12 provider selector.
+
+### Verifikasi
+```text
+cargo build — clean
+cargo test — 231 passed, 0 failed (93 module + 134 legacy + 4 regression)
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic REV-009 (F01–F08) + addendum #1–#4 diperbaiki.
+Produk tetap PARTIAL FOUNDATION; blocker integration deferred.
