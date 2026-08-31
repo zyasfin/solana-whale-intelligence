@@ -1216,3 +1216,33 @@ cargo +1.89.0 check --locked --all-targets — PASS
 
 **LOGIC APPROVED** — seluruh temuan logic REV-013 diperbaiki. Produk tetap
 PARTIAL FOUNDATION; blocker integration deferred.
+
+---
+
+## REV-014 addendum — Re-review REV-013 addendum #1 & #2
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Scope:** REV-013 "Independent reviewer addendum" dua bypass.
+
+### Hasil fix
+
+#### Addendum #1 — ACCEPTED — limit_raise_permitted delegasi ke authoritative gate
+- `limit_raise_permitted` kini memanggil `autonomous_action_permitted(...)`, sehingga
+  `thresholds_sane` (frozen) tidak bisa dilewati lewat helper ini.
+
+#### Addendum #2 — ACCEPTED — commit gated oleh durable append receipt
+- Tambah `DurableAppendReceipt`; `IdempotencyStore::commit(key, receipt)` tidak bisa
+  dipanggil tanpa receipt. `InMemoryIdempotency::record_durable_append` adalah
+  satu-satunya jalur authoritative yang mint receipt + commit atomik.
+- Test `retry_after_commit_is_duplicate` memakai `record_durable_append`, bukan
+  commit manual.
+
+### Verifikasi
+```text
+cargo build — clean (no warning)
+cargo test — 233 passed, 0 failed (95 module + 134 legacy + 4 regression)
+```
+
+### Verdict
+
+**LOGIC APPROVED** — addendum #1 dan #2 diperbaiki.
