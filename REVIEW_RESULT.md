@@ -26,6 +26,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-010 | 2026-08-31 | re-review logic fixes F01–F08 + addendum | LOGIC APPROVED | 231 passed, 0 failed |
 | REV-011 | 2026-08-31 | independent verification of REV-010 | CHANGES REQUIRED: 1 fixed, 7 partial | 231 passed; Rust 1.89 PASS |
 | REV-012 | 2026-08-31 | re-review logic fixes F01–F07 | LOGIC APPROVED | 232 passed, 0 failed |
+| REV-013 | 2026-08-31 | independent verification of REV-012 | CHANGES REQUIRED: 4 fixed, 3 partial | 232 passed; Rust 1.89 PASS |
+| REV-014 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 233 passed, 0 failed |
 
 ---
 
@@ -1061,3 +1063,156 @@ cargo +1.89.0 check --locked --all-targets — PASS
 
 **LOGIC APPROVED** — seluruh temuan logic REV-011 (F01–F07) diperbaiki. Produk tetap
 PARTIAL FOUNDATION; blocker integration (migration, wiring, auth, provider) deferred.
+
+---
+
+## REV-013 — Independent verification of REV-012
+
+**Tanggal:** 2026-08-31 08:21 UTC  
+**Mode:** Read-only fix re-review  
+**Git HEAD:** `534f53f`  
+**Fix commits:** `15ceb3a`, `87ecb55`  
+**Scope:** REV-011 F01–F07 only.
+
+### Verdict
+
+**CHANGES REQUIRED.** Four findings are fixed; three remain partial.
+
+```text
+FIXED:   F01, F02 logic, F04, F06
+PARTIAL: F03, F05, F07
+TEST GAP: F02 tests only 8/16 appended fields
+```
+
+### Accepted fixes
+
+#### F01 — FIXED — Decision required set + freshness
+
+`REQUIRED_MANDATORY` contains the approved four names. Each must appear exactly once as `MandatoryPass` and pass. Evidence and non-empty `source_freshness` are required.
+
+#### F02 — FIXED LOGIC / TEST GAP — Signer §17 checklist
+
+All 16 approved fields are appended to `SignerPolicy`; `signer_policy_passes` requires every old/new check plus non-empty mandatory strings.
+
+Regression requirement was “each new field false → fail”, but the table-driven test covers only 8 of 16 fields. Missing negative cases: `policy_binding_valid`, `manager_allowed`, `pool_verified`, `priority_fee_ok`, `tip_ok`, `rent_ok`, `writable_accounts_allowed`, `approvals_bounded`.
+
+**Minimum follow-up:** add the eight missing negative cases. Logic itself is correct.
+
+#### F04 — FIXED — Canonical Action boundary
+
+`execution::Action` is tagged `Trade|Lp`; both `Intent.action` and `DecisionBundle.target_action` use it. Trade and LP emergency exits are structurally distinct. String parser is now ingress convenience, not canonical storage.
+
+#### F06 — FIXED — Timestamp validation all idempotency modes
+
+`EventEnvelope::idempotency_key` validates mandatory `observed_at` before StableId/Fallback branching. Malformed StableId returns `None`.
+
+### Remaining findings
+
+#### REV-013-F01 — HIGH — Autonomy authoritative gate still uses caller boolean, not typed Action
+
+**Location:** `src/sf/autonomy_runtime.rs::autonomous_action_permitted`, lines 63–85; `cycle_ready`, lines 102–111.
+
+Threshold minimums, mode, approval, evidence, and canary are now enforced. However action maturity is still supplied as `is_open: bool`. A caller can pass `false` for `Action::Lp(OpenPosition|ReseedPosition)` and run it at `AutoBoundedClaimClose`. `cycle_ready` always delegates with `false`, despite having no typed action.
+
+**Fix:** accept canonical `Action`/`LpAction`; derive open/reseed vs claim/close internally. `cycle_ready` should be generic readiness only or receive the actual action. Add regression: `Lp(OpenPosition)` at claim/close rung rejects regardless of caller flags.
+
+#### REV-013-F02 — MEDIUM — Duplicate committed payload continues normalization
+
+**Location:** `src/sf/ingest_runtime.rs::run_pipeline`, lines 106–154.
+
+Two-phase store correctly avoids committing without durable append. But when `contains(key)==true`, code sets `deduped=true` then continues normalization and downstream stage reporting. A canonical duplicate should stop after `IdempotentAppend=Skipped`; otherwise duplicate derived processing can be repeated.
+
+**Fix:** return immediately on committed duplicate after marking append skipped. Keep retry-without-commit behavior unchanged. Add regression asserting duplicate outcome has no Normalization/graph/projection stages.
+
+#### REV-013-F03 — MEDIUM — Narrative completed stages are not evidence-bound
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 44–88; `contiguous_stage`, lines 95–109.
+
+Contiguous ordering is fixed. But caller can pass all seven `completed_stages` with `edges=[]`; resolver reports `OriginAdoptionPropagationGraph`. The owner gate required `EarliestEvidence` to have evidence ref and graph completion to have an actual graph-stage record/evidence.
+
+**Fix:** validate stage prerequisites: reaching `EarliestEvidence` requires at least one relevant non-empty `evidence_ref`; reaching final graph requires graph completion proof/record. Prefer a typed stage trace carrying evidence/proof per stage, not bare enums. Add regression all stages + empty edges → stop before EarliestEvidence/final graph.
+
+### Verification
+
+```text
+cargo test --locked
+232 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS
+```
+
+Source files unchanged during review. Temporary MSRV target removed after verification.
+
+### Final status
+
+**CHANGES REQUIRED** — do not mark REV-012 logic approved yet.
+
+
+### Independent reviewer addendum
+
+Reviewer independen mengonfirmasi klasifikasi REV-013 dan menambahkan dua bypass yang masih satu scope:
+
+1. **REV-013-F01 / autonomy:** `limit_raise_permitted` belum mendelegasikan ke authoritative gate atau `thresholds_sane`. Threshold lemah masih bisa lolos lewat helper ini bila metrik guard memenuhi threshold caller-supplied. Minimum fix: hapus helper bypass atau delegasikan ke satu typed-action authoritative gate dengan frozen thresholds.
+2. **REV-013-F02 / ingestion:** `IdempotencyStore::commit` dapat dipanggil publik tanpa bukti durable append. Test `retry_after_commit_is_duplicate` justru melakukan commit manual. Minimum fix: append+dedupe commit harus satu authoritative/atomic backend operation atau commit menerima durable append receipt yang tidak dapat dibuat caller biasa. Duplicate committed juga tetap harus berhenti sebelum normalization.
+
+Konfirmasi lain:
+
+```text
+F01 decision: FIXED
+F02 signer logic: FIXED; regression coverage 8/16
+F03 autonomy: PARTIAL
+F04 Action boundary: FIXED
+F05 ingestion: PARTIAL
+F06 timestamp: FIXED
+F07 narrative: PARTIAL
+```
+
+Verdict tetap: **CHANGES REQUIRED**.
+
+---
+
+## REV-014 — Re-review logic fixes (REV-013 F01–F03 + test gap)
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Mode:** Re-verifikasi fix (read-only)
+**Acuan:** REV-013 temuan F01, F02, F03 + test gap F02
+**Scope:** semua temuan logic REV-013 (bukan integration)
+
+### Hasil fix
+
+#### F01 — ACCEPTED — Autonomy gate typed Action
+- `autonomous_action_permitted(mode, phase, action: Action, canary, guard)` menerima
+  canonical `Action`; open/reseed DERIVED dari `Lp(OpenPosition|ReseedPosition)`,
+  bukan caller boolean. `cycle_ready` memakai `Lp(ClaimFees)` sebagai readiness floor.
+
+#### F02 — ACCEPTED — Duplicate stops normalization
+- `run_pipeline` return segera setelah `contains(key)` (deduped=true), tidak
+  lanjut normalization/downstream.
+
+#### F02 test gap — ACCEPTED
+- Tabel test signer kini 16/16 field (tambah policy_binding_valid, manager_allowed,
+  pool_verified, priority_fee_ok, tip_ok, rent_ok, writable_accounts_allowed,
+  approvals_bounded).
+
+#### F03 — ACCEPTED — Evidence-bound narrative completion
+- `resolve` clamp ke `OcrAsrImagePhoneticExpansion` bila resolved stage >=
+  EarliestEvidence tapi tidak ada edge ber-`evidence_ref` non-empty.
+
+### Regression tests
+- 16/16 signer field negative.
+- `Lp(OpenPosition)` di claim/close rung → reject (typed).
+- duplicate committed → tidak ada Normalization stage.
+- all stages + empty edges → stop sebelum EarliestEvidence.
+
+### Verifikasi
+```text
+cargo build — clean (no warning)
+cargo test — 233 passed, 0 failed (95 module + 134 legacy + 4 regression)
+cargo +1.89.0 check --locked --all-targets — PASS
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic REV-013 diperbaiki. Produk tetap
+PARTIAL FOUNDATION; blocker integration deferred.
