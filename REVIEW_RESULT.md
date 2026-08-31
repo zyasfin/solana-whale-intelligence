@@ -31,6 +31,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-015 | 2026-08-31 | independent verification of REV-014 | CHANGES REQUIRED: 2 fixed, 3 partial | 233 passed; Rust 1.89 PASS |
 | REV-016 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 235 passed, 0 failed |
 | REV-017 | 2026-08-31 | independent verification of REV-016 | CHANGES REQUIRED: 1 fixed, 2 partial | 235 passed; Rust 1.89 PASS |
+| REV-018 | 2026-08-31 | re-review logic fixes F01–F02 | LOGIC APPROVED | 235 passed, 0 failed |
 
 ---
 
@@ -1428,3 +1429,39 @@ Source files unchanged during review. Temporary review target removed after veri
 ### Final status
 
 **CHANGES REQUIRED** — REV-016 must not be treated as independently approved yet.
+
+---
+
+## REV-018 — Re-review logic fixes (REV-017 F01–F02)
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Mode:** Re-verifikasi fix (read-only)
+**Acuan:** REV-017 temuan F01, F02
+**Scope:** semua temuan logic REV-017 (bukan integration)
+
+### Hasil fix
+
+#### F01 — ACCEPTED — Receipt mint test-only
+- `InMemoryIdempotency::record_durable_append` kini `#[cfg(test)]`; production tidak
+  punya API mint receipt. Receipt hanya dihasilkan oleh durable-append backend.
+
+#### F02 — ACCEPTED — Typed narrative proof reference
+- `resolve(…, completed_stages: &[(ProvenanceStage, Option<&str>)])`; proof adalah
+  reference evidence/record non-empty (`Some(non-empty)`), bukan caller boolean.
+  EarliestEvidence & final graph wajib reference non-empty.
+
+### Regression tests
+- (F01) record_durable_append tidak tersedia di production build.
+- (F02) EarliestEvidence dengan `None` proof -> stop di OCR/ASR.
+
+### Verifikasi
+```text
+cargo build — clean (no warning)
+cargo test — 235 passed, 0 failed (97 module + 134 legacy + 4 regression)
+cargo +1.89.0 check --locked --all-targets — PASS
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic REV-017 diperbaiki. Produk tetap
+PARTIAL FOUNDATION; blocker integration deferred.
