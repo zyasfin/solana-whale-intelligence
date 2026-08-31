@@ -30,6 +30,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-014 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 233 passed, 0 failed |
 | REV-015 | 2026-08-31 | independent verification of REV-014 | CHANGES REQUIRED: 2 fixed, 3 partial | 233 passed; Rust 1.89 PASS |
 | REV-016 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 235 passed, 0 failed |
+| REV-017 | 2026-08-31 | independent verification of REV-016 | CHANGES REQUIRED: 1 fixed, 2 partial | 235 passed; Rust 1.89 PASS |
 
 ---
 
@@ -1368,3 +1369,62 @@ cargo +1.89.0 check --locked --all-targets — PASS
 
 **LOGIC APPROVED** — seluruh temuan logic REV-015 diperbaiki. Produk tetap
 PARTIAL FOUNDATION; blocker integration deferred.
+
+---
+
+## REV-017 — Independent verification of REV-016
+
+**Tanggal:** 2026-08-31 10:46 UTC  
+**Mode:** Read-only fix re-review  
+**Git HEAD:** `a61bf97`  
+**Fix commit:** `77bf515`  
+**Scope:** REV-015 F01–F03 only.
+
+### Verdict
+
+**CHANGES REQUIRED.** Autonomy is fixed; durable append and narrative proof remain caller-asserted.
+
+```text
+FIXED:   F01 autonomy action maturity
+PARTIAL: F02 durable append authority, F03 narrative stage proof
+```
+
+### Accepted fix
+
+#### F01 — FIXED — Action maturity fail-closed
+
+`classify_action(Action)` explicitly maps every current closed action. Risk-reducing claim/close actions may use the early rung; `Trade::Buy`, `Lp::AddLiquidity`, `Lp::CompoundFees`, `Lp::OpenPosition`, and `Lp::ReseedPosition` require open maturity. `limit_raise_permitted` delegates to the same authoritative gate and frozen thresholds.
+
+### Remaining findings
+
+#### REV-017-F01 — HIGH — Public record_durable_append still mints proof without durable append
+
+**Location:** `src/sf/ingest_runtime.rs::InMemoryIdempotency::record_durable_append`, lines 72–77; `IdempotencyStore::commit`, lines 57–61.
+
+Receipt fields are now private and cross-key use is rejected. However any ordinary caller with `&mut InMemoryIdempotency` can call public `record_durable_append(key)`, which both mints a receipt and marks the key committed without any durable append operation or backend receipt. The method name/comment claims authority but no authority is enforced.
+
+**Fix:** remove public proof-minting from the dedupe store. The durable append backend should return an opaque receipt from its successful transaction; dedupe commit consumes that receipt. For the in-memory test backend, keep minting test-only/private (`#[cfg(test)]`) or combine actual append storage + commit in one method that records evidence before dedupe. Add regression/API compile boundary proving callers cannot mint a receipt directly.
+
+#### REV-017-F02 — MEDIUM — Narrative stage proof is still a caller boolean
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 44–86; `contiguous_stage`, lines 93–112.
+
+The trace is contiguous, but each proof is only `(ProvenanceStage, bool)`. A caller can pass all stages with `true` and `edges=[]`; resolver reports final graph completion. The boolean is not tied to an evidence reference, earliest-evidence record, or graph assembly artifact.
+
+**Fix:** replace boolean with typed proof containing stage + evidence/record reference. Validate `EarliestEvidence` proof references actual evidence and final graph proof references a graph assembly record. Add regression: all stages marked true without proof artifacts must not pass EarliestEvidence/final graph.
+
+### Verification
+
+```text
+cargo test --locked
+235 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS
+```
+
+Source files unchanged during review. Temporary review target removed after verification.
+
+### Final status
+
+**CHANGES REQUIRED** — REV-016 must not be treated as independently approved yet.

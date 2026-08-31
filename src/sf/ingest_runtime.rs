@@ -37,9 +37,11 @@ pub struct PipelineOutcome {
     pub deduped: bool, // already seen (idempotent skip)
 }
 
-/// Proof that a durable canonical append actually happened (REV-013 addendum #2,
-/// REV-015-F02). The field is PRIVATE and the receipt is bound to a specific
-/// key, so a bare caller cannot forge one or reuse it for a different key.
+/// Proof that a durable canonical append actually happened. The field is PRIVATE
+/// and bound to a specific key. In PRODUCTION this receipt is returned only by a
+/// durable-append backend after its transaction commits; no caller-facing API
+/// mints it (REV-017-F01). The in-memory reference backend's mint helper is
+/// `#[cfg(test)]`-only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableAppendReceipt {
     key: String,
@@ -52,9 +54,9 @@ impl DurableAppendReceipt {
     }
 }
 
-/// A two-phase idempotency store (REV-011-F05 + REV-015-F02):
-/// `contains` is read-only; `commit` persists a key only when handed a
-/// `DurableAppendReceipt` bound to that same key.
+/// A two-phase idempotency store: `contains` is read-only; `commit` persists a
+/// key only when handed a `DurableAppendReceipt` bound to that same key. The
+/// receipt originates from a durable-append backend, not from this store.
 pub trait IdempotencyStore {
     /// Read-only check: has this key already been durably committed?
     fn contains(&self, key: &str) -> bool;
@@ -69,8 +71,9 @@ pub struct InMemoryIdempotency {
 }
 
 impl InMemoryIdempotency {
-    /// Authoritative durable-append simulation: mints a key-bound receipt and
-    /// commits the key atomically. This is the ONLY way a key becomes committed.
+    /// TEST-ONLY durable-append simulation: mints a key-bound receipt and commits
+    /// the key atomically. NOT available in production builds (REV-017-F01).
+    #[cfg(test)]
     pub fn record_durable_append(&mut self, key: &str) -> DurableAppendReceipt {
         let receipt = DurableAppendReceipt { key: key.to_string() };
         self.committed.insert(key.to_string());

@@ -44,7 +44,7 @@ pub fn can_advance(current: ProvenanceStage, next: ProvenanceStage) -> bool {
 pub fn resolve(
     narrative_key: &str,
     edges: &[NarrativeEdge],
-    completed_stages: &[(ProvenanceStage, bool)],
+    completed_stages: &[(ProvenanceStage, Option<&str>)],
 ) -> NarrativeResolution {
     let mut originator: Option<String> = None;
     let mut official_adopter: Option<String> = None;
@@ -75,9 +75,8 @@ pub fn resolve(
         }
     }
 
-    // REV-015-F03: derive furthest CONTIGUOUS completed stage, where the bool
-    // per stage is its completion proof. EarliestEvidence and the final graph
-    // REQUIRE their own proof=true; a proof-less entry stops progress there.
+    // REV-017-F02: each stage's proof is a typed evidence/record reference
+    // (`Some(non-empty ref)`), not a caller-asserted boolean.
     let resolved_stage = contiguous_stage(completed_stages);
 
     NarrativeResolution {
@@ -90,20 +89,21 @@ pub fn resolve(
     }
 }
 
-/// Furthest stage reached with NO gap, starting from `DeployFirstLiquidity`.
-/// Each entry is `(stage, has_proof)`. EarliestEvidence (index 5) and the final
-/// graph (index 6) require `has_proof == true`; otherwise progress stops there.
-fn contiguous_stage(completed: &[(ProvenanceStage, bool)]) -> ProvenanceStage {
+/// Furthest stage reached with NO gap. Each entry is `(stage, proof)` where
+/// `proof` is `Some(non-empty evidence/record reference)`. EarliestEvidence and
+/// the final graph REQUIRE a non-empty proof; a `None`/empty proof stops there.
+fn contiguous_stage(completed: &[(ProvenanceStage, Option<&str>)]) -> ProvenanceStage {
     let mut expected = 0u8;
     let mut last = ProvenanceStage::DeployFirstLiquidity;
-    for &(s, has_proof) in completed {
+    for &(s, proof) in completed {
         if stage_index(s) != expected {
-            // Gap or out-of-order -> stop.
-            break;
+            break; // gap
         }
-        // Evidence-bound stages require proof.
-        if stage_index(s) >= stage_index(ProvenanceStage::EarliestEvidence) && !has_proof {
-            break;
+        if stage_index(s) >= stage_index(ProvenanceStage::EarliestEvidence) {
+            let has_proof = proof.map(|r| !r.trim().is_empty()).unwrap_or(false);
+            if !has_proof {
+                break;
+            }
         }
         last = s;
         expected += 1;
@@ -141,13 +141,13 @@ mod tests {
             edge("adopter", ProvenanceRole::OfficialAdopter, ProvenanceTruthStatus::Exact),
         ];
         let all_stages = [
-            (ProvenanceStage::DeployFirstLiquidity, true),
-            (ProvenanceStage::MetadataFingerprint, true),
-            (ProvenanceStage::LocalArchiveSearch, true),
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
-            (ProvenanceStage::OcrAsrImagePhoneticExpansion, true),
-            (ProvenanceStage::EarliestEvidence, true),
-            (ProvenanceStage::OriginAdoptionPropagationGraph, true),
+            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
+            (ProvenanceStage::MetadataFingerprint, Some("p1")),
+            (ProvenanceStage::LocalArchiveSearch, Some("p2")),
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
+            (ProvenanceStage::OcrAsrImagePhoneticExpansion, Some("p4")),
+            (ProvenanceStage::EarliestEvidence, Some("ev-proof")),
+            (ProvenanceStage::OriginAdoptionPropagationGraph, Some("graph-proof")),
         ];
         let r = resolve("narr1", &edges, &all_stages);
         assert_eq!(r.originator.as_deref(), Some("originator_wallet"));
@@ -167,25 +167,26 @@ mod tests {
     #[test]
     fn gap_in_stages_stops_before_gap() {
         let stages = [
-            (ProvenanceStage::DeployFirstLiquidity, true),
-            (ProvenanceStage::LocalArchiveSearch, true), // gap: skipped MetadataFingerprint
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
+            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
+            (ProvenanceStage::LocalArchiveSearch, Some("p2")), // gap: skipped MetadataFingerprint
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
     }
 
-    // REV-015-F03: EarliestEvidence/final graph WITHOUT proof stops there.
+    // REV-017-F02: EarliestEvidence/final graph WITHOUT a non-empty proof ref
+    // stops there, even if earlier stages carry proofs.
     #[test]
     fn earliest_evidence_without_proof_stops() {
         let stages = [
-            (ProvenanceStage::DeployFirstLiquidity, true),
-            (ProvenanceStage::MetadataFingerprint, true),
-            (ProvenanceStage::LocalArchiveSearch, true),
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, true),
-            (ProvenanceStage::OcrAsrImagePhoneticExpansion, true),
-            (ProvenanceStage::EarliestEvidence, false), // no proof
-            (ProvenanceStage::OriginAdoptionPropagationGraph, true),
+            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
+            (ProvenanceStage::MetadataFingerprint, Some("p1")),
+            (ProvenanceStage::LocalArchiveSearch, Some("p2")),
+            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
+            (ProvenanceStage::OcrAsrImagePhoneticExpansion, Some("p4")),
+            (ProvenanceStage::EarliestEvidence, None), // no proof ref
+            (ProvenanceStage::OriginAdoptionPropagationGraph, Some("graph-proof")),
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::OcrAsrImagePhoneticExpansion);
