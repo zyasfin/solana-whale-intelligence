@@ -14,7 +14,7 @@
 //! `ProvenanceTruthStatus`) and introduces no new frozen state.
 
 use super::narrative::{NarrativeEdge, NarrativeResolution, ProvenanceStage};
-use super::token::{ProvenanceRole, ProvenanceTruthStatus};
+use super::token::ProvenanceRole;
 
 /// Ordered stage index (matches the frozen §8.4 token-first flow).
 fn stage_index(s: ProvenanceStage) -> u8 {
@@ -41,13 +41,15 @@ pub fn can_advance(current: ProvenanceStage, next: ProvenanceStage) -> bool {
 ///
 /// `originator`/`official_adopter`/`market_leading_contract` are extracted from
 /// the edges by role; `independent_spread` collects all edges with that role.
-pub fn resolve(narrative_key: &str, edges: &[NarrativeEdge]) -> NarrativeResolution {
+pub fn resolve(
+    narrative_key: &str,
+    edges: &[NarrativeEdge],
+    completed_stages: &[ProvenanceStage],
+) -> NarrativeResolution {
     let mut originator: Option<String> = None;
     let mut official_adopter: Option<String> = None;
     let mut market_leading_contract: Option<String> = None;
     let mut independent_spread: Vec<String> = Vec::new();
-
-    let mut furthest = ProvenanceStage::DeployFirstLiquidity;
 
     for e in edges {
         match e.role {
@@ -71,24 +73,16 @@ pub fn resolve(narrative_key: &str, edges: &[NarrativeEdge]) -> NarrativeResolut
             }
             _ => {}
         }
-
-        // REV-009-F08: an `Exact` edge only advances to EarliestEvidence when it
-        // actually carries an evidence reference. Truth status alone cannot
-        // imply the workflow stages completed.
-        if e.truth_status == ProvenanceTruthStatus::Exact && e.evidence_ref.is_some() {
-            furthest = ProvenanceStage::EarliestEvidence;
-        }
     }
 
-    // If we reached EarliestEvidence (via a real evidence ref), the graph stage
-    // is also reached.
-    if furthest == ProvenanceStage::EarliestEvidence {
-        furthest = ProvenanceStage::OriginAdoptionPropagationGraph;
-    }
+    // REV-011-F07: derive the furthest CONTIGUOUS completed stage from the
+    // resolver's explicit `completed_stages` trace. We stop at the first gap;
+    // a single Exact edge can no longer imply the whole workflow completed.
+    let resolved_stage = contiguous_stage(completed_stages);
 
     NarrativeResolution {
         narrative_key: narrative_key.to_string(),
-        resolved_stage: furthest,
+        resolved_stage,
         originator,
         independent_spread,
         official_adopter,
@@ -96,9 +90,27 @@ pub fn resolve(narrative_key: &str, edges: &[NarrativeEdge]) -> NarrativeResolut
     }
 }
 
+/// Furthest stage reached with NO gap, starting from `DeployFirstLiquidity`.
+/// Stages must appear in order; stop at the first missing stage.
+fn contiguous_stage(completed: &[ProvenanceStage]) -> ProvenanceStage {
+    let mut expected = 0u8;
+    let mut last = ProvenanceStage::DeployFirstLiquidity;
+    for &s in completed {
+        if stage_index(s) == expected {
+            last = s;
+            expected += 1;
+        } else {
+            // Out-of-order or duplicate -> stop (gap detected).
+            break;
+        }
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::token::ProvenanceTruthStatus;
 
     fn edge(from: &str, role: ProvenanceRole, ts: ProvenanceTruthStatus) -> NarrativeEdge {
         NarrativeEdge {
@@ -122,29 +134,41 @@ mod tests {
         let edges = vec![
             edge("originator_wallet", ProvenanceRole::Originator, ProvenanceTruthStatus::Exact),
             edge("spread1", ProvenanceRole::IndependentSpread, ProvenanceTruthStatus::Reconstructed),
-            edge("spread2", ProvenanceRole::IndependentSpread, ProvenanceTruthStatus::Estimated),
             edge("adopter", ProvenanceRole::OfficialAdopter, ProvenanceTruthStatus::Exact),
         ];
-        let r = resolve("narr1", &edges);
+        let all_stages = [
+            ProvenanceStage::DeployFirstLiquidity,
+            ProvenanceStage::MetadataFingerprint,
+            ProvenanceStage::LocalArchiveSearch,
+            ProvenanceStage::ExactAliasWebXTiktokSearch,
+            ProvenanceStage::OcrAsrImagePhoneticExpansion,
+            ProvenanceStage::EarliestEvidence,
+            ProvenanceStage::OriginAdoptionPropagationGraph,
+        ];
+        let r = resolve("narr1", &edges, &all_stages);
         assert_eq!(r.originator.as_deref(), Some("originator_wallet"));
         assert_eq!(r.official_adopter.as_deref(), Some("adopter"));
-        assert_eq!(r.independent_spread.len(), 2);
+        assert_eq!(r.independent_spread.len(), 1);
         assert_eq!(r.resolved_stage, ProvenanceStage::OriginAdoptionPropagationGraph);
     }
 
     #[test]
     fn resolve_no_evidence_stays_at_deploy() {
-        let r = resolve("narr1", &[]);
+        let r = resolve("narr1", &[], &[]);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
         assert!(r.originator.is_none());
     }
 
-    // REV-009-F08: an Exact edge WITHOUT evidence_ref must not complete the graph.
+    // REV-011-F07: a gap in completed_stages stops contiguous progress.
     #[test]
-    fn exact_edge_without_evidence_does_not_complete() {
-        let mut e = edge("originator", ProvenanceRole::Originator, ProvenanceTruthStatus::Exact);
-        e.evidence_ref = None;
-        let r = resolve("narr1", &[e]);
+    fn gap_in_stages_stops_before_gap() {
+        // Missing MetadataFingerprint (index 1) -> only DeployFirstLiquidity counted.
+        let stages = [
+            ProvenanceStage::DeployFirstLiquidity,
+            ProvenanceStage::LocalArchiveSearch, // gap: skipped MetadataFingerprint
+            ProvenanceStage::ExactAliasWebXTiktokSearch,
+        ];
+        let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
     }
 }

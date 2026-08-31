@@ -82,7 +82,7 @@ pub struct Intent {
     pub intent_hash: String,
     pub chain: String,
     pub wallet: String,
-    pub action: String,
+    pub action: super::execution::Action,
     pub target_entity: String,
     pub policy_version: String,
     pub strategy_version: Option<String>,

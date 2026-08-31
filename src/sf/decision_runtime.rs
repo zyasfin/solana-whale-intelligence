@@ -10,7 +10,7 @@
 //! disposition. It consumes the frozen `decision.rs` types (`DecisionBundle`,
 //! `ComponentResult`, `ComponentClass`) and introduces no new frozen state.
 
-use super::decision::{ComponentClass, DecisionBundle};
+use super::decision::{ComponentClass, ComponentResult, DecisionBundle};
 
 /// Final disposition of a decision evaluation (derived, not frozen).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,40 +20,53 @@ pub enum Disposition {
     MissingCapability,
     InsufficientEvidence,
 }
+/// Frozen universal mandatory minimum (PLAN §12.2, REV-011-F01). A decision may
+/// only approve when ALL four are present (exactly one each) and pass.
+pub const REQUIRED_MANDATORY: [&str; 4] = [
+    "security",
+    "contract_identity",
+    "chain_state",
+    "mandatory_freshness",
+];
 
 /// Evaluate a decision bundle (fail-closed):
-/// - No evidence snapshot -> InsufficientEvidence (gate #2: reproducible only
-///   from an immutable point-in-time bundle).
-/// - A missing capability -> MissingCapability.
-/// - Any MANDATORY_PASS component not `pass == Some(true)` -> Reject (fail-closed).
-/// - Any HALT_INPUT component with `pass == Some(true)` (a halt signal fired)
-///   -> Reject (source degradation/drawdown/reconciliation incident halt).
+/// - No evidence snapshot -> InsufficientEvidence.
+/// - Unknown action -> Reject.
+/// - Missing capability -> MissingCapability.
+/// - Not all four REQUIRED_MANDATORY present & passing -> Reject.
+/// - A HALT_INPUT that fires -> Reject.
 /// - Otherwise -> Approve.
-///
-/// SIZING_INPUT and STRATEGY_INPUT are informative only (do not gate).
 pub fn evaluate(bundle: &DecisionBundle) -> Disposition {
-    // REV-007-F04: no evidence -> insufficient (never approve on empty bundle).
     if bundle.evidence_snapshot_ids.is_empty() {
         return Disposition::InsufficientEvidence;
     }
 
-    // REV-009-F04: the target action must be a known, closed action — an
-    // arbitrary/unknown action string must be rejected before persistence.
-    if super::execution_runtime::parse_action(&bundle.target_action).is_none() {
-        return Disposition::Reject;
+    // REV-011-F01: source_freshness must be a non-empty object.
+    if bundle.source_freshness.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return Disposition::InsufficientEvidence;
     }
+
+    // (target_action is now the canonical `Action` type — no string parsing
+    // needed; REV-011-F04.)
 
     if !bundle.missing_capabilities.is_empty() {
         return Disposition::MissingCapability;
     }
-    // REV-009-F01: a decision with NO mandatory component at all is incomplete —
-    // there is nothing gating execution. Reject (fail-closed).
-    let has_mandatory = bundle
-        .component_results
-        .iter()
-        .any(|c| c.component_class == ComponentClass::MandatoryPass);
-    if !has_mandatory {
-        return Disposition::Reject;
+
+    // REV-011-F01: each of the four REQUIRED_MANDATORY names must appear exactly
+    // once as a MandatoryPass component, all passing.
+    for required in REQUIRED_MANDATORY {
+        let matching: Vec<&ComponentResult> = bundle
+            .component_results
+            .iter()
+            .filter(|c| {
+                c.component_class == ComponentClass::MandatoryPass
+                    && c.component_name == required
+            })
+            .collect();
+        if matching.len() != 1 || matching[0].pass != Some(true) {
+            return Disposition::Reject;
+        }
     }
 
     for c in &bundle.component_results {
@@ -64,14 +77,11 @@ pub fn evaluate(bundle: &DecisionBundle) -> Disposition {
                 }
             }
             ComponentClass::HaltInput => {
-                // A halt input that fires (pass == true) halts the decision.
                 if c.pass == Some(true) {
                     return Disposition::Reject;
                 }
             }
-            ComponentClass::SizingInput | ComponentClass::StrategyInput => {
-                // Informative only — no gating.
-            }
+            ComponentClass::SizingInput | ComponentClass::StrategyInput => {}
         }
     }
 
@@ -107,12 +117,12 @@ mod tests {
     ) -> DecisionBundle {
         DecisionBundle {
             target_entity: "T".into(),
-            target_action: "BUY".into(),
+            target_action: super::super::execution::Action::Trade(super::super::execution::TradeAction::Buy),
             decision_at: "2026-01-01T00:00:00Z".into(),
             evidence_snapshot_ids: evidence,
             component_results: components,
             missing_capabilities: missing,
-            source_freshness: serde_json::json!({}),
+            source_freshness: serde_json::json!({"fresh": true}),
             confidence: None,
             truth_status: TruthStatus::Unknown,
             strategy_version: None,
@@ -141,68 +151,75 @@ mod tests {
         }
     }
 
+    // All four REQUIRED_MANDATORY, all passing.
+    fn required() -> Vec<ComponentResult> {
+        REQUIRED_MANDATORY
+            .iter()
+            .map(|n| mandatory(n, Some(true)))
+            .collect()
+    }
+
     #[test]
     fn missing_capability_blocks() {
-        let b = bundle(vec!["provider".into()], vec![], vec!["e1".into()]);
+        let b = bundle(vec!["provider".into()], required(), vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::MissingCapability);
     }
 
     #[test]
     fn empty_evidence_is_insufficient() {
-        // REV-007-F04: no evidence -> InsufficientEvidence, never Approve.
-        let b = bundle(vec![], vec![mandatory("gate1", Some(true))], vec![]);
+        let b = bundle(vec![], required(), vec![]);
+        assert_eq!(evaluate(&b), Disposition::InsufficientEvidence);
+    }
+
+    // REV-011-F01: a single fake mandatory + empty freshness -> not approve.
+    #[test]
+    fn fake_mandatory_and_empty_freshness_rejects() {
+        let mut b = bundle(vec![], vec![mandatory("fake", Some(true))], vec!["e1".into()]);
+        b.source_freshness = serde_json::json!({});
         assert_eq!(evaluate(&b), Disposition::InsufficientEvidence);
     }
 
     #[test]
-    fn mandatory_fail_rejects() {
-        let b = bundle(vec![], vec![mandatory("gate1", Some(false))], vec!["e1".into()]);
-        assert_eq!(evaluate(&b), Disposition::Reject);
-    }
-
-    #[test]
-    fn mandatory_unresolved_fails_closed() {
-        let b = bundle(vec![], vec![mandatory("gate1", None)], vec!["e1".into()]);
+    fn missing_required_mandatory_rejects() {
+        // Only 3 of 4 required names present.
+        let comps = vec![
+            mandatory("security", Some(true)),
+            mandatory("contract_identity", Some(true)),
+            mandatory("chain_state", Some(true)),
+        ];
+        let b = bundle(vec![], comps, vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::Reject);
     }
 
     #[test]
     fn halt_input_firing_rejects() {
-        // REV-007-F03: a HALT_INPUT that fires (pass == true) halts the decision.
-        let b = bundle(vec![], vec![mandatory("gate1", Some(true)), halt("drawdown", Some(true))], vec!["e1".into()]);
-        assert_eq!(evaluate(&b), Disposition::Reject);
-    }
-
-    // REV-009-F01: evidence present but zero mandatory components -> Reject.
-    #[test]
-    fn no_mandatory_component_rejects() {
-        let b = bundle(vec![], vec![], vec!["e1".into()]);
-        assert_eq!(evaluate(&b), Disposition::Reject);
-    }
-
-    // REV-009-F04: an unknown target_action must be rejected.
-    #[test]
-    fn unknown_action_rejects() {
-        let mut b = bundle(vec![], vec![mandatory("gate1", Some(true))], vec!["e1".into()]);
-        b.target_action = "arbitrary_calldata".into();
+        let mut comps = required();
+        comps.push(halt("drawdown", Some(true)));
+        let b = bundle(vec![], comps, vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::Reject);
     }
 
     #[test]
-    fn all_mandatory_pass_approves() {
-        let b = bundle(vec![], vec![mandatory("gate1", Some(true)), halt("drawdown", Some(false))], vec!["e1".into()]);
+    fn all_required_pass_approves() {
+        let mut comps = required();
+        comps.push(halt("drawdown", Some(false)));
+        let b = bundle(vec![], comps, vec!["e1".into()]);
         assert_eq!(evaluate(&b), Disposition::Approve);
     }
 
     #[test]
     fn reproducible_requires_evidence() {
-        assert!(is_reproducible(&bundle(vec![], vec![], vec!["e1".into()])));
-        assert!(!is_reproducible(&bundle(vec![], vec![], vec![])));
+        assert!(is_reproducible(&bundle(vec![], required(), vec!["e1".into()])));
+        assert!(!is_reproducible(&bundle(vec![], required(), vec![])));
     }
 
     #[test]
     fn unresolved_mandatory_count() {
-        let b = bundle(vec![], vec![mandatory("a", Some(true)), mandatory("b", None)], vec!["e1".into()]);
+        let comps = vec![
+            mandatory("security", Some(true)),
+            mandatory("contract_identity", None),
+        ];
+        let b = bundle(vec![], comps, vec!["e1".into()]);
         assert_eq!(unresolved_mandatory(&b), 1);
     }
 }

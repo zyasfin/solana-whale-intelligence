@@ -95,6 +95,9 @@ pub fn parse_action(s: &str) -> Option<Action> {
         "emergency_exit" | "EmergencyExit" | "EMERGENCY_EXIT" => {
             Some(Action::Trade(TradeAction::EmergencyExit))
         }
+        "lp_emergency_exit" | "LpEmergencyExit" | "LP_EMERGENCY_EXIT" => {
+            Some(Action::Lp(LpAction::EmergencyExit))
+        }
         "open_position" | "OpenPosition" | "OPEN_POSITION" => {
             Some(Action::Lp(LpAction::OpenPosition))
         }
@@ -121,12 +124,9 @@ pub fn parse_action(s: &str) -> Option<Action> {
     }
 }
 
-/// A closed action: either a token trade or an LP action (REV-007-F07).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    Trade(TradeAction),
-    Lp(LpAction),
-}
+/// A closed action: either a token trade or an LP action (canonical type,
+/// re-exported from `execution.rs` — REV-011-F04).
+pub use super::execution::Action;
 
 /// Whether a signer policy checklist passes (every closed check must be true).
 /// Mandatory fields are NON-OPTIONAL at sign time: a `None` on chain_id,
@@ -134,9 +134,6 @@ pub enum Action {
 /// min_output fails closed (REV-007-F05). The signer validates the full
 /// transaction semantics — it never signs with absent mandatory context.
 pub fn signer_policy_passes(p: &SignerPolicy) -> bool {
-    // REV-009-F02 + addendum #1: mandatory fields must be Some AND non-empty
-    // (whitespace-only fails closed). The signer never signs with absent or
-    // empty mandatory context.
     let non_empty = |s: &Option<String>| s.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
     non_empty(&p.chain_id)
         && non_empty(&p.chain_genesis)
@@ -157,6 +154,23 @@ pub fn signer_policy_passes(p: &SignerPolicy) -> bool {
         && p.price_impact_ok
         && p.deadline_ok
         && p.simulation_delta_ok
+        // REV-011-F02: remaining PLAN §17 mandatory semantics.
+        && p.workspace_binding_valid
+        && p.wallet_binding_valid
+        && p.policy_binding_valid
+        && p.idempotency_binding_valid
+        && p.factory_allowed
+        && p.manager_allowed
+        && p.pool_verified
+        && p.authority_verified
+        && p.gas_ok
+        && p.priority_fee_ok
+        && p.tip_ok
+        && p.rent_ok
+        && p.writable_accounts_allowed
+        && p.approvals_bounded
+        && p.instructions_decoded
+        && p.no_unrelated_operations
 }
 
 #[cfg(test)]
@@ -231,6 +245,11 @@ mod tests {
             max_native_debit: Some("1".into()), max_token_debit: Some("1".into()),
             min_output: Some("0".into()),
             slippage_ok: true, price_impact_ok: true, deadline_ok: true, simulation_delta_ok: true,
+            workspace_binding_valid: true, wallet_binding_valid: true, policy_binding_valid: true,
+            idempotency_binding_valid: true, factory_allowed: true, manager_allowed: true,
+            pool_verified: true, authority_verified: true, gas_ok: true, priority_fee_ok: true,
+            tip_ok: true, rent_ok: true, writable_accounts_allowed: true, approvals_bounded: true,
+            instructions_decoded: true, no_unrelated_operations: true,
         };
         assert!(signer_policy_passes(&pass));
 
@@ -240,6 +259,21 @@ mod tests {
         assert!(!signer_policy_passes(&missing_output));
         let empty_chain = SignerPolicy { chain_id: Some("".into()), ..pass.clone() };
         assert!(!signer_policy_passes(&empty_chain));
+
+        // REV-011-F02: each new §17 field false -> fail.
+        let cases: Vec<SignerPolicy> = vec![
+            SignerPolicy { workspace_binding_valid: false, ..pass.clone() },
+            SignerPolicy { wallet_binding_valid: false, ..pass.clone() },
+            SignerPolicy { idempotency_binding_valid: false, ..pass.clone() },
+            SignerPolicy { factory_allowed: false, ..pass.clone() },
+            SignerPolicy { authority_verified: false, ..pass.clone() },
+            SignerPolicy { gas_ok: false, ..pass.clone() },
+            SignerPolicy { instructions_decoded: false, ..pass.clone() },
+            SignerPolicy { no_unrelated_operations: false, ..pass.clone() },
+        ];
+        for c in &cases {
+            assert!(!signer_policy_passes(c));
+        }
     }
 
     // REV-007-F07: unknown/arbitrary action strings must be rejected.
@@ -251,5 +285,22 @@ mod tests {
         assert_eq!(parse_action("arbitrary_calldata"), None);
         assert_eq!(parse_action("wallet_sweep"), None);
         assert_eq!(parse_action(""), None);
+    }
+
+    // REV-011-F04: trade vs LP emergency exit must be distinct.
+    #[test]
+    fn emergency_exit_trade_vs_lp_distinct() {
+        assert_eq!(
+            parse_action("emergency_exit"),
+            Some(Action::Trade(TradeAction::EmergencyExit))
+        );
+        assert_eq!(
+            parse_action("lp_emergency_exit"),
+            Some(Action::Lp(LpAction::EmergencyExit))
+        );
+        assert_ne!(
+            Action::Trade(TradeAction::EmergencyExit),
+            Action::Lp(LpAction::EmergencyExit)
+        );
     }
 }

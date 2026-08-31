@@ -120,3 +120,43 @@ fn time_bucket(observed_at: &str) -> Option<String> {
         .ok()
         .map(|dt| (dt.timestamp().div_euclid(3600)).to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(observed_at: &str, source_event_id: Option<&str>) -> EventEnvelope {
+        EventEnvelope {
+            event_id: "e1".into(),
+            workspace_id: None,
+            chain: Some("solana".into()),
+            event_type: "transfer".into(),
+            entity_keys: vec!["token:A".into()],
+            source_id: "src".into(),
+            source_event_id: source_event_id.map(String::from),
+            occurred_at: None,
+            observed_at: observed_at.into(),
+            ingested_at: "2026-01-01T00:00:00Z".into(),
+            raw_hash: "hash".into(),
+            raw_ref: "ref".into(),
+            parser_version: None,
+            payload_schema_version: "1".into(),
+            truth_status: TruthStatus::Confirmed,
+            confidence: None,
+        }
+    }
+
+    // REV-011-F06: a malformed observed_at must be rejected even in StableId
+    // mode (source_event_id present).
+    #[test]
+    fn stable_id_malformed_timestamp_rejected() {
+        let e = envelope("not-a-date", Some("tx1"));
+        assert!(e.idempotency_key().is_none());
+    }
+
+    #[test]
+    fn valid_timestamp_produces_stable_id() {
+        let e = envelope("2026-01-01T00:00:00Z", Some("tx1"));
+        assert!(e.idempotency_key().is_some());
+    }
+}

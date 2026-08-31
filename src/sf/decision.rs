@@ -14,7 +14,7 @@ pub use super::portfolio::ComponentClass;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecisionBundle {
     pub target_entity: String,
-    pub target_action: String,
+    pub target_action: super::execution::Action,
     pub decision_at: String,
     pub evidence_snapshot_ids: Vec<String>,
     pub component_results: Vec<ComponentResult>,

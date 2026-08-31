@@ -34,6 +34,17 @@ pub enum LpAction {
     EmergencyExit,
 }
 
+/// Canonical closed action (REV-011-F04): either a token trade or an LP action.
+/// This is the authoritative action type for intent/decision — a free-form
+/// `String` is no longer accepted. `Trade::EmergencyExit` and `Lp::EmergencyExit`
+/// are DISTINCT and unambiguous.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Trade(TradeAction),
+    Lp(LpAction),
+}
+
 /// Policy limits (doc §14 "Policy limits"): max per trade/token/chain/strategy,
 /// exposure, rate windows, slippage/impact/gas/tip, depth, daily loss/drawdown,
 /// reserve, allowlists, cooldown/denylist.
@@ -114,4 +125,21 @@ pub struct SignerPolicy {
     pub price_impact_ok: bool,
     pub deadline_ok: bool,
     pub simulation_delta_ok: bool,
+    // REV-011-F02: remaining PLAN §17 mandatory semantics.
+    pub workspace_binding_valid: bool,
+    pub wallet_binding_valid: bool,
+    pub policy_binding_valid: bool,
+    pub idempotency_binding_valid: bool,
+    pub factory_allowed: bool,
+    pub manager_allowed: bool,
+    pub pool_verified: bool,
+    pub authority_verified: bool,
+    pub gas_ok: bool,
+    pub priority_fee_ok: bool,
+    pub tip_ok: bool,
+    pub rent_ok: bool,
+    pub writable_accounts_allowed: bool,
+    pub approvals_bounded: bool,
+    pub instructions_decoded: bool,
+    pub no_unrelated_operations: bool,
 }

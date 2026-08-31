@@ -64,9 +64,13 @@ pub fn autonomous_action_permitted(
     mode: TradingMode,
     phase: RolloutPhase,
     is_open: bool,
+    canary: bool,
     guard: &AutonomyGuard,
 ) -> bool {
     if !is_autonomous(mode) {
+        return false;
+    }
+    if !canary {
         return false;
     }
     if !thresholds_sane(&guard.thresholds) {
@@ -81,27 +85,28 @@ pub fn autonomous_action_permitted(
 }
 
 /// Validate rollout thresholds against the FROZEN minimums (REV-011-F03):
-/// min_forward_sample == 30, forward_horizon_days == 14, max_drawdown_pct == -10,
-/// ci_lower_bound > 0, requires_human_approval == true. A caller-supplied weaker
-/// threshold (e.g. 1 sample / 1 day / -0.1% / CI >= -100) MUST fail closed.
+/// min_forward_sample >= 30, forward_horizon_days >= 14,
+/// -10.0 <= max_drawdown_pct < 0, ci_lower_bound >= 0, requires_human_approval.
+/// Stricter values are allowed; weaker values fail closed.
 pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
     t.min_forward_sample >= 30
         && t.forward_horizon_days >= 14
-        && t.max_drawdown_pct <= -10.0
-        && t.ci_lower_bound > 0.0
+        && t.max_drawdown_pct >= -10.0
+        && t.max_drawdown_pct < 0.0
+        && t.ci_lower_bound >= 0.0
         && t.requires_human_approval
 }
 
-/// Whether an autonomous cycle is ready to run: mode is AUTO_BOUNDED, phase is
-/// at least claim/close, canary is set, frozen thresholds are sane, AND the
-/// guard passes (numeric thresholds + human approval + evidence).
+/// Whether an autonomous cycle is ready to run (REV-011-F03): delegates to the
+/// single authoritative `autonomous_action_permitted` gate.
 pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
-    is_autonomous(cycle.mode)
-        && can_claim_close(cycle.phase)
-        && cycle.canary
-        && thresholds_sane(&cycle.guard.thresholds)
-        && !cycle.guard.evidence_refs.is_empty()
-        && cycle.guard.can_raise_limit()
+    autonomous_action_permitted(
+        cycle.mode,
+        cycle.phase,
+        false, // claim/close readiness (cycle itself is not an open action)
+        cycle.canary,
+        &cycle.guard,
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -200,13 +205,11 @@ mod tests {
     #[test]
     fn autonomous_action_gate_distinguishes_action_kind() {
         let g = guard(true, 30);
-        // claim/close (not open) on claim/close rung -> ok.
-        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, false, &g));
-        // open/reseed on claim/close rung -> rejected (needs open rung).
-        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, true, &g));
-        // open/reseed on open rung -> ok.
-        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, &g));
-        // non-AUTO_BOUNDED mode -> rejected.
-        assert!(!autonomous_action_permitted(TradingMode::Paper, RolloutPhase::AutoBoundedOpenReseed, true, &g));
+        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, false, true, &g));
+        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, true, true, &g));
+        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, true, &g));
+        assert!(!autonomous_action_permitted(TradingMode::Paper, RolloutPhase::AutoBoundedOpenReseed, true, true, &g));
+        // REV-011-F03: canary=false must fail the authoritative gate.
+        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, false, &g));
     }
 }

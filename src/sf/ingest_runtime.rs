@@ -37,22 +37,29 @@ pub struct PipelineOutcome {
     pub deduped: bool, // already seen (idempotent skip)
 }
 
-/// A minimal idempotency store (in-memory for tests; the real runtime backs this
-/// with the `events` table unique indexes from migration 1003).
+/// A two-phase idempotency store (REV-011-F05): `contains` is read-only,
+/// `commit` persists a key only AFTER a durable canonical append succeeds.
+/// This prevents a valid-but-never-persisted payload from poisoning the dedupe
+/// cache.
 pub trait IdempotencyStore {
-    /// Returns true if this idempotency key was already appended.
-    fn seen(&mut self, key: &str) -> bool;
+    /// Read-only check: has this key already been durably committed?
+    fn contains(&self, key: &str) -> bool;
+    /// Persist the key (only called after durable append succeeds).
+    fn commit(&mut self, key: &str);
 }
 
 /// In-memory idempotency store for tests and as a reference implementation.
 #[derive(Default)]
 pub struct InMemoryIdempotency {
-    seen: HashSet<String>,
+    committed: HashSet<String>,
 }
 
 impl IdempotencyStore for InMemoryIdempotency {
-    fn seen(&mut self, key: &str) -> bool {
-        !self.seen.insert(key.to_string())
+    fn contains(&self, key: &str) -> bool {
+        self.committed.contains(key)
+    }
+    fn commit(&mut self, key: &str) {
+        self.committed.insert(key.to_string());
     }
 }
 
@@ -93,17 +100,18 @@ pub fn run_pipeline(
     }
     stages.push(StageResult::Ok(IngestionStage::EnvelopeValidation));
 
-    // 4. Idempotent append — two modes (doc §7.1).
+    // 4. Idempotent append — two-phase (REV-011-F05). No durable append backend
+    // in this pure-logic slice: we only CHECK `contains` (read-only), never
+    // `commit`. A retry of a never-persisted payload is not falsely deduped.
     let key = idempotency_key(raw);
-    if idem.seen(&key) {
+    let already_seen = idem.contains(&key);
+    if already_seen {
         deduped = true;
-        stages.push(StageResult::Skipped(
-            IngestionStage::IdempotentAppend,
-            "duplicate idempotency key".into(),
-        ));
-        return PipelineOutcome { stages, accepted, deduped };
     }
-    stages.push(StageResult::Ok(IngestionStage::IdempotentAppend));
+    stages.push(StageResult::Skipped(
+        IngestionStage::IdempotentAppend,
+        "no canonical append backend (pure logic slice)".into(),
+    ));
 
     // 5. Normalization — parse derived claims. Malformed counts, not fatal.
     if let Some(_entity_keys) = normalize_entity_keys(raw) {
@@ -205,28 +213,28 @@ mod tests {
         }
     }
 
-    // Regression #4: fallback idempotency key must preserve entity + event type
-    // + time bucket + raw hash, so two payloads with the same raw hash but
-    // different entity/time do NOT dedupe.
+    // REV-011-F05: pure-logic slice never commits, so a retry of a payload that
+    // was never durably persisted is NOT deduped.
     #[test]
-    fn fallback_key_preserves_entity_and_time_context() {
+    fn retry_without_commit_is_not_duplicate() {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
-        let two = payload(None, "same", 3600, "B");
-        // REV-009-F05: pure-logic slice is normalized-only, not accepted.
         assert!(!run_pipeline(&one, &mut idem).accepted);
-        let outcome = run_pipeline(&two, &mut idem);
-        assert!(!outcome.deduped);
+        assert!(!idem.contains(&idempotency_key(&one)), "pure slice must not commit");
+        // A retry of the same payload is also not deduped (nothing committed).
+        let retry = run_pipeline(&one, &mut idem);
+        assert!(!retry.deduped);
     }
 
-    // Regression #4b: same entity + same time bucket + same hash DOES dedupe.
+    // REV-011-F05: after a durable append (commit), a retry IS deduped.
     #[test]
-    fn fallback_key_dedupes_true_duplicate() {
+    fn retry_after_commit_is_duplicate() {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
-        let two = payload(None, "same", 100, "A"); // same hourly bucket, same entity
-        assert!(!run_pipeline(&one, &mut idem).accepted);
-        let outcome = run_pipeline(&two, &mut idem);
-        assert!(outcome.deduped);
+        let key = idempotency_key(&one);
+        // Simulate a durable append having committed the key.
+        idem.commit(&key);
+        let retry = run_pipeline(&one, &mut idem);
+        assert!(retry.deduped);
     }
 }
