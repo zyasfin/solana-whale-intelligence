@@ -21,6 +21,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-005 | 2026-08-30 | final runtime B19–B22 | 1 bug | 218 passed, 0 failed |
 | REV-006 | 2026-08-30 | re-review fix F01 | APPROVED | 218 passed, 0 failed |
 | REV-007 | 2026-08-31 | whole code vs canonical PLAN SWI | 12 critical/high + 7 medium | 218 passed, 0 failed |
+| REV-008 | 2026-08-31 | re-review logic fixes F03–F19 | LOGIC APPROVED | 226 passed, 0 failed |
 
 ---
 
@@ -597,3 +598,90 @@ Fix order:
 5. Source health/ingestion/revival correctness.
 6. Identity/auth alignment.
 7. Remaining medium mismatches and capability phases.
+
+---
+
+## REV-008 — Re-review logic fixes (REV-007 F03–F19)
+
+**Tanggal:** 2026-08-31 (post-fix)  
+**Mode:** Re-verifikasi fix logic (read-only)  
+**Acuan:** `REVIEW_BRIEF.md` + REV-007 temuan logic (bukan integration)  
+**Scope:** F03, F04, F05, F06, F07, F08, F09, F10, F13, F14, F15, F16, F17, F18, F19
+
+### Hasil fix
+
+#### F03 — ACCEPTED — Decision taxonomy terpadu
+- `decision.rs::ComponentClass` kini re-export dari `portfolio.rs` (4 kelas:
+  MandatoryPass/SizingInput/StrategyInput/HaltInput). Tidak ada enum duplikat.
+- `decision_runtime::evaluate` memakai 4 kelas; HaltInput yang fire → Reject.
+
+#### F04 — ACCEPTED — Decision tanpa evidence tidak lagi APPROVE
+- `evaluate` kini mengembalikan `InsufficientEvidence` bila `evidence_snapshot_ids`
+  kosong (fail-closed, gate #2).
+
+#### F05 — ACCEPTED — Signer checklist fail-closed pada field mandatory
+- `signer_policy_passes` mewajibkan `chain_id`/`chain_genesis`/`function_selector`/
+  `max_native_debit`/`max_token_debit`/`min_output` bernilai `Some` (None → fail).
+
+#### F06 — ACCEPTED — AUTO_BOUNDED menegakkan guard + evidence
+- `cycle_ready` kini mewajibkan `guard.evidence_refs` non-kosong + `guard.can_raise_limit()`.
+- `limit_raise_permitted` + `autonomous_action_permitted` mewajibkan evidence.
+
+#### F07 — ACCEPTED — Action string bebas ditolak
+- `execution_runtime::parse_action` memvalidasi string ke `Action` (Trade/Lp)
+  tertutup; unknown/arbitrary → None.
+
+#### F08 — ACCEPTED — Source health recency terhadap waktu sekarang
+- `HealthSignal` membawa `now_secs`; cadence dihitung `now - last_success`.
+- `ProviderHealth::default` kini `Silent` (bukan `Up`).
+
+#### F09 — ACCEPTED — Ingestion stage no-op ditandai Skipped
+- `run_pipeline` memvalidasi envelope lengkap (source_name + event_type non-kosong).
+- Stage persistence-dependent (EntityResolution..JobsOutbox) ditandai `Skipped`, bukan `Ok`.
+
+#### F10 — ACCEPTED — Revival tidak fabricate + validasi token
+- `run_revival` menerima `revival_quality`/`evidence_refs` dari caller; memvalidasi
+  `token == baseline.token`; failure memory dibawa di semua path.
+
+#### F13 — ACCEPTED — time_bucket diimplementasi
+- `core.rs::time_bucket` mem-parse RFC3339 → bucket jam; malformed → kosong.
+
+#### F14 — ACCEPTED — Wallet PnL per-token
+- `SwapReconstruction` membawa `realized_pnl_by_token`; `CostBasis.realized_pnl`
+  kini PnL token itu sendiri, bukan total wallet.
+
+#### F15 — ACCEPTED — Caller hit_rate excludes missing copy_pnl
+- Denominator hanya outcome dengan `copy_pnl=Some`; missing ≠ miss.
+
+#### F16 — ACCEPTED — Narrative flow sesuai §8.4
+- `ProvenanceStage` ditambah `MetadataFingerprint` + urutan verbatim
+  (LocalArchiveSearch sebelum ExactAliasWebXTiktokSearch).
+
+#### F17 — ACCEPTED — Graph node taxonomy lengkap
+- `NodeType` ditambah alias `Contract`/`SourceAccount`/`Message`/`ExternalEvent`/
+  `Policy` sesuai §9.
+
+#### F18 — ACCEPTED — LP malformed numeric → Insufficient
+- `fee_to_tvl` parse failure → None (bukan zero).
+
+#### F19 — ACCEPTED — Cargo MSRV dinaikkan
+- `Cargo.toml` `rust-version` 1.85 → 1.89.
+
+### Masih deferred (bukan bug logic — integration/cutover)
+
+- F01 (migration bundle initialize/upgrade DB)
+- F02 (wire `sf` ke binary/API/UI)
+- F11 (OIDC/RBAC/WebAuthn/workload identity)
+- F12 (wire canonical provider selector)
+
+### Verifikasi
+
+```text
+cargo build — clean (no warning)
+cargo test — 226 passed, 0 failed (88 module + 134 legacy + 4 regression)
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic (F03–F19) diperbaiki. Produk tetap
+PARTIAL FOUNDATION; blocker integration F01/F02/F11/F12 masih deferred.
