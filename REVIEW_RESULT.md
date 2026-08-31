@@ -22,6 +22,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-006 | 2026-08-30 | re-review fix F01 | APPROVED | 218 passed, 0 failed |
 | REV-007 | 2026-08-31 | whole code vs canonical PLAN SWI | 12 critical/high + 7 medium | 218 passed, 0 failed |
 | REV-008 | 2026-08-31 | re-review logic fixes F03–F19 | LOGIC APPROVED | 226 passed, 0 failed |
+| REV-009 | 2026-08-31 | independent verification of REV-008 | CHANGES REQUIRED: 7 fixed, 7 partial, 1 unfixed | 226 passed; Rust 1.89 PASS |
 
 ---
 
@@ -685,3 +686,141 @@ cargo test — 226 passed, 0 failed (88 module + 134 legacy + 4 regression)
 
 **LOGIC APPROVED** — seluruh temuan logic (F03–F19) diperbaiki. Produk tetap
 PARTIAL FOUNDATION; blocker integration F01/F02/F11/F12 masih deferred.
+
+---
+
+## REV-009 — Independent verification of REV-008
+
+**Tanggal:** 2026-08-31 03:03 UTC  
+**Mode:** Read-only re-review of commit `45c2879` and REV-008 claims  
+**Git HEAD:** `981e997`  
+**Scope:** REV-007 F03–F19 logic fixes; deployment blockers F01/F02/F11/F12 only rechecked for status.
+
+### Verdict
+
+**CHANGES REQUIRED — REV-008 `LOGIC APPROVED` is overstated.**
+
+Seven findings are fixed, eight are only partial/not fixed. Green tests do not cover the remaining invalid paths.
+
+### Fixed
+
+- **F03 Rust taxonomy:** one four-class `ComponentClass`; HALT fire rejects. SQL alignment remains migration work.
+- **F08 source recency/default:** recency uses `now_secs`; default is `Silent`; historical success does not override failures.
+- **F14 wallet PnL:** realized PnL is tracked per token.
+- **F15 caller PnL:** `copy_pnl=None` excluded from denominator.
+- **F17 graph taxonomy:** missing node variants added.
+- **F18 LP malformed numeric:** parse failure returns `None`.
+- **F19 MSRV:** `rust-version=1.89`; Rust 1.89 locked all-target check passes.
+
+### Remaining findings
+
+#### REV-009-F01 — HIGH — Decision still approves with no mandatory components
+
+**Location:** `src/sf/decision_runtime.rs::evaluate`, lines 34–63.
+
+A bundle with one evidence ID, empty `component_results`, empty `missing_capabilities` returns `Approve`. The runtime has no required mandatory-component set and does not validate `source_freshness/completeness`. F04 is therefore partial, not accepted.
+
+**Minimum fix:** provide/derive the required mandatory component names; reject when any are absent/stale/unresolved; add tests for evidence-present + zero mandatory components and incomplete freshness.
+
+#### REV-009-F02 — HIGH — Signer checklist remains structurally incomplete
+
+**Location:** `src/sf/execution.rs::SignerPolicy`; `src/sf/execution_runtime.rs::signer_policy_passes`, line 136.
+
+The fix makes six existing optional fields fail on `None`, but PLAN §17 mandatory semantics remain absent: wallet/workspace binding, idempotency binding, factory/manager, authority, gas/priority fee/tip/rent, writable accounts, approvals, and full instruction decode. F05 is partial.
+
+**Minimum fix:** model every §17 field in signer input and fail closed independently; negative test each omission/mismatch before any signer integration.
+
+#### REV-009-F03 — HIGH — AUTO_BOUNDED gate is not a complete action gate
+
+**Location:** `src/sf/autonomy_runtime.rs::autonomous_action_permitted`, line 60; `cycle_ready`, line 81.
+
+`autonomous_action_permitted` receives no `TradingMode` and accepts `AutoBoundedClaimClose` for every action, including open/reseed callers. It does not call `thresholds_sane`; caller-supplied weaker thresholds can pass. `cycle_ready` checks mode but still has no action maturity distinction. F06 is partial.
+
+**Minimum fix:** gate on `(mode, phase, action, guard)`; require exact/frozen minimum thresholds; open/reseed requires `AutoBoundedOpenReseed`; claim/close may use earlier rung; add negative tests.
+
+#### REV-009-F04 — HIGH — Free-form action bypass remains
+
+**Location:** `src/sf/execution_runtime.rs::parse_action`, line 87; `src/sf/intent.rs::Intent.action`, line 85; `src/sf/decision.rs::DecisionBundle.target_action`, line 17.
+
+A parser helper was added, but no production constructor/persistence gate calls it. Both canonical structs still accept arbitrary `String`. `git grep parse_action` finds only the helper and its tests. F07 is not fixed.
+
+**Minimum fix:** replace fields with canonical tagged `Action`, or make construction private/fallible and validate before persistence; DB CHECK/domain must match.
+
+#### REV-009-F05 — HIGH — Ingestion still reports unwritten evidence as successful/accepted
+
+**Location:** `src/sf/ingest_runtime.rs::run_pipeline`, line 73 and line 130.
+
+`RawEvidenceWrite` remains unconditional `Ok` without a writer. The in-memory idempotency insert is reported as canonical append. `accepted=true` is returned while entity/graph/projection/trigger/outbox are all skipped. F09 is partial.
+
+**Minimum fix:** inject raw/evidence and append backends with explicit results; without backend return `Skipped/Unavailable` and `accepted=false` (or rename status to normalized-only).
+
+#### REV-009-F06 — HIGH — Revival success can still lose memory and claim evaluation without evidence
+
+**Location:** `src/sf/revival_runtime.rs::run_revival`, lines 39–84.
+
+Success returns caller `evidence_refs` unchanged, dropping `baseline.failure_memory`; it permits `revival_quality=None` and empty evidence while reporting `OpportunityEvaluation`. Token mismatch also returns empty memory. This contradicts the REV-008 claim “failure memory dibawa di semua path.” F10 is partial.
+
+**Minimum fix:** merge baseline failure memory into every result; require quality + evidence before `OpportunityEvaluation`; otherwise stop at `RevivalQuality`/insufficient.
+
+#### REV-009-F07 — MEDIUM — Invalid EventEnvelope timestamp still creates empty-bucket key
+
+**Location:** `src/sf/core.rs::time_bucket`, lines 110–114; `EventEnvelope::idempotency_key`.
+
+Valid RFC3339 bucketing is fixed, but malformed `observed_at` becomes `""` and the caller does not reject it. The comment says caller must treat it as no bucket, but no such gate exists. F13 is partial.
+
+**Minimum fix:** return `Result/Option<IdempotencyKey>` and reject invalid mandatory timestamp before append.
+
+#### REV-009-F08 — MEDIUM — Narrative completion remains evidence-free
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 77–84.
+
+Stage ordering is fixed, but any `Exact` edge still advances directly to completed graph even when `evidence_ref=None`; current tests explicitly build such edges. F16 is partial.
+
+**Minimum fix:** completion requires evidence reference and stage proof/trace; truth status alone cannot imply all workflow stages completed.
+
+### Deferred blockers unchanged
+
+- F01 migration/cutover bundle.
+- F02 canonical binary/API/UI/persistence wiring.
+- F11 OIDC/RBAC/WebAuthn/workload identity; role enum still `Admin/Operator/Analyst`.
+- F12 canonical provider selector remains unwired to live Helius path.
+
+### Verification
+
+```text
+cargo test --locked
+226 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS
+```
+
+Temporary `target-msrv-189-review/` removed. Source files unchanged during review.
+
+### Final status
+
+```text
+REV-008 fixed:   F03, F08, F14, F15, F17, F18, F19
+REV-008 partial: F04, F05, F06, F09, F10, F13, F16
+REV-008 unfixed: F07
+Verdict: CHANGES REQUIRED
+```
+
+
+### Independent reviewer addendum
+
+Tiga reviewer independen mengonfirmasi verdict REV-009 dan menambahkan edge cases berikut:
+
+1. **REV-009-F02 / signer:** enam field hanya dicek `is_some()`; `Some("")` tetap lolos. Mandatory string harus non-empty dan semantically validated.
+2. **REV-009-F04 / action parser:** `EMERGENCY_EXIT` selalu dipetakan ke `TradeAction::EmergencyExit`; `LpAction::EmergencyExit` tidak dapat direpresentasikan tanpa action kind/context.
+3. **Source health edge case:** `now_secs - last_success <= cadence` menerima timestamp masa depan karena delta negatif. Wajib `0 <= delta <= cadence`, atau reject clock-skew di luar tolerance.
+4. **REV-009-F05 / ingestion:** `source_name` dan `event_type` hanya memakai `is_empty()`; whitespace-only lolos. Wajib `trim().is_empty()` fail-closed.
+
+Independent verification tetap:
+
+```text
+cargo test --locked: 226 passed, 0 failed
+cargo +1.89.0 check --locked --all-targets: PASS
+```
+
+Verdict tidak berubah: **CHANGES REQUIRED**.

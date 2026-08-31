@@ -69,16 +69,21 @@ pub fn run_pipeline(
     // 1. Fetch/stream — assumed complete (payload is in hand).
     stages.push(StageResult::Ok(IngestionStage::Fetch));
 
-    // 2. Raw evidence write — raw-first (doc §7.2 + ingest.rs old).
-    stages.push(StageResult::Ok(IngestionStage::RawEvidenceWrite));
+    // 2. Raw evidence write — NOT executed in this pure-logic slice (no writer
+    // backend). Marked Skipped, not Ok (REV-009-F05): an unwritten evidence is
+    // never reported as success.
+    stages.push(StageResult::Skipped(
+        IngestionStage::RawEvidenceWrite,
+        "no raw evidence writer backend (pure logic slice)".into(),
+    ));
 
     // 3. Envelope validation — fail-closed (principle #7). A canonical envelope
     // requires raw_hash, schema version, a source name, and a non-empty event
-    // type (REV-007-F09: empty source/event type must not be accepted).
-    if raw.raw_hash.is_empty()
-        || raw.payload_schema_version.is_empty()
-        || raw.source_name.is_empty()
-        || raw.event_type.is_empty()
+    // type. Whitespace-only values are rejected (REV-009 addendum #4).
+    if raw.raw_hash.trim().is_empty()
+        || raw.payload_schema_version.trim().is_empty()
+        || raw.source_name.trim().is_empty()
+        || raw.event_type.trim().is_empty()
     {
         stages.push(StageResult::Failed(
             IngestionStage::EnvelopeValidation,
@@ -127,7 +132,9 @@ pub fn run_pipeline(
             IngestionStage::JobsOutbox,
             "no jobs/outbox backend (pure logic slice)".into(),
         ));
-        accepted = true;
+        // REV-009-F05: the payload is only NORMALIZED, not accepted into the
+        // canonical store (evidence/graph/projection/trigger/outbox are skipped).
+        accepted = false;
     } else {
         stages.push(StageResult::Skipped(
             IngestionStage::Normalization,
@@ -206,7 +213,8 @@ mod tests {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
         let two = payload(None, "same", 3600, "B");
-        assert!(run_pipeline(&one, &mut idem).accepted);
+        // REV-009-F05: pure-logic slice is normalized-only, not accepted.
+        assert!(!run_pipeline(&one, &mut idem).accepted);
         let outcome = run_pipeline(&two, &mut idem);
         assert!(!outcome.deduped);
     }
@@ -217,7 +225,7 @@ mod tests {
         let mut idem = InMemoryIdempotency::default();
         let one = payload(None, "same", 0, "A");
         let two = payload(None, "same", 100, "A"); // same hourly bucket, same entity
-        assert!(run_pipeline(&one, &mut idem).accepted);
+        assert!(!run_pipeline(&one, &mut idem).accepted);
         let outcome = run_pipeline(&two, &mut idem);
         assert!(outcome.deduped);
     }

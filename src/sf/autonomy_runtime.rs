@@ -53,19 +53,36 @@ pub fn limit_raise_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool
         && guard.can_raise_limit()
 }
 
-/// Single autonomous-action gate (REV-007-F06): mode, phase maturity, frozen
-/// thresholds + evidence + human approval (all inside `can_raise_limit`).
-/// This is the one entry point callers should use to decide whether an
-/// autonomous action may run.
-pub fn autonomous_action_permitted(phase: RolloutPhase, guard: &AutonomyGuard) -> bool {
-    can_claim_close(phase)
-        && !guard.evidence_refs.is_empty()
-        && guard.can_raise_limit()
+/// Single autonomous-action gate (REV-007-F06 + REV-009-F03): gates on
+/// `(mode, phase, action-kind, guard)`.
+/// - mode MUST be AUTO_BOUNDED.
+/// - frozen thresholds MUST be sane (`thresholds_sane`).
+/// - guard must pass (numeric thresholds + human approval + evidence).
+/// - `is_open` (open/reseed actions) requires `AutoBoundedOpenReseed` or later;
+///   claim/close may use the earlier `AutoBoundedClaimClose` rung.
+pub fn autonomous_action_permitted(
+    mode: TradingMode,
+    phase: RolloutPhase,
+    is_open: bool,
+    guard: &AutonomyGuard,
+) -> bool {
+    if !is_autonomous(mode) {
+        return false;
+    }
+    if !thresholds_sane(&guard.thresholds) {
+        return false;
+    }
+    let phase_ok = if is_open {
+        can_open(phase)
+    } else {
+        can_claim_close(phase)
+    };
+    phase_ok && !guard.evidence_refs.is_empty() && guard.can_raise_limit()
 }
 
 /// Validate frozen rollout thresholds are sane (min sample > 0, horizon > 0,
-/// drawdown < 0, CI lower bound >= 0, requires approval). Returns true when all
-/// hold (a malformed threshold set fails closed).
+/// drawdown < 0, CI lower bound >= 0, requires approval). A malformed set fails
+/// closed.
 pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
     t.min_forward_sample > 0
         && t.forward_horizon_days > 0
@@ -74,10 +91,9 @@ pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
         && t.requires_human_approval
 }
 
-/// Whether an autonomous cycle is ready to run (REV-007-F06): mode is
-/// AUTO_BOUNDED, phase is at least claim/close, canary is set, AND the guard
-/// passes (numeric thresholds + human approval + evidence). A cycle with no
-/// evidence refs or a failing guard is NOT ready.
+/// Whether an autonomous cycle is ready to run: mode is AUTO_BOUNDED, phase is
+/// at least claim/close, canary is set, AND the guard passes (numeric thresholds
+/// + human approval + evidence).
 pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
     is_autonomous(cycle.mode)
         && can_claim_close(cycle.phase)
@@ -85,7 +101,6 @@ pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
         && !cycle.guard.evidence_refs.is_empty()
         && cycle.guard.can_raise_limit()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +179,20 @@ mod tests {
             max_notional: None,
         };
         assert!(!cycle_ready(&c));
+    }
+
+    // REV-009-F03: open/reseed requires AutoBoundedOpenReseed; claim/close uses
+    // earlier rung; non-AUTO_BOUNDED mode is rejected.
+    #[test]
+    fn autonomous_action_gate_distinguishes_action_kind() {
+        let g = guard(true, 30);
+        // claim/close (not open) on claim/close rung -> ok.
+        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, false, &g));
+        // open/reseed on claim/close rung -> rejected (needs open rung).
+        assert!(!autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedClaimClose, true, &g));
+        // open/reseed on open rung -> ok.
+        assert!(autonomous_action_permitted(TradingMode::AutoBounded, RolloutPhase::AutoBoundedOpenReseed, true, &g));
+        // non-AUTO_BOUNDED mode -> rejected.
+        assert!(!autonomous_action_permitted(TradingMode::Paper, RolloutPhase::AutoBoundedOpenReseed, true, &g));
     }
 }

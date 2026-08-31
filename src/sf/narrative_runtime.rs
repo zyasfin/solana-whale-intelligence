@@ -72,14 +72,16 @@ pub fn resolve(narrative_key: &str, edges: &[NarrativeEdge]) -> NarrativeResolut
             _ => {}
         }
 
-        // Furthest stage is the max stage index among edges' truth status:
-        // an edge with `Exact` evidence implies EarliestEvidence reached.
-        if e.truth_status == ProvenanceTruthStatus::Exact {
+        // REV-009-F08: an `Exact` edge only advances to EarliestEvidence when it
+        // actually carries an evidence reference. Truth status alone cannot
+        // imply the workflow stages completed.
+        if e.truth_status == ProvenanceTruthStatus::Exact && e.evidence_ref.is_some() {
             furthest = ProvenanceStage::EarliestEvidence;
         }
     }
 
-    // If we reached EarliestEvidence, the graph stage is also reached.
+    // If we reached EarliestEvidence (via a real evidence ref), the graph stage
+    // is also reached.
     if furthest == ProvenanceStage::EarliestEvidence {
         furthest = ProvenanceStage::OriginAdoptionPropagationGraph;
     }
@@ -104,7 +106,7 @@ mod tests {
             to_key: "TOKEN".into(),
             role,
             truth_status: ts,
-            evidence_ref: None,
+            evidence_ref: if ts == ProvenanceTruthStatus::Exact { Some("ev".into()) } else { None },
             confidence: None,
         }
     }
@@ -135,5 +137,14 @@ mod tests {
         let r = resolve("narr1", &[]);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
         assert!(r.originator.is_none());
+    }
+
+    // REV-009-F08: an Exact edge WITHOUT evidence_ref must not complete the graph.
+    #[test]
+    fn exact_edge_without_evidence_does_not_complete() {
+        let mut e = edge("originator", ProvenanceRole::Originator, ProvenanceTruthStatus::Exact);
+        e.evidence_ref = None;
+        let r = resolve("narr1", &[e]);
+        assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
     }
 }

@@ -46,7 +46,7 @@ fn fallback_idempotency_preserves_entity_and_time_context() {
     let mut idem = InMemoryIdempotency::default();
     let one = RawPayload { chain: Chain::Solana, source_name: "source".into(), source_event_id: None, event_type: "transfer".into(), payload_schema_version: "1".into(), raw_hash: "same".into(), observed_at: 0, payload: serde_json::json!({"token":"A"}) };
     let two = RawPayload { chain: Chain::Solana, source_name: "source".into(), source_event_id: None, event_type: "transfer".into(), payload_schema_version: "1".into(), raw_hash: "same".into(), observed_at: 3600, payload: serde_json::json!({"token":"B"}) };
-    assert!(run_pipeline(&one, &mut idem).accepted);
+    assert!(!run_pipeline(&one, &mut idem).accepted); // normalized-only (REV-009-F05)
     let outcome = run_pipeline(&two, &mut idem);
     assert!(!outcome.deduped, "fallback key requires entity + event type + time bucket + raw hash");
 }

@@ -85,31 +85,37 @@ pub enum IdempotencyKey {
 }
 
 impl EventEnvelope {
-    /// Derive the idempotency key per the frozen defaults (doc §7.1).
-    pub fn idempotency_key(&self) -> IdempotencyKey {
+    /// Derive the idempotency key per the frozen defaults (doc §7.1). Returns
+    /// `None` when the fallback path has a malformed/empty `observed_at`
+    /// (REV-009-F07: an invalid mandatory timestamp must be rejected, not
+    /// silently bucketed to an empty key).
+    pub fn idempotency_key(&self) -> Option<IdempotencyKey> {
         match &self.source_event_id {
-            Some(source_event_id) => IdempotencyKey::StableId {
+            Some(source_event_id) => Some(IdempotencyKey::StableId {
                 source_id: self.source_id.clone(),
                 source_event_id: source_event_id.clone(),
                 payload_schema_version: self.payload_schema_version.clone(),
-            },
-            None => IdempotencyKey::Fallback {
-                source_id: self.source_id.clone(),
-                normalized_entity: self.entity_keys.join(","),
-                event_type: self.event_type.clone(),
-                time_bucket: time_bucket(&self.observed_at),
-                raw_hash: self.raw_hash.clone(),
-            },
+            }),
+            None => {
+                let bucket = time_bucket(&self.observed_at)?;
+                Some(IdempotencyKey::Fallback {
+                    source_id: self.source_id.clone(),
+                    normalized_entity: self.entity_keys.join(","),
+                    event_type: self.event_type.clone(),
+                    time_bucket: bucket,
+                    raw_hash: self.raw_hash.clone(),
+                })
+            }
         }
     }
 }
 
-/// An hourly time-bucket for the fallback idempotency key (doc §7.1). Parses an
-/// RFC3339 timestamp; a malformed/empty timestamp fails closed to an empty
-/// bucket, which the caller must treat as "no bucket" (REV-007-F13).
-fn time_bucket(observed_at: &str) -> String {
+/// An hourly time-bucket for the fallback idempotency key (doc §7.1). Returns
+/// `None` for a malformed/empty timestamp (REV-009-F07), so the caller can
+/// reject the envelope instead of using an empty bucket.
+fn time_bucket(observed_at: &str) -> Option<String> {
     observed_at
         .parse::<chrono::DateTime<chrono::Utc>>()
+        .ok()
         .map(|dt| (dt.timestamp().div_euclid(3600)).to_string())
-        .unwrap_or_default()
 }

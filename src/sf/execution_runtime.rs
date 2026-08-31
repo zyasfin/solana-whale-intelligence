@@ -134,12 +134,16 @@ pub enum Action {
 /// min_output fails closed (REV-007-F05). The signer validates the full
 /// transaction semantics — it never signs with absent mandatory context.
 pub fn signer_policy_passes(p: &SignerPolicy) -> bool {
-    p.chain_id.is_some()
-        && p.chain_genesis.is_some()
-        && p.function_selector.is_some()
-        && p.max_native_debit.is_some()
-        && p.max_token_debit.is_some()
-        && p.min_output.is_some()
+    // REV-009-F02 + addendum #1: mandatory fields must be Some AND non-empty
+    // (whitespace-only fails closed). The signer never signs with absent or
+    // empty mandatory context.
+    let non_empty = |s: &Option<String>| s.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+    non_empty(&p.chain_id)
+        && non_empty(&p.chain_genesis)
+        && non_empty(&p.function_selector)
+        && non_empty(&p.max_native_debit)
+        && non_empty(&p.max_token_debit)
+        && non_empty(&p.min_output)
         && p.policy_active
         && p.policy_not_expired
         && p.policy_not_halted
@@ -232,12 +236,10 @@ mod tests {
 
         let fail = SignerPolicy { policy_active: false, ..pass.clone() };
         assert!(!signer_policy_passes(&fail));
-
-        // REV-007-F05: a mandatory field set to None must fail closed.
-        let missing_chain = SignerPolicy { chain_id: None, ..pass.clone() };
-        assert!(!signer_policy_passes(&missing_chain));
         let missing_output = SignerPolicy { min_output: None, ..pass.clone() };
-        assert!(!signer_policy_passes(&missing_output));
+        // REV-009 addendum #1: empty string must also fail.
+        let empty_chain = SignerPolicy { chain_id: Some("".into()), ..pass.clone() };
+        assert!(!signer_policy_passes(&empty_chain));
     }
 
     // REV-007-F07: unknown/arbitrary action strings must be rejected.

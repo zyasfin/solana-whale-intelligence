@@ -58,10 +58,14 @@ pub fn transition(current: &ProviderHealth, signal: &HealthSignal) -> SourceHeal
     if let Some(success) = signal.last_success_secs {
         // Cadence is judged by recency against NOW, not the delta between two
         // historical timestamps (REV-007-F08): now - last_success must be
-        // within the expected cadence, otherwise the source has gone silent.
+        // within the expected cadence. A negative delta (future timestamp /
+        // clock skew) is rejected (REV-009 addendum #3): 0 <= delta <= cadence.
         let cadence_ok = signal
             .expected_cadence_secs
-            .map(|c| signal.now_secs - success <= c)
+            .map(|c| {
+                let delta = signal.now_secs - success;
+                delta >= 0 && delta <= c
+            })
             .unwrap_or(false);
 
         if cadence_ok && !signal.schema_stale {
@@ -153,6 +157,16 @@ mod tests {
         let s = HealthSignal {
             now_secs: 5000,
             ..sig(5000, Some(1000), 0, false)
+        };
+        assert_eq!(transition(&base(), &s), SourceHealthState::Silent);
+    }
+
+    // REV-009 addendum #3: a future success timestamp (clock skew) is rejected.
+    #[test]
+    fn future_timestamp_rejected() {
+        let s = HealthSignal {
+            now_secs: 1000,
+            ..sig(1000, Some(5000), 0, false) // success in the future
         };
         assert_eq!(transition(&base(), &s), SourceHealthState::Silent);
     }

@@ -37,8 +37,23 @@ pub fn evaluate(bundle: &DecisionBundle) -> Disposition {
         return Disposition::InsufficientEvidence;
     }
 
+    // REV-009-F04: the target action must be a known, closed action — an
+    // arbitrary/unknown action string must be rejected before persistence.
+    if super::execution_runtime::parse_action(&bundle.target_action).is_none() {
+        return Disposition::Reject;
+    }
+
     if !bundle.missing_capabilities.is_empty() {
         return Disposition::MissingCapability;
+    }
+    // REV-009-F01: a decision with NO mandatory component at all is incomplete —
+    // there is nothing gating execution. Reject (fail-closed).
+    let has_mandatory = bundle
+        .component_results
+        .iter()
+        .any(|c| c.component_class == ComponentClass::MandatoryPass);
+    if !has_mandatory {
+        return Disposition::Reject;
     }
 
     for c in &bundle.component_results {
@@ -155,6 +170,21 @@ mod tests {
     fn halt_input_firing_rejects() {
         // REV-007-F03: a HALT_INPUT that fires (pass == true) halts the decision.
         let b = bundle(vec![], vec![mandatory("gate1", Some(true)), halt("drawdown", Some(true))], vec!["e1".into()]);
+        assert_eq!(evaluate(&b), Disposition::Reject);
+    }
+
+    // REV-009-F01: evidence present but zero mandatory components -> Reject.
+    #[test]
+    fn no_mandatory_component_rejects() {
+        let b = bundle(vec![], vec![], vec!["e1".into()]);
+        assert_eq!(evaluate(&b), Disposition::Reject);
+    }
+
+    // REV-009-F04: an unknown target_action must be rejected.
+    #[test]
+    fn unknown_action_rejects() {
+        let mut b = bundle(vec![], vec![mandatory("gate1", Some(true))], vec!["e1".into()]);
+        b.target_action = "arbitrary_calldata".into();
         assert_eq!(evaluate(&b), Disposition::Reject);
     }
 

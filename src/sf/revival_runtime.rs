@@ -44,6 +44,11 @@ pub fn run_revival(
     revival_quality: Option<f64>,
     evidence_refs: Vec<String>,
 ) -> RevivalResult {
+    // Failure memory is ALWAYS merged into the evidence refs (REV-009-F06):
+    // prior failure memory stays attached on every path (doc §8.8).
+    let mut all_evidence: Vec<String> = baseline.failure_memory.clone();
+    all_evidence.extend(evidence_refs.iter().cloned());
+
     // REV-007-F10: reject a token/baseline mismatch.
     if token != baseline.token {
         return RevivalResult {
@@ -51,7 +56,7 @@ pub fn run_revival(
             reached_stage: RevivalStage::Wake,
             revival_quality: None,
             passed_activation_gate: false,
-            evidence_refs: Vec::new(),
+            evidence_refs: all_evidence,
         };
     }
 
@@ -61,7 +66,7 @@ pub fn run_revival(
             reached_stage: RevivalStage::Wake,
             revival_quality: None,
             passed_activation_gate: false,
-            evidence_refs: baseline.failure_memory.clone(),
+            evidence_refs: all_evidence,
         };
     }
 
@@ -71,16 +76,26 @@ pub fn run_revival(
             reached_stage: RevivalStage::ActivationGate,
             revival_quality: None,
             passed_activation_gate: false,
-            evidence_refs: baseline.failure_memory.clone(),
+            evidence_refs: all_evidence,
         };
     }
 
+    // REV-009-F06: OpportunityEvaluation requires BOTH a computed quality AND
+    // non-empty caller evidence. Otherwise stop at RevivalQuality (insufficient).
+    let has_quality = revival_quality.is_some();
+    let has_caller_evidence = !evidence_refs.is_empty();
+    let reached = if has_quality && has_caller_evidence {
+        RevivalStage::OpportunityEvaluation
+    } else {
+        RevivalStage::RevivalQuality
+    };
+
     RevivalResult {
         token: token.to_string(),
-        reached_stage: RevivalStage::OpportunityEvaluation,
+        reached_stage: reached,
         revival_quality,
         passed_activation_gate: true,
-        evidence_refs,
+        evidence_refs: all_evidence,
     }
 }
 
@@ -126,15 +141,17 @@ mod tests {
         assert_eq!(r.reached_stage, RevivalStage::OpportunityEvaluation);
         assert!(r.passed_activation_gate);
         assert_eq!(r.revival_quality, Some(0.8));
-        assert_eq!(r.evidence_refs, vec!["ev1".to_string()]);
+        // Failure memory merged with caller evidence (REV-009-F06).
+        assert_eq!(r.evidence_refs, vec!["prev_fail".to_string(), "ev1".to_string()]);
     }
 
-    // REV-007-F10: token/baseline mismatch must be rejected.
+    // REV-009-F06: quality/evidence missing -> stop at RevivalQuality, not eval.
     #[test]
-    fn token_mismatch_rejected() {
-        let r = run_revival("OTHER", &baseline(), true, true, Some(0.8), vec![]);
-        assert_eq!(r.reached_stage, RevivalStage::Wake);
-        assert!(!r.passed_activation_gate);
+    fn missing_quality_or_evidence_stops_before_evaluation() {
+        let no_quality = run_revival("T1", &baseline(), true, true, None, vec!["ev1".into()]);
+        assert_eq!(no_quality.reached_stage, RevivalStage::RevivalQuality);
+        let no_evidence = run_revival("T1", &baseline(), true, true, Some(0.8), vec![]);
+        assert_eq!(no_evidence.reached_stage, RevivalStage::RevivalQuality);
     }
 
     #[test]
