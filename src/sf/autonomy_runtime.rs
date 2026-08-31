@@ -80,24 +80,26 @@ pub fn autonomous_action_permitted(
     phase_ok && !guard.evidence_refs.is_empty() && guard.can_raise_limit()
 }
 
-/// Validate frozen rollout thresholds are sane (min sample > 0, horizon > 0,
-/// drawdown < 0, CI lower bound >= 0, requires approval). A malformed set fails
-/// closed.
+/// Validate rollout thresholds against the FROZEN minimums (REV-011-F03):
+/// min_forward_sample == 30, forward_horizon_days == 14, max_drawdown_pct == -10,
+/// ci_lower_bound > 0, requires_human_approval == true. A caller-supplied weaker
+/// threshold (e.g. 1 sample / 1 day / -0.1% / CI >= -100) MUST fail closed.
 pub fn thresholds_sane(t: &RolloutThresholds) -> bool {
-    t.min_forward_sample > 0
-        && t.forward_horizon_days > 0
-        && t.max_drawdown_pct < 0.0
-        && t.ci_lower_bound >= 0.0
+    t.min_forward_sample >= 30
+        && t.forward_horizon_days >= 14
+        && t.max_drawdown_pct <= -10.0
+        && t.ci_lower_bound > 0.0
         && t.requires_human_approval
 }
 
 /// Whether an autonomous cycle is ready to run: mode is AUTO_BOUNDED, phase is
-/// at least claim/close, canary is set, AND the guard passes (numeric thresholds
-/// + human approval + evidence).
+/// at least claim/close, canary is set, frozen thresholds are sane, AND the
+/// guard passes (numeric thresholds + human approval + evidence).
 pub fn cycle_ready(cycle: &AutonomousCycle) -> bool {
     is_autonomous(cycle.mode)
         && can_claim_close(cycle.phase)
         && cycle.canary
+        && thresholds_sane(&cycle.guard.thresholds)
         && !cycle.guard.evidence_refs.is_empty()
         && cycle.guard.can_raise_limit()
 }
@@ -106,12 +108,14 @@ mod tests {
     use super::*;
 
     fn guard(approved: bool, sample: u32) -> AutonomyGuard {
+        let mut thresholds = RolloutThresholds::default();
+        thresholds.ci_lower_bound = 0.1; // satisfy frozen CI > 0 requirement
         AutonomyGuard {
-            thresholds: RolloutThresholds::default(),
+            thresholds,
             forward_sample: sample,
             forward_horizon_days: 14,
             current_drawdown_pct: -5.0,
-            ci_lower_bound: 0.1,
+            ci_lower_bound: 0.2, // > threshold.ci_lower_bound (0.1) so can_raise_limit passes
             evidence_refs: vec!["ev1".into()],
             human_approved: approved,
         }
@@ -145,10 +149,20 @@ mod tests {
 
     #[test]
     fn thresholds_must_be_sane() {
-        assert!(thresholds_sane(&RolloutThresholds::default()));
+        // A fully-satisfied frozen threshold set passes.
+        let mut good = RolloutThresholds::default();
+        good.ci_lower_bound = 0.1;
+        assert!(thresholds_sane(&good));
         let mut bad = RolloutThresholds::default();
         bad.min_forward_sample = 0;
         assert!(!thresholds_sane(&bad));
+        // REV-011-F03: a weaker-but-still-"positive" threshold must fail.
+        let mut weak = RolloutThresholds::default();
+        weak.min_forward_sample = 1;
+        weak.forward_horizon_days = 1;
+        weak.max_drawdown_pct = -0.1;
+        weak.ci_lower_bound = -100.0;
+        assert!(!thresholds_sane(&weak));
     }
 
     #[test]

@@ -90,22 +90,23 @@ impl EventEnvelope {
     /// (REV-009-F07: an invalid mandatory timestamp must be rejected, not
     /// silently bucketed to an empty key).
     pub fn idempotency_key(&self) -> Option<IdempotencyKey> {
+        // REV-011-F06: `observed_at` is a mandatory canonical envelope field —
+        // validate it BEFORE branching, so a malformed timestamp is rejected in
+        // BOTH StableId and Fallback modes (not just fallback).
+        let _bucket = time_bucket(&self.observed_at)?;
         match &self.source_event_id {
             Some(source_event_id) => Some(IdempotencyKey::StableId {
                 source_id: self.source_id.clone(),
                 source_event_id: source_event_id.clone(),
                 payload_schema_version: self.payload_schema_version.clone(),
             }),
-            None => {
-                let bucket = time_bucket(&self.observed_at)?;
-                Some(IdempotencyKey::Fallback {
-                    source_id: self.source_id.clone(),
-                    normalized_entity: self.entity_keys.join(","),
-                    event_type: self.event_type.clone(),
-                    time_bucket: bucket,
-                    raw_hash: self.raw_hash.clone(),
-                })
-            }
+            None => Some(IdempotencyKey::Fallback {
+                source_id: self.source_id.clone(),
+                normalized_entity: self.entity_keys.join(","),
+                event_type: self.event_type.clone(),
+                time_bucket: time_bucket(&self.observed_at)?,
+                raw_hash: self.raw_hash.clone(),
+            }),
         }
     }
 }
