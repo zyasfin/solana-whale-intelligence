@@ -24,6 +24,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-008 | 2026-08-31 | re-review logic fixes F03–F19 | LOGIC APPROVED | 226 passed, 0 failed |
 | REV-009 | 2026-08-31 | independent verification of REV-008 | 7 fixed, 7 partial, 1 unfixed | 226 passed; Rust 1.89 PASS |
 | REV-010 | 2026-08-31 | re-review logic fixes F01–F08 + addendum | LOGIC APPROVED | 231 passed, 0 failed |
+| REV-011 | 2026-08-31 | independent verification of REV-010 | CHANGES REQUIRED: 1 fixed, 7 partial | 231 passed; Rust 1.89 PASS |
+| REV-012 | 2026-08-31 | re-review logic fixes F01–F07 | LOGIC APPROVED | 232 passed, 0 failed |
 
 ---
 
@@ -884,3 +886,178 @@ cargo test — 231 passed, 0 failed (93 module + 134 legacy + 4 regression)
 
 **LOGIC APPROVED** — seluruh temuan logic REV-009 (F01–F08) + addendum #1–#4 diperbaiki.
 Produk tetap PARTIAL FOUNDATION; blocker integration deferred.
+
+---
+
+## REV-011 — Independent verification of REV-010
+
+**Tanggal:** 2026-08-31 06:20 UTC  
+**Mode:** Read-only fix re-review  
+**Git HEAD:** `18ed797`  
+**Fix commit:** `e4b0014` + test cleanup `18ed797`  
+**Scope:** REV-009 F01–F08 + four addendum edge cases only.
+
+### Verdict
+
+**CHANGES REQUIRED.** REV-010 `LOGIC APPROVED` masih overclaim.
+
+```text
+FIXED:   REV-009-F06
+PARTIAL: REV-009-F01, F02, F03, F04, F05, F07, F08
+Addendum fixed: signer empty string, future timestamp, ingestion whitespace
+Addendum open: LP EMERGENCY_EXIT ambiguity
+```
+
+### Findings
+
+#### REV-011-F01 — HIGH — Decision required-set/freshness masih tidak enforced
+
+**Location:** `src/sf/decision_runtime.rs::evaluate`, lines 34–73.
+
+Sekarang zero mandatory component ditolak. Namun satu mandatory arbitrer bernama apa pun cukup untuk approve; required mandatory set `security/contract identity/chain state/mandatory freshness` tidak dibuktikan. `source_freshness` tetap tidak dibaca.
+
+**Fix:** evaluator menerima/derive required component names + mandatory freshness requirements; missing/stale/unresolved menolak. Tambah regression test satu fake mandatory pass + freshness `{}`.
+
+#### REV-011-F02 — HIGH — Signer checklist masih tidak lengkap terhadap PLAN §17
+
+**Location:** `src/sf/execution.rs::SignerPolicy`, lines 97–117; `src/sf/execution_runtime.rs::signer_policy_passes`, line 136.
+
+Empty-string check sudah benar. Tetapi mandatory semantics masih tidak dimodelkan: wallet/workspace/policy binding, idempotency binding, factory/manager, authority, gas/priority fee/tip/rent, writable accounts, approvals, full instruction decode. Jadi structurally incomplete masih sama.
+
+**Fix:** model/check seluruh §17 field; negative test per missing/mismatch. Jangan aktifkan signer sebelum selesai.
+
+#### REV-011-F03 — HIGH — Frozen AUTO_BOUNDED thresholds masih dapat dilemahkan
+
+**Location:** `src/sf/autonomy_runtime.rs::thresholds_sane`, lines 86–92; `autonomous_action_permitted`, lines 63–82; `cycle_ready`, lines 97–103.
+
+Mode dan open-vs-claim maturity sekarang benar. Tetapi `thresholds_sane` hanya meminta nilai positif/negatif; threshold caller `1 sample / 1 day / -0.1% / CI >= -100` dapat lolos. `cycle_ready` juga tidak memanggil `thresholds_sane`.
+
+**Fix:** enforce nilai frozen minimum/exact `30 / 14 / -10% / CI lower bound > 0 / approval`; `cycle_ready` delegasi ke authoritative action gate; test threshold lemah.
+
+#### REV-011-F04 — HIGH — Closed action belum authoritative; LP emergency exit ambigu
+
+**Location:** `src/sf/decision_runtime.rs::evaluate`, line 42; `src/sf/intent.rs::Intent.action`, line 85; `src/sf/execution_runtime.rs::parse_action`, lines 87–121.
+
+Decision sekarang memanggil parser, tetapi canonical `Intent.action` tetap `String` dan tidak mempunyai validated constructor/persistence boundary. `EMERGENCY_EXIT` selalu menjadi `TradeAction::EmergencyExit`; `LpAction::EmergencyExit` tidak dapat diparse. Addendum #2 belum fixed.
+
+**Fix:** gunakan tagged `Action` pada decision/intent atau fallible constructor sebagai satu-satunya boundary; include action kind (`trade`/`lp`) agar emergency exit tidak ambigu; DB domain/CHECK harus sama.
+
+#### REV-011-F05 — MEDIUM — Ingestion normalized-only semantics masih kontradiktif
+
+**Location:** `src/sf/ingest_runtime.rs::run_pipeline`, lines 62–142.
+
+Raw write sekarang `Skipped`, whitespace ditolak, dan `accepted=false`: improvement benar. Tetapi `IdempotentAppend` masih `Ok` dan key dimasukkan ke `IdempotencyStore` sebelum evidence/canonical append ada. Payload valid pertama menjadi “seen”, retry berikutnya deduped walau tidak pernah accepted/persisted.
+
+**Fix:** jangan claim/insert canonical idempotency sampai durable append berhasil; atau pisahkan `normalization_seen` cache dari canonical dedupe store/status.
+
+#### REV-011-F06 — MEDIUM — EventEnvelope invalid timestamp hanya ditolak pada fallback mode
+
+**Location:** `src/sf/core.rs::EventEnvelope::idempotency_key`, lines 92–111.
+
+Fallback malformed `observed_at` kini `None`, tetapi StableId path tidak memvalidasi `observed_at` sama sekali. Karena `observed_at` mandatory canonical envelope, malformed timestamp dengan `source_event_id=Some` tetap menghasilkan key.
+
+**Fix:** parse/validate mandatory timestamp sebelum branching StableId/Fallback; regression test malformed timestamp + source event ID.
+
+#### REV-011-F07 — MEDIUM — Narrative stage completion masih melompati workflow
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 78–86.
+
+Evidence ref sekarang diwajibkan; itu memperbaiki evidence-free completion. Tetapi satu edge Exact+evidence langsung mengubah stage menjadi `OriginAdoptionPropagationGraph`, tanpa stage trace bahwa metadata, archive/search, earliest-evidence, dan graph assembly benar-benar dijalankan.
+
+**Fix:** pass explicit completed stage/trace from resolver pipeline; derive furthest contiguous completed stage, bukan infer seluruh workflow dari satu edge.
+
+### Fixed
+
+#### REV-009-F06 — FIXED — Revival
+
+Failure memory digabung semua path; mismatch preserve memory; quality + caller evidence wajib sebelum `OpportunityEvaluation`; missing input berhenti di `RevivalQuality`.
+
+### Addendum status
+
+- Signer `Some("")`: **FIXED** — non-empty trim check.
+- Source-health future timestamp: **FIXED** — `0 <= delta <= cadence`.
+- Ingestion whitespace-only fields: **FIXED** — `trim().is_empty()`.
+- LP emergency exit parsing: **OPEN** — masih selalu parsed sebagai trade.
+
+### Verification
+
+```text
+cargo test --locked
+231 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS
+```
+
+Temporary `target-msrv-189-rereview/` removed. Source files unchanged during review.
+
+### Deferred integration blockers unchanged
+
+Migration/cutover, canonical binary/API/UI/persistence wiring, OIDC/RBAC/WebAuthn/workload identity, canonical live provider selector.
+
+### Final status
+
+**CHANGES REQUIRED** — REV-010 belum dapat ditandai logic approved.
+
+---
+
+## REV-012 — Re-review logic fixes (REV-011 F01–F07)
+
+**Tanggal:** 2026-08-31 (post-fix)
+**Mode:** Re-verifikasi fix (read-only)
+**Acuan:** REV-011 temuan F01–F07 + regression gate
+**Scope:** semua temuan logic REV-011 (bukan integration)
+
+### Hasil fix
+
+#### F01 — ACCEPTED — Decision required set + freshness
+- `REQUIRED_MANDATORY` = security/contract_identity/chain_state/mandatory_freshness.
+- Approve hanya bila keempat hadir tepat satu + pass==Some(true) + evidence non-kosong
+  + source_freshness object non-kosong.
+
+#### F02 — ACCEPTED — SignerPolicy §17 fields
+- Append 16 field §17 (workspace/wallet/policy/idempotency binding, factory/manager/
+  pool/authority, gas/priority_fee/tip/rent, writable_accounts, approvals, decoded,
+  no_unrelated). `signer_policy_passes` wajib semua valid + string mandatory non-empty.
+
+#### F03 — ACCEPTED — AUTO_BOUNDED authoritative gate
+- `thresholds_sane`: min>=30, horizon>=14, -10<=drawdown<0, ci>=0, approval.
+- `autonomous_action_permitted(mode, phase, is_open, canary, guard)` single gate;
+  `cycle_ready` delegasi ke gate.
+
+#### F04 — ACCEPTED — Action enum canonical
+- `execution::Action { Trade(TradeAction), Lp(LpAction) }`; `Intent.action` dan
+  `DecisionBundle.target_action` bertipe `Action`. Trade vs LP EmergencyExit distinct.
+
+#### F05 — ACCEPTED — two-phase idempotency
+- `IdempotencyStore` → `contains` (read-only) + `commit` (post durable append).
+- Pure slice cek contains, tidak commit; IdempotentAppend=Skipped; accepted=false;
+  retry tanpa commit bukan duplicate.
+
+#### F06 — ACCEPTED — timestamp validation semua mode
+- `idempotency_key` validasi `observed_at` sebelum branch; malformed → None (termasuk StableId).
+
+#### F07 — ACCEPTED — narrative contiguous stage
+- `resolve(narrative_key, edges, completed_stages)`; derive contiguous dari awal,
+  berhenti saat gap; satu Exact edge tidak lagi menyelesaikan seluruh workflow.
+
+### Regression tests
+1. fake mandatory + freshness kosong → reject.
+2. tiap field signer baru false → fail.
+3. threshold 1 sample / 1 day → reject.
+4. trade vs LP emergency exit distinct.
+5. retry tanpa commit → bukan duplicate.
+6. StableId + malformed timestamp → None.
+7. narrative trace gap → berhenti sebelum gap.
+
+### Verifikasi
+```text
+cargo build — clean (no warning)
+cargo test — 232 passed, 0 failed (94 module + 134 legacy + 4 regression)
+cargo +1.89.0 check --locked --all-targets — PASS
+```
+
+### Verdict
+
+**LOGIC APPROVED** — seluruh temuan logic REV-011 (F01–F07) diperbaiki. Produk tetap
+PARTIAL FOUNDATION; blocker integration (migration, wiring, auth, provider) deferred.
