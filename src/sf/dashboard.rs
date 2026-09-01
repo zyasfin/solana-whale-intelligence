@@ -38,6 +38,9 @@ pub enum Surface {
     SourceHealthCost,
     DecisionExplanation,
     MissedRunnerReview,
+    // REV-020 recent-intelligence surfaces.
+    TokenRecentTimeline,
+    DeployerSocialReuse,
 }
 
 /// Data retention tier (doc §21).

@@ -13,7 +13,7 @@
 //! `NarrativeResolution`) and `token.rs` (`ProvenanceRole`,
 //! `ProvenanceTruthStatus`) and introduces no new frozen state.
 
-use super::narrative::{NarrativeEdge, NarrativeResolution, ProvenanceStage};
+use super::narrative::{NarrativeEdge, NarrativeResolution, ProvenanceStage, StageArtifactKind, StageProof};
 use super::token::ProvenanceRole;
 
 /// Ordered stage index (matches the frozen §8.4 token-first flow).
@@ -44,7 +44,7 @@ pub fn can_advance(current: ProvenanceStage, next: ProvenanceStage) -> bool {
 pub fn resolve(
     narrative_key: &str,
     edges: &[NarrativeEdge],
-    completed_stages: &[(ProvenanceStage, Option<&str>)],
+    completed_stages: &[StageProof],
 ) -> NarrativeResolution {
     let mut originator: Option<String> = None;
     let mut official_adopter: Option<String> = None;
@@ -89,23 +89,34 @@ pub fn resolve(
     }
 }
 
-/// Furthest stage reached with NO gap. Each entry is `(stage, proof)` where
-/// `proof` is `Some(non-empty evidence/record reference)`. EarliestEvidence and
-/// the final graph REQUIRE a non-empty proof; a `None`/empty proof stops there.
-fn contiguous_stage(completed: &[(ProvenanceStage, Option<&str>)]) -> ProvenanceStage {
+/// Furthest stage reached with NO gap. Each entry is a [`StageProof`] whose
+/// `artifact_ref` must be non-empty. `EarliestEvidence` requires
+/// `StageArtifactKind::EvidenceRef`; the final graph requires
+/// `StageArtifactKind::GraphAssemblyRecord`. A wrong-kind or empty proof stops
+/// progression at the prior stage (REV-019-F01 fail-closed).
+fn contiguous_stage(completed: &[StageProof]) -> ProvenanceStage {
     let mut expected = 0u8;
     let mut last = ProvenanceStage::DeployFirstLiquidity;
-    for &(s, proof) in completed {
-        if stage_index(s) != expected {
+    for proof in completed {
+        if stage_index(proof.stage) != expected {
             break; // gap
         }
-        if stage_index(s) >= stage_index(ProvenanceStage::EarliestEvidence) {
-            let has_proof = proof.map(|r| !r.trim().is_empty()).unwrap_or(false);
-            if !has_proof {
-                break;
-            }
+        if proof.artifact_ref.trim().is_empty() {
+            break; // empty ref is never valid proof
         }
-        last = s;
+        let kind_ok = match proof.stage {
+            ProvenanceStage::EarliestEvidence => {
+                proof.artifact_kind == StageArtifactKind::EvidenceRef
+            }
+            ProvenanceStage::OriginAdoptionPropagationGraph => {
+                proof.artifact_kind == StageArtifactKind::GraphAssemblyRecord
+            }
+            _ => true, // earlier stages accept any non-empty ref
+        };
+        if !kind_ok {
+            break;
+        }
+        last = proof.stage;
         expected += 1;
     }
     last
@@ -127,6 +138,16 @@ mod tests {
         }
     }
 
+    /// Build a stage proof. `kind` defaults to `EvidenceRef` unless the stage is
+    /// the final graph (which must be a `GraphAssemblyRecord`).
+    fn proof(stage: ProvenanceStage, artifact_ref: &str) -> StageProof {
+        let artifact_kind = match stage {
+            ProvenanceStage::OriginAdoptionPropagationGraph => StageArtifactKind::GraphAssemblyRecord,
+            _ => StageArtifactKind::EvidenceRef,
+        };
+        StageProof { stage, artifact_kind, artifact_ref: artifact_ref.to_string() }
+    }
+
     #[test]
     fn stage_advances_forward_only() {
         assert!(can_advance(ProvenanceStage::DeployFirstLiquidity, ProvenanceStage::MetadataFingerprint));
@@ -141,13 +162,13 @@ mod tests {
             edge("adopter", ProvenanceRole::OfficialAdopter, ProvenanceTruthStatus::Exact),
         ];
         let all_stages = [
-            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
-            (ProvenanceStage::MetadataFingerprint, Some("p1")),
-            (ProvenanceStage::LocalArchiveSearch, Some("p2")),
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
-            (ProvenanceStage::OcrAsrImagePhoneticExpansion, Some("p4")),
-            (ProvenanceStage::EarliestEvidence, Some("ev-proof")),
-            (ProvenanceStage::OriginAdoptionPropagationGraph, Some("graph-proof")),
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            proof(ProvenanceStage::EarliestEvidence, "ev-proof"),
+            proof(ProvenanceStage::OriginAdoptionPropagationGraph, "graph-proof"),
         ];
         let r = resolve("narr1", &edges, &all_stages);
         assert_eq!(r.originator.as_deref(), Some("originator_wallet"));
@@ -167,28 +188,69 @@ mod tests {
     #[test]
     fn gap_in_stages_stops_before_gap() {
         let stages = [
-            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
-            (ProvenanceStage::LocalArchiveSearch, Some("p2")), // gap: skipped MetadataFingerprint
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"), // gap: skipped MetadataFingerprint
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
     }
 
-    // REV-017-F02: EarliestEvidence/final graph WITHOUT a non-empty proof ref
-    // stops there, even if earlier stages carry proofs.
+    // REV-019-F01: EarliestEvidence with an EMPTY ref stops there.
     #[test]
     fn earliest_evidence_without_proof_stops() {
         let stages = [
-            (ProvenanceStage::DeployFirstLiquidity, Some("p0")),
-            (ProvenanceStage::MetadataFingerprint, Some("p1")),
-            (ProvenanceStage::LocalArchiveSearch, Some("p2")),
-            (ProvenanceStage::ExactAliasWebXTiktokSearch, Some("p3")),
-            (ProvenanceStage::OcrAsrImagePhoneticExpansion, Some("p4")),
-            (ProvenanceStage::EarliestEvidence, None), // no proof ref
-            (ProvenanceStage::OriginAdoptionPropagationGraph, Some("graph-proof")),
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            proof(ProvenanceStage::EarliestEvidence, ""), // empty ref
+            proof(ProvenanceStage::OriginAdoptionPropagationGraph, "graph-proof"),
         ];
         let r = resolve("narr1", &[], &stages);
         assert_eq!(r.resolved_stage, ProvenanceStage::OcrAsrImagePhoneticExpansion);
+    }
+
+    // REV-019-F01: EarliestEvidence carrying a GraphAssemblyRecord (wrong kind)
+    // stops at the prior stage.
+    #[test]
+    fn earliest_evidence_wrong_kind_stops() {
+        let stages = [
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            StageProof {
+                stage: ProvenanceStage::EarliestEvidence,
+                artifact_kind: StageArtifactKind::GraphAssemblyRecord,
+                artifact_ref: "ev-proof".into(),
+            },
+            proof(ProvenanceStage::OriginAdoptionPropagationGraph, "graph-proof"),
+        ];
+        let r = resolve("narr1", &[], &stages);
+        assert_eq!(r.resolved_stage, ProvenanceStage::OcrAsrImagePhoneticExpansion);
+    }
+
+    // REV-019-F01: final graph with an EvidenceRef (wrong kind) stops at
+    // EarliestEvidence.
+    #[test]
+    fn final_graph_wrong_kind_stops() {
+        let stages = [
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            proof(ProvenanceStage::EarliestEvidence, "ev-proof"),
+            StageProof {
+                stage: ProvenanceStage::OriginAdoptionPropagationGraph,
+                artifact_kind: StageArtifactKind::EvidenceRef,
+                artifact_ref: "graph-proof".into(),
+            },
+        ];
+        let r = resolve("narr1", &[], &stages);
+        assert_eq!(r.resolved_stage, ProvenanceStage::EarliestEvidence);
     }
 }

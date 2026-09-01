@@ -19,6 +19,7 @@ pub struct BrowserTask {
 pub enum BrowserPlatform {
     X,
     Tiktok,
+    Web,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

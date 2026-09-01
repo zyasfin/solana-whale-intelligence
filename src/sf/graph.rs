@@ -45,6 +45,17 @@ pub enum EdgeType {
     SameFamilyAs,
     EvidencedBy,
     ResultedIn,
+    // REV-020 recent-intelligence relations (graph-visible).
+    SameDeployer,
+    SameAuthority,
+    SameFeePayer,
+    SameFunder,
+    SameSocialAccount,
+    ReusedSocialLink,
+    OfficialCaAnnouncement,
+    CrossChainDeployment,
+    SuspectedCopycat,
+    LiquidityAttentionRotatedTo,
 }
 
 /// An entity node. Identity is the chain-qualified entity key.

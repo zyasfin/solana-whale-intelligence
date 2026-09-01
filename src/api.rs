@@ -30,7 +30,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/wallets/{chain}/{address}/scores", get(api_wallet_scores))
         .route("/api/wallets/{chain}/{address}/labels", get(api_wallet_labels))
         .route("/api/tokens/{chain}/{mint}/report", get(api_token_report))
-        .route("/api/funding/radar/cases", get(api_radar_cases))
+        .route("/api/tokens/{chain}/{mint}/recent", get(api_token_recent))
+        .route("/api/tokens/{chain}/{mint}/relations", get(api_token_relations))
         .route("/api/funding/radar/cases/{id}", get(api_radar_case))
         .route("/api/signals", get(api_signals))
         .route("/api/signals/rejections", get(api_signal_rejections))
@@ -329,6 +330,38 @@ async fn api_token_report(
             "observed_at": at,
         })),
     })))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RecentQuery {
+    window: Option<String>,
+}
+
+async fn api_token_recent(
+    State(state): State<ApiState>,
+    Path((chain, mint)): Path<(String, String)>,
+    Query(query): Query<RecentQuery>,
+) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::RecentEvent>>, StatusCode> {
+    let window = query.window.as_deref().unwrap_or("24h");
+    if !matches!(window, "1h" | "24h" | "7d" | "30d" | "all") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let token_identity = format!("{chain}:{mint}");
+    let events = solana_whale_intelligence::sf::recent_store::fetch_recent_timeline(&state.pool, &token_identity, window)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(events))
+}
+
+async fn api_token_relations(
+    State(state): State<ApiState>,
+    Path((chain, mint)): Path<(String, String)>,
+) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::CandidateRelation>>, StatusCode> {
+    let token_identity = format!("{chain}:{mint}");
+    let relations = solana_whale_intelligence::sf::recent_store::fetch_relations(&state.pool, &token_identity)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(relations))
 }
 
 async fn api_radar_cases(

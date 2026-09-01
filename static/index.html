@@ -1,1 +1,121 @@
-review-only placeholder
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal Forge — Token Recent</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; }
+  header { padding: 16px 24px; border-bottom: 1px solid #21262d; }
+  h1 { font-size: 18px; margin: 0; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  form { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
+  input, select, button { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; }
+  button { cursor: pointer; }
+  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 800px) { .panels { grid-template-columns: 1fr; } }
+  .panel { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: #58a6ff; }
+  .event, .relation { border-top: 1px solid #21262d; padding: 8px 0; font-size: 13px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin-right: 4px; }
+  .exact { background: #1f6feb33; color: #58a6ff; }
+  .reconstructed { background: #a371f733; color: #bc8cff; }
+  .estimated { background: #d2992233; color: #e3b341; }
+  .insufficient { background: #f8514933; color: #f85149; }
+  .copycat { background: #f8514933; color: #f85149; }
+  .official { background: #2ea04333; color: #3fb950; }
+  .muted { color: #8b949e; }
+  .filters { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header><h1>Signal Forge — Token Recent + Deployer/Social Reuse</h1></header>
+<main>
+  <form id="query-form">
+    <input id="chain" placeholder="chain (solana)" value="solana" size="12">
+    <input id="mint" placeholder="contract address" size="40">
+    <select id="window">
+      <option value="1h">1h</option>
+      <option value="24h" selected>24h</option>
+      <option value="7d">7d</option>
+      <option value="30d">30d</option>
+      <option value="all">all</option>
+    </select>
+    <button type="submit">Load</button>
+  </form>
+
+  <div class="filters" id="filters">
+    <label><input type="checkbox" data-filter="cross_chain" checked> cross-chain</label>
+    <label><input type="checkbox" data-filter="social" checked> social</label>
+    <label><input type="checkbox" data-filter="deployer" checked> deployer</label>
+  </div>
+
+  <div class="panels">
+    <section class="panel">
+      <h2>Token Recent Timeline</h2>
+      <div id="timeline"><span class="muted">No query yet.</span></div>
+    </section>
+    <section class="panel">
+      <h2>Deployer / Social Reuse</h2>
+      <div id="relations"><span class="muted">No query yet.</span></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const form = document.getElementById('query-form');
+const timeline = document.getElementById('timeline');
+const relations = document.getElementById('relations');
+
+function confidenceClass(c) {
+  const map = { exact: 'exact', reconstructed: 'reconstructed', estimated: 'estimated', insufficient: 'insufficient' };
+  return map[c] || 'estimated';
+}
+
+function relationBadge(r) {
+  const isOfficial = /official_ca_announcement/i.test(r);
+  const isCopycat = /copycat|reused_social_link/i.test(r);
+  const cls = isOfficial ? 'official' : (isCopycat ? 'copycat' : 'estimated');
+  return `<span class="badge ${cls}">${r}</span>`;
+}
+
+async function render() {
+  const chain = document.getElementById('chain').value.trim();
+  const mint = document.getElementById('mint').value.trim();
+  const window = document.getElementById('window').value;
+  if (!mint) { timeline.innerHTML = '<span class="muted">Enter a contract address.</span>'; relations.innerHTML = ''; return; }
+
+  const [recent, rel] = await Promise.all([
+    fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`).then(r => r.ok ? r.json() : []),
+    fetch(`/api/tokens/${chain}/${mint}/relations`).then(r => r.ok ? r.json() : []),
+  ]);
+
+  const filterState = {};
+  document.querySelectorAll('[data-filter]').forEach(cb => filterState[cb.dataset.filter] = cb.checked);
+
+  timeline.innerHTML = recent.length
+    ? recent.map(e => `
+      <div class="event" data-kinds="${(e.relation||'').toLowerCase()}">
+        <div>${relationBadge(e.relation || 'unknown')}<span class="muted">${e.event_type}</span></div>
+        <div>occurred ${e.occurred_at} · observed ${e.observed_at}</div>
+        <div class="muted">confidence: <span class="${confidenceClass(e.confidence_level)}">${e.confidence_level}</span>
+          · freshness ${e.freshness ? e.freshness.age_seconds + 's' : 'n/a'} · coverage ${e.coverage} · capability ${e.capability_status}</div>
+        <div class="muted">evidence: ${(e.evidence_refs||[]).join(', ') || 'none'}${e.dependency_group ? ' · group ' + e.dependency_group : ''}</div>
+      </div>`).join('')
+    : '<span class="muted">No recent events.</span>';
+
+  relations.innerHTML = rel.length
+    ? rel.map(c => `
+      <div class="relation">
+        <div>${relationBadge(c.relation)} → ${c.to_identity.kind}:${c.to_identity.value}</div>
+        <div class="muted">confidence <span class="${confidenceClass(c.confidence)}">${c.confidence}</span> · evidence ${(c.evidence_refs||[]).join(', ') || 'none'}</div>
+      </div>`).join('')
+    : '<span class="muted">No corroborated relations (same-symbol-only contracts stay unrelated).</span>';
+}
+
+form.addEventListener('submit', e => { e.preventDefault(); render(); });
+document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', render));
+</script>
+</body>
+</html>

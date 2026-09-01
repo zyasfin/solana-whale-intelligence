@@ -53,3 +53,24 @@ pub struct NarrativeResolution {
     pub official_adopter: Option<String>,
     pub market_leading_contract: Option<String>,
 }
+
+/// A typed, evidence/store-bound proof for a provenance stage (REV-019-F01).
+/// Replaces caller-asserted free text: each proof names the artifact kind it
+/// references and carries a non-empty reference into the evidence/graph store.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StageProof {
+    pub stage: ProvenanceStage,
+    pub artifact_kind: StageArtifactKind,
+    /// Non-empty evidence ref or graph-assembly record id. A `Some`-style
+    /// caller boolean is NOT sufficient; the reference must identify an actual
+    /// stored artifact of the matching kind.
+    pub artifact_ref: String,
+}
+
+/// The kind of stored artifact a [`StageProof`] references.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StageArtifactKind {
+    EvidenceRef,
+    GraphAssemblyRecord,
+}
