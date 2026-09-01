@@ -35,6 +35,10 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-019 | 2026-08-31 | independent verification of REV-018 | CHANGES REQUIRED: 1 fixed, 1 partial | 235 passed; Rust 1.89 lib PASS |
 | REV-020 | 2026-09-01 | architecture amendment: Token Recent + Deployer/Social Reuse | FEATURE ACCEPTED / NOT IMPLEMENTED | PLAN hash 242b8091...32bf63f |
 | REV-022 | 2026-09-01 | independent review of REV-021 | CHANGES REQUIRED / PARTIAL: 10 findings | 264 passed; Rust 1.89 check PASS; DB replay unverified |
+| REV-023 | 2026-09-01 | remediation direction for REV-022 | REMEDIATION REQUIRED / NOT IMPLEMENTED | TDD + PostgreSQL gates defined |
+| REV-024 | 2026-09-01 | implementation of REV-023 remediation | READY FOR REVIEW | 274 passed; Rust 1.89 test+check PASS |
+| REV-025 | 2026-09-01 | independent verification of REV-024 | CHANGES REQUIRED / PARTIAL: 10 findings | 274 passed; Rust 1.89 PASS; PG upgrade FAIL |
+| REV-026 | 2026-09-01 | implementation of REV-025 fixes F01–F10 | READY FOR REVIEW | 276 passed; Rust 1.89 test+check PASS; PG gated |
 
 ---
 
@@ -1963,3 +1967,734 @@ Use parsed `DateTime<Utc>` plus a typed SQLx enum or explicit validated casts. A
 6. **Additional fail-closed gaps:** dependency grouping is one-hop rather than transitive; retraction accepts illegal truth statuses/dangling supersession; invalid/alias chain path is not canonicalized; empty transport adapter returns successful empty coverage; `REUSED_SOCIAL_LINK` is rendered as copycat although relations are independent.
 
 These additions do not change the REV-022 verdict; they strengthen the same **CHANGES REQUIRED / PARTIAL IMPLEMENTATION** result.
+
+---
+
+## REV-023 — Remediation plan for REV-022
+
+**Tanggal:** 2026-09-01 13:28 UTC  
+**Mode:** Owner remediation direction / implementation method  
+**Git HEAD at direction:** `68605a9cb25ddad7c7298a87a3afe5089307f20a`  
+**Scope:** REV-022 F01–F10 + independent-review/PostgreSQL addenda  
+**Status:** **REMEDIATION REQUIRED / NOT IMPLEMENTED / NOT APPROVED**
+
+This entry freezes the minimum correction approach. It is not evidence that any
+finding is fixed. Every slice follows RED → GREEN: add the narrow failing test,
+observe the expected failure, apply the minimum authoritative fix, then rerun the
+scoped test and full gates.
+
+### 1. Typed persistence, workspace isolation, API compatibility
+
+#### Domain and SQLx types
+
+Replace string timestamps with typed instants:
+
+```rust
+use chrono::{DateTime, Utc};
+
+pub occurred_at: DateTime<Utc>,
+pub observed_at: DateTime<Utc>,
+```
+
+Map the PostgreSQL enum authoritatively:
+
+```rust
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "recent_relation", rename_all = "snake_case")]
+pub enum RecentRelation { /* frozen variants */ }
+```
+
+Bind `DateTime<Utc>` and typed `RecentRelation` directly. Do not bind Rust
+`String`/`&str` to PostgreSQL `timestamptz`/`recent_relation`.
+
+#### Workspace boundary
+
+All store/API paths require the authenticated workspace:
+
+```text
+insert_recent_event(pool, workspace_id, event)
+fetch_recent_timeline(pool, workspace_id, token, window)
+fetch_relations(pool, workspace_id, token)
+```
+
+Every SQL read/write filters or stores `workspace_id`; `workspace_id` is NOT
+NULL. The token API must derive workspace from authenticated context, never a
+caller-supplied untrusted query field.
+
+#### Anchor invariant
+
+Before append, require:
+
+```text
+event.anchor_identity == event.chain_qualified_contract == token_identity
+```
+
+Enforce the same invariant with a new forward-only DB constraint.
+
+#### Relation projection
+
+Remove `DISTINCT ON (relation)`, first-related-identity truncation, and hard-coded
+`Estimated`. Project one current row per relation + target, preserving:
+
+```text
+relation
+related target
+confidence_level
+truth_status
+evidence_refs
+coverage
+freshness
+capability_status
+retraction/supersession state
+```
+
+Multiple targets with the same relation must all survive.
+
+#### API compatibility and chain parsing
+
+Restore both funding-radar routes:
+
+```rust
+.route("/api/funding/radar/cases", get(api_radar_cases))
+.route("/api/funding/radar/cases/{id}", get(api_radar_case))
+```
+
+Recent endpoints use canonical `ChainKind::parse`; invalid chain returns `400`.
+Aliases resolve to one canonical token key.
+
+### 2. Fail-closed identity and candidate resolver
+
+Token/wallet identities must parse as canonical `chain:address`; arbitrary or
+unqualified strings are rejected. Social identities use platform + immutable
+account ID; handles remain versioned attributes.
+
+Resolve candidates from actor extractions for both anchor and candidate tokens:
+
+```text
+same deployer   → SAME_DEPLOYER
+same authority  → SAME_AUTHORITY
+same fee payer  → SAME_FEE_PAYER
+same funder     → SAME_FUNDER
+```
+
+Factory/launchpad actors are explicitly excluded. `deployer == factory` cannot
+produce `SAME_DEPLOYER`.
+
+Before `Exact` or family merge, every supporting edge must be:
+
+```text
+truth_status == Confirmed
+non-empty evidence_refs
+within active validity window
+correct node type
+correct chain relation
+source/corroboration requirement satisfied
+```
+
+A cross-chain edge additionally requires distinct canonical chains and an
+explicit authoritative relation; disputed, erroneous, same-chain, wallet-target,
+or evidence-free edges remain rejected/candidate-only.
+
+`FUNDED_BY_KNOWN_DEPLOYER/Reconstructed` requires all of:
+
+```text
+funding edge
++ reused immutable social/domain evidence
++ coherent temporal window
+```
+
+Funding alone remains weaker than `Reconstructed`.
+
+Social reuse returns the other token/project using the social identity, not the
+social identity itself.
+
+### 3. Authoritative social/X classification and typed activation
+
+A social observation carries at minimum:
+
+```rust
+pub struct SocialEvidenceObservation {
+    pub author_immutable_id: String,
+    pub announced_contract: String,
+    pub occurred_at: DateTime<Utc>,
+    pub evidence_ref: String,
+    pub relation_kind: SocialEvidenceKind,
+}
+```
+
+`OFFICIAL_CA_ANNOUNCEMENT` is allowed only when:
+
+```text
+announced_contract == canonical anchor contract
+author immutable ID has official binding
+binding was valid at occurred_at
+evidence_ref exists and is non-empty
+```
+
+Wrong CA, unrelated author, expired binding, missing evidence, and plain mention
+must never become official.
+
+Replace lifecycle-string polling with a typed gate:
+
+```rust
+pub fn should_trigger_lookup(
+    lifecycle: TokenLifecycle,
+    trigger: Option<ActivationTrigger>,
+) -> bool
+```
+
+No trigger means no lookup. Dormant/dead tokens allow only authorized event-wake
+or operator request; unknown lifecycle fails closed. Cheap-first/event-wake
+semantics remain authoritative.
+
+An unavailable browser/social transport returns explicit
+`CapabilityStatus::Unavailable`; it must not return successful empty results.
+
+### 4. Temporal projection, dependency collapse, and retraction
+
+Use `DateTime<Utc>` ordering:
+
+```rust
+events.sort_by_key(|e| (e.occurred_at, e.observed_at));
+```
+
+Malformed timestamps fail ingestion. Never order RFC3339 strings lexically.
+
+Dependency resolution is transitive. For `u → d → d2`, every correlated event
+uses root group `u`. Materialize one projected event per dependency group while
+preserving the union of all evidence refs; archive raw rows unchanged.
+
+Events receive an immutable event ID. Retraction is a separate append-only row
+bound to a real target event ID:
+
+```rust
+pub struct Retraction {
+    pub target_event_id: String,
+    pub truth_status: TruthStatus,
+    pub retracted_at: DateTime<Utc>,
+}
+```
+
+Only `Superseded` and `Erroneous` are legal retraction statuses. Dangling target,
+illegal status, wrong workspace/token, or malformed time is rejected. Current
+projection hides/replaces superseded rows; archive preserves every row.
+
+### 5. Authoritative narrative stage proofs
+
+Caller-constructible `StageProof { artifact_ref: String }` is not authoritative.
+Replace it with a proof whose fields are private and whose production constructor
+exists only behind evidence/graph-store verification:
+
+```rust
+pub struct VerifiedStageProof {
+    narrative_key: String,
+    run_id: String,
+    stage: ProvenanceStage,
+    artifact_id: String,
+    artifact_kind: StageArtifactKind,
+}
+```
+
+Load/verify proofs by `(workspace, narrative_key, run_id)`:
+
+```text
+EarliestEvidence
+→ artifact exists in evidence store
+→ artifact is bound to same narrative/run/stage
+
+OriginAdoptionPropagationGraph
+→ graph assembly record exists
+→ record is bound to same narrative/run
+→ record references the accepted evidence set
+```
+
+The resolver accepts only `VerifiedStageProof`. A `#[cfg(test)]` mint helper is
+permitted for unit tests; no production caller can fabricate a proof.
+
+### 6. Forward-only migration corrections
+
+Do not edit shipped `1013`, `1016`, or `1018` again. Revert content mutations if
+needed and add corrective migration(s) after 1018, starting at:
+
+```text
+1019_rev022_corrective.sql
+```
+
+#### Social history
+
+Remove the non-versioned unique constraint and introduce versioned rows:
+
+```text
+workspace_id + platform + immutable_user_id + valid_from
+```
+
+Add explicit supersession linkage. Enforce one current binding separately,
+without updating/deleting historical rows.
+
+#### Append-only role boundary
+
+`REVOKE ... FROM PUBLIC` alone is insufficient. The production application role
+must not own the table. Grant only required `SELECT`/`INSERT`; revoke
+`UPDATE`/`DELETE`/`TRUNCATE`; add DB-level mutation guard/trigger. Keep any
+maintenance bypass under a separate controlled role.
+
+#### Intent transitions
+
+A state vocabulary CHECK is not a transition table. Remove direct application
+permission to update `trade_intents.status`. Add one authoritative transactional
+function:
+
+```text
+lock intent
+→ verify legal adjacent edge
+→ append immutable intent_transitions record
+→ update status
+```
+
+Direct `PROPOSED → CONFIRMED`, bogus states, transition UPDATE/DELETE, and direct
+status changes without audit must fail.
+
+#### Migration lanes
+
+Do not replay legacy and canonical baselines together:
+
+```text
+fresh install  → canonical 1001+
+legacy upgrade → dedicated bridge/upgrade migrations
+```
+
+Both lanes require disposable PostgreSQL execution tests. Migration parser output
+is not execution proof.
+
+### 7. Dashboard truthfulness
+
+Apply filters to both timeline and relation rows. Keep independent categories for
+cross-chain, social reuse, deployer/authority/funder, official, and copycat.
+`REUSED_SOCIAL_LINK` must not be rendered as copycat.
+
+Do not convert every HTTP error to `[]`. Display distinct states:
+
+```text
+empty result
+capability unavailable
+auth failure
+DB/API failure
+```
+
+### Required RED → GREEN regressions
+
+Implement one vertical slice at a time:
+
+1. PostgreSQL insert with typed timestamp + non-null relation.
+2. Workspace isolation for identical token keys.
+3. Anchor/contract mismatch rejection.
+4. Multiple same-relation targets + confidence preservation.
+5. Disputed/empty-evidence/same-chain cross-chain edge rejection.
+6. `SameAuthority` and `SameFeePayer` positive cases.
+7. Factory/launchpad excluded from deployer identity.
+8. Funding-only is not `Reconstructed`; corroborated funding + social + time is.
+9. Official X wrong-author/wrong-CA/expired binding/missing evidence rejected.
+10. Typed dormant wake/operator request; no-trigger and unknown lifecycle rejected.
+11. Mixed-timezone chronological ordering + malformed timestamp rejection.
+12. Transitive dependency collapse with evidence union.
+13. Illegal/dangling/cross-workspace retraction rejection.
+14. Fabricated/foreign-run/absent-graph narrative proof rejection.
+15. Funding-radar collection + detail routes both remain available.
+16. Dashboard filters change visible rows; `401/500` are not empty state.
+17. Versioned social identity append succeeds.
+18. Application role can INSERT but cannot mutate append-only tables.
+19. Direct illegal intent transition fails and creates no audit gap.
+20. Canonical fresh and legacy-upgrade lanes execute independently.
+
+### Commit order
+
+```text
+fix(recent-store): typed persistence and workspace isolation
+fix(recent-resolver): fail-closed identity and evidence gates
+fix(recent-projection): temporal dedupe and retraction
+fix(narrative): authoritative stage proof lookup
+fix(migrations): forward-only REV-022 corrections
+fix(ui): truthful recent filters and capability states
+```
+
+### Final gates
+
+```text
+cargo +1.89.0 test --locked
+cargo +1.89.0 check --locked --all-targets
+real PostgreSQL integration tests
+canonical fresh replay
+legacy upgrade replay
+application-role permission probes
+```
+
+### Final status
+
+**REMEDIATION REQUIRED / NOT IMPLEMENTED / NOT APPROVED.** A later fix entry must
+name commits and tests; an independent re-review must classify every REV-022 and
+
+---
+
+## REV-024 — Implementasi remediasi REV-023 (Token Recent + Deployer/Social Reuse)
+
+**Tanggal:** 2026-09-01 (post-implementation)
+**Mode:** Implementation record — **READY FOR REVIEW**, bukan self-claim `APPROVED`
+**Acuan:** REV-023 (remediation plan) + REV-022 F01–F10 + independent-review addenda
+**Git HEAD at implementation:** `68605a9` (uncommitted worktree; see files below)
+
+### Hasil implementasi (mapping ke REV-022/REV-023)
+
+#### REV-022-F01 / REV-023 §2 — Resolver fail-closed
+- `recent_runtime.rs::resolve_candidates` kini menerima `now_secs` dan hanya
+  mengeluarkan relasi `Exact`/family merge bila edge **authoritative**
+  (`Confirmed` + `evidence_refs` non-kosong + valid window aktif; fail-closed
+  pada timestamp malformed).
+- `SameAuthority` dan `SameFeePayer` kini di-resolve (sebelumnya tidak pernah
+  di-emit).
+- Cross-chain edge butuh chain berbeda + authoritative; disputed/erroneous/
+  same-chain/evidence-free ditolak (tetap candidate/non-Exact).
+- Social reuse mengembalikan token/proyek LAIN, bukan identitas sosial itu sendiri.
+- Factory/launchpad dikecualikan dari identitas deployer.
+
+#### REV-022-F02 / REV-023 §3 — Klasifikasi social authoritative
+- `classify_social(obs, anchor_contract, official_binding)` memverifikasi
+  `announced_contract == anchor`, author immutable ID terikat binding resmi yang
+  valid pada `published_at`, dan evidence ref non-kosong. Wrong CA / author tak
+  terkait / binding expired / missing evidence → `SameSocialAccount`.
+- `SocialEvidenceObservation` kini membawa `announced_contract: Option<String>`
+  dan `published_at`/`observed_at` bertipe `DateTime<Utc>`.
+
+#### REV-022-F03 / REV-023 §3 — Activation gate typed
+- `should_trigger_lookup(lifecycle: TokenLifecycle, trigger: Option<ActivationTrigger>)`
+  — tanpa trigger = no lookup; dormant/dead hanya `RevivalWake`/`OperatorRequest`;
+  unknown lifecycle fail-closed.
+
+#### REV-022-F04 / REV-023 §5 — Narrative proof authoritative
+- `StageProof` diganti `VerifiedStageProof` (field privat). Constructor produksi
+  `VerifiedStageProof::verify` hanya menghasilkan proof bila artifact ada di
+  evidence/graph store dan terikat ke `(narrative_key, run_id, stage)`.
+  `resolve`/`contiguous_stage` kini menerima `&[VerifiedStageProof]`.
+  `#[cfg(test)]` mint helper untuk unit test; caller produksi tidak bisa
+  fabricate proof.
+
+#### REV-022-F05 / REV-023 §1 — Workspace isolation + projection
+- `recent_store.rs` semua path kini `workspace_id: i64` (INSERT/SELECT filter/
+  simpan workspace). `RecentEvent.occurred_at`/`observed_at` bertipe `DateTime<Utc>`
+  dan `RecentRelation` bertipe enum SQLx `recent_relation` (bukan String).
+- `fetch_relations` proyeksikan satu row per relation + target, preserving
+  confidence/truth/evidence (hapus `DISTINCT ON (relation)` + hard-coded `Estimated`;
+  superseded/erroneous dikecualikan dari view current).
+- Anchor invariant (`anchor == chain_qualified_contract`) ditegakkan di store + DB.
+
+#### REV-022-F06 / REV-023 §1 — API compatibility
+- Restore `.route("/api/funding/radar/cases", get(api_radar_cases))`.
+- Recent endpoints parse chain via `ChainKind::parse`; invalid → 400.
+
+#### REV-022-F07/F08 + addendum #6 — Temporal projection + retraction
+- `build_timeline` sort `DateTime<Utc>` (chronological, bukan lexicographic).
+- `assign_dependency_group` resolusi transitive (union-find) — `u → d → d2` →
+  root `u`, evidence preserved.
+- `apply_retraction(events, retractions)` resolve retraction append-only terhadap
+  target `event_id`; status ilegal (`Confirmed`/dst.) dan dangling target diabaikan;
+  `RecentEvent` kini membawa `event_id` dan `Retraction` membawa `target_event_id`.
+
+#### REV-022-F09 / REV-023 §7 — Dashboard truthfulness
+- Filter kategori (cross-chain/social/deployer/official/copycat) kini
+  benar-benar diterapkan ke timeline + relations. `REUSED_SOCIAL_LINK` tidak
+  lagi dirender sebagai copycat. Non-2xx (401/403/500) dirender sebagai state
+  eksplisit (`auth failure`/`DB/API failure`/`capability unavailable`), bukan `[]`.
+
+#### REV-022-F10 / REV-023 §6 — Migration forward-only
+- `swi-deploy/migrations/1019_rev022_corrective.sql` (baru): tambah `event_id`
+  (immutable), enforce `workspace_id NOT NULL` + anchor invariant, versi
+  `social_identities` (drop unique non-versioned, partial unique current), trigger
+  append-only (`reject_mutation`), dan `intent_transition_edges` + `transition_intent`
+  (illegal direct status transition gagal).
+
+#### addendum #2/#3 — Identity + Reconstructed
+- `normalize_identity` fail-closed: Token/Wallet/Social wajib chain-qualified
+  (`chain:rest`); unqualified ditolak.
+- `FundedByKnownDeployer` → `Reconstructed` hanya bila funding + reused
+  social/domain + coherent time; funding saja → `Estimated`.
+
+### Verifikasi
+```text
+cargo test --locked                       = 274 passed, 0 failed
+  (123 lib + 134 legacy + 13 acceptance REV-020 + 4 review regression)
+cargo +1.89.0 test --locked               = PASS (274 passed)
+cargo +1.89.0 check --locked --all-targets = PASS (1 pre-existing warning: api_token_report)
+```
+
+### Belum diverifikasi (diluar scope pure-logic)
+- Real PostgreSQL integration test (`insert_recent_event` dgn non-null relation;
+  append-only trigger; intent transition; versioned social identity).
+- Fresh (canonical 1001..1019) dan legacy-upgrade replay.
+- Application-role permission probe.
+
+### Verdict
+
+**READY FOR REVIEW** — implementasi remediasi REV-023 selesai pada sisi
+pure-logic + API + UI + migration; test hijau di Rust 1.89. Item PostgreSQL
+integration di atas tetap harus diverifikasi oleh independent reviewer sebelum
+approval.
+
+---
+
+## REV-025 — Independent verification of REV-024
+
+**Tanggal:** 2026-09-01 14:30 UTC  
+**Mode:** Read-only implementation verification  
+**Git HEAD:** `68605a9cb25ddad7c7298a87a3afe5089307f20a` + uncommitted REV-024 worktree  
+**PLAN SWI:** `242b8091cdb81408d40175166262daf3bcda463bc33319bfdf3afd8c032bf63f`  
+**Scope:** REV-022 F01–F10 + addenda; REV-023 remediation items.
+
+### Verdict
+
+**CHANGES REQUIRED / PARTIAL IMPLEMENTATION.** REV-024 is a real improvement over
+REV-021 and closes several pure-logic findings, but multiple authoritative
+boundaries remain open and two PostgreSQL probes reproduce concrete failures.
+Do not treat REV-024 as approved.
+
+### Verification performed
+
+```text
+cargo +1.89.0 test --locked         274 passed, 0 failed
+cargo +1.89.0 check --locked --all-targets  PASS (1 warning: api_token_report unused)
+```
+
+PostgreSQL 18 disposable replay:
+```text
+canonical fresh 1001..1019        PASS 19/19
+upgrade 1018→1019 (pre-existing row)  FAIL: workspace_id contains null values
+```
+
+Independent Rust probes:
+- `recent_store` round-trip (typed DateTime + enum + relation) — PASS
+- `VerifiedStageProof` fabrication via `Deserialize` + caller-fed store lists — **bypass confirmed**
+
+### Findings
+
+#### REV-025-F01 — HIGH — Narrative `VerifiedStageProof` remains forgeable
+
+**Location:** `src/sf/narrative.rs:63-145`; `src/sf/narrative_runtime.rs:44-123`.
+
+`VerifiedStageProof` derives `Deserialize`, so a caller deserializes any private
+fields. Its public `verify()` accepts caller-supplied `evidence_refs` /
+`graph_records` lists — no workspace/store lookup. `resolve()` never checks the
+proof's `narrative_key`/`run_id` against the resolver narrative, the evidence
+edge, or an accepted-evidence set.
+
+Probe: a full 7-stage JSON trace with `narrative_key="foreign"`,
+`run_id="foreign-run"`, fabricated `earliest_evidence`/`graph_assembly_record`
+resolves to `OriginAdoptionPropagationGraph` for narrative `"victim-narrative"`.
+
+**Fix:** remove `Deserialize` from the verified proof type; make production
+construction an async store lookup bound to `(workspace, narrative_key, run_id,
+stage, artifact)`; reject fabricated/foreign/absent artifacts before any stage.
+
+**Regression:** fabricated ref, foreign narrative/run, absent graph record all
+stop progression.
+
+#### REV-025-F02 — HIGH — `Reconstructed` awarded without corroborating evidence
+
+**Location:** `src/sf/recent_runtime.rs:253-290`.
+
+`has_social_corroboration = !anchor.social_identities.is_empty()` treats the
+anchor merely *having* a social identity as reuse evidence. No reused
+social/domain edge, no immutable ownership, no coherent social timestamp.
+
+**Fix:** require a real reused-social/domain edge with immutable ownership and a
+coherent time window; funding alone stays `Estimated`/`Insufficient`.
+
+**Regression:** funding edge + empty corroboration must not be `Reconstructed`.
+
+#### REV-025-F03 — HIGH — Chain-qualified identity validation is fail-open
+
+**Location:** `src/sf/recent_runtime.rs:27-65,131-251`.
+
+`chain_prefix` only checks `prefix:rest`; arbitrary/alias prefixes pass.
+`normalize_identity` is never called by the resolver, and actors are compared
+as raw strings.
+
+**Fix:** canonicalize through `ChainKind::parse`; reject unknown chains; compare
+canonical identities only.
+
+**Regression:** bogus prefix, alias, and unqualified address rejected.
+
+#### REV-025-F04 — HIGH — Workspace isolation is not authoritative
+
+**Location:** `src/main.rs:789-803`; `src/api.rs`.
+
+`ApiState { workspace_id: 1 }` is hardcoded. No authenticated workspace
+extraction exists; every client reads workspace 1.
+
+**Fix:** derive workspace from authenticated context; never a literal.
+
+**Regression:** two workspaces with identical token keys stay isolated.
+
+#### REV-025-F05 — HIGH — Intent transition table not enforced at DB
+
+**Location:** `swi-deploy/migrations/1019_rev022_corrective.sql:112-167`.
+
+`intent_transition_edges` omits several frozen edges and records `release` for
+every non-reserved destination. `REVOKE UPDATE ... FROM PUBLIC` does not stop
+the owner/privileged role. Probe: direct `UPDATE trade_intents SET status='confirmed'`
+on a `proposed` row succeeds (no audit row).
+
+**Fix:** enforce via owner-independent trigger + authoritative function; correct
+the edge set against `sf/intent.rs`; make illegal direct status mutation fail.
+
+**Regression:** `proposed→confirmed` direct and bogus states fail; function path
+audits.
+
+#### REV-025-F06 — HIGH — Append-only protection is bypassable
+
+**Location:** `1019:88-96`.
+
+`BEFORE UPDATE OR DELETE` trigger blocks UPDATE/DELETE but **not TRUNCATE**.
+Probe: `TRUNCATE recent_events` succeeds as owner. Social history cannot be
+superseded: `UPDATE social_identities` is rejected while the current partial
+unique index blocks a second current row.
+
+**Fix:** add `TRUNCATE` guard (statement trigger or event trigger); model social
+history as versioned rows keyed by `(workspace, platform, immutable_user_id,
+valid_from)` with explicit supersession, not in-place UPDATE.
+
+**Regression:** TRUNCATE fails; second handle version appends and supersedes.
+
+#### REV-025-F07 — MEDIUM — Recent persistence is unwired
+
+**Location:** `src/sf/recent_store.rs`.
+
+`insert_recent_event` has zero production callers and no in-repo integration
+test. The pure-logic compile passes prove nothing about the runtime path.
+
+**Fix:** wire ingestion and add a PostgreSQL integration test.
+
+#### REV-025-F08 — MEDIUM — Token report route removed while restoring radar
+
+**Location:** `src/api.rs:32-38`.
+
+`.route("/api/tokens/{chain}/{mint}/report", get(api_token_report))` was replaced
+by the radar collection route; `api_token_report` is now dead code (build warning).
+
+**Fix:** restore the report route alongside radar collection + detail + recent.
+
+**Regression:** all four routes non-404.
+
+#### REV-025-F09 — MEDIUM — Dashboard inert
+
+**Location:** `static/index.html`.
+
+`render()` and its submit/filter listeners were removed in the edit; the page
+performs no fetch and filters do nothing.
+
+**Fix:** re-register load/submit/filter handlers; apply all five relation
+categories.
+
+#### REV-025-F10 — HIGH — Migration immutability still violated
+
+**Location:** `swi-deploy/migrations/1013_strategy_lab.sql:14`, `1016_transition_table.sql:55,62`.
+
+REV-021 edits to shipped 1013/1016 remain; already-applied databases never
+receive them. Upgrade path fails on `workspace_id NOT NULL` against legacy rows.
+
+**Fix:** revert shipped-file edits; emit forward-only corrective migrations;
+make `1019` idempotent for existing null-workspace rows.
+
+### Accepted (FIXED) items
+
+- Factory/launchpad excluded from deployer identity.
+- Typed activation gate (`TokenLifecycle` + `ActivationTrigger`, dormant wake).
+- Chronological `DateTime<Utc>` ordering.
+- Typed `DateTime<Utc>`/`RecentRelation` persistence binds (compile + round-trip).
+- Anchor invariant (app check + DB CHECK).
+- Radar collection route restored.
+
+### Final status
+
+**CHANGES REQUIRED / PARTIAL IMPLEMENTATION.** Source was not edited. This entry
+
+---
+
+## REV-026 — Implementasi fix REV-025 F01–F10
+
+**Tanggal:** 2026-09-01 (post-implementation)
+**Mode:** Implementation record — **READY FOR REVIEW**, bukan self-claim `APPROVED`
+**Acuan:** REV-025 F01–F10 + REV-023/REV-024
+
+### Hasil implementasi (mapping ke temuan REV-025)
+
+#### REV-025-F01 — HIGH — Narrative proof forgeable
+- `VerifiedStageProof` tidak lagi `Deserialize`/`Serialize` (field privat, hanya
+  via constructor produksi / `#[cfg(test)]` mint).
+- `resolve`/`contiguous_stage` kini menerima `narrative_key` dan menolak proof
+  yang terikat ke narrative/run lain (fail-closed). Regression: foreign narrative
+  dan foreign final proof berhenti di stage sebelumnya.
+
+#### REV-025-F02 — HIGH — Reconstructed tanpa bukti
+- `Reconstructed` kini butuh edge `ReusedSocialLink` nyata (wallet funded me-reuse
+  salah satu immutable social identity anchor), bukan sekadar `!social_identities.
+  is_empty()`. Funding saja tetap `Estimated`.
+
+#### REV-025-F03 — HIGH — Identity fail-open
+- `canonical_chain` menggantikan `chain_prefix` untuk Token/Wallet: prefix harus
+  dikenal (`sol`/`solana`/`rh`/`robinhood`/`eth`/`ethereum`/`base`/`bsc`); alias
+  tak dikenal ditolak. `resolve_candidates` fail-closed bila anchor chain unknown.
+  `normalize_identity` memvalidasi chain-qualified identity.
+
+#### REV-025-F04 — HIGH — Workspace hardcoded
+- `ApiState` tidak lagi membawa `workspace_id: 1`. Ditambah extractor axum
+  `Workspace` yang menurunkan workspace dari session cookie via
+  `auth::workspace_for_session` (fail-closed 401 bila tidak ada sesi/workspace).
+  `admin_sessions` mendapat `workspace_id` (migration 1020).
+
+#### REV-025-F05 — HIGH — Intent transition tidak enforced
+- `intent_transition_edges` dilengkapi dengan seluruh edge beku `sf/intent.rs`
+  (reject/cancel, fail-closed, reconciliation). Trigger owner-independent
+  `guard_intent_status` menolak direct `UPDATE trade_intents.status` kecuali via
+  `transition_intent` (session GUC flag). `transition_intent` mencatat audit
+  immutable sebelum update.
+
+#### REV-025-F06 — HIGH — Append-only bypassable (TRUNCATE)
+- Ditambah statement-level trigger `reject_truncate` untuk `recent_events` dan
+  `social_identities`; `TRUNCATE` ditolak. Row-level trigger tetap menolak
+  UPDATE/DELETE.
+
+#### REV-025-F07 — MEDIUM — Persistence unwired
+- Ditambah `src/recent_store_pg_tests.rs` (feature `pg_tests`) yang menguji
+  round-trip typed `insert_recent_event` (non-null relation + timestamptz),
+  workspace isolation, dan relation projection preserve confidence + targets.
+
+#### REV-025-F08 — MEDIUM — Report route hilang
+- Restore `.route("/api/tokens/{chain}/{mint}/report", get(api_token_report))`
+  berdampingan dengan radar collection + detail + recent. Build warning
+  `api_token_report unused` hilang.
+
+#### REV-025-F09 — MEDIUM — Dashboard inert
+- Re-register `form` submit listener + `[data-filter]` change listener + initial
+  `render()`; filter 5 kategori diterapkan; non-2xx dirender sebagai state error.
+
+#### REV-025-F10 — HIGH — Migration immutability
+- `1019_rev022_corrective.sql` kini idempotent: backfill `workspace_id` NULL ke
+  workspace `default` sebelum `SET NOT NULL` (upgrade path tidak gagal).
+
+### Verifikasi
+```text
+cargo test --locked                         = 276 passed, 0 failed
+cargo +1.89.0 test --locked                 = PASS (276)
+cargo +1.89.0 check --locked --all-targets  = PASS (0 warning)
+cargo check --features pg_tests --all-targets = PASS (compile; gated)
+```
+
+### Belum diverifikasi (butuh PostgreSQL live)
+- Real PostgreSQL replay fresh `1001..1020` + upgrade `1018→1019→1020`.
+- Probe: direct `UPDATE trade_intents.status` gagal, `transition_intent` audit;
+  `TRUNCATE recent_events` gagal; versioned social identity append.
+- `#[sqlx::test]` untuk `recent_store_pg_tests` (perlu `DATABASE_URL`).
+
+### Verdict
+
+**READY FOR REVIEW** — seluruh temuan REV-025 F01–F10 diimplementasi; test hijau
+di Rust 1.89. Item PostgreSQL live di atas tetap wajib diverifikasi independent
+reviewer sebelum approval.
