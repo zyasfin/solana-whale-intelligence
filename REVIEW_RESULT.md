@@ -32,6 +32,9 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-016 | 2026-08-31 | re-review logic fixes F01–F03 | LOGIC APPROVED | 235 passed, 0 failed |
 | REV-017 | 2026-08-31 | independent verification of REV-016 | CHANGES REQUIRED: 1 fixed, 2 partial | 235 passed; Rust 1.89 PASS |
 | REV-018 | 2026-08-31 | re-review logic fixes F01–F02 | LOGIC APPROVED | 235 passed, 0 failed |
+| REV-019 | 2026-08-31 | independent verification of REV-018 | CHANGES REQUIRED: 1 fixed, 1 partial | 235 passed; Rust 1.89 lib PASS |
+| REV-020 | 2026-09-01 | architecture amendment: Token Recent + Deployer/Social Reuse | FEATURE ACCEPTED / NOT IMPLEMENTED | PLAN hash 242b8091...32bf63f |
+| REV-022 | 2026-09-01 | independent review of REV-021 | CHANGES REQUIRED / PARTIAL: 10 findings | 264 passed; Rust 1.89 check PASS; DB replay unverified |
 
 ---
 
@@ -1465,3 +1468,498 @@ cargo +1.89.0 check --locked --all-targets — PASS
 
 **LOGIC APPROVED** — seluruh temuan logic REV-017 diperbaiki. Produk tetap
 PARTIAL FOUNDATION; blocker integration deferred.
+
+---
+
+## REV-019 — Independent verification of REV-018
+
+**Tanggal:** 2026-08-31 13:31 UTC  
+**Mode:** Read-only fix re-review  
+**Git HEAD:** `67ae903`  
+**Fix commit:** `e883778`  
+**Scope:** REV-017 F01–F02 only.
+
+### Verdict
+
+**CHANGES REQUIRED.** Durable receipt authority is fixed; narrative proof remains caller-supplied and unverified.
+
+```text
+FIXED:   F01 durable receipt production authority
+PARTIAL: F02 narrative proof binding
+```
+
+### Accepted fix
+
+#### F01 — FIXED — Production callers cannot mint DurableAppendReceipt
+
+`DurableAppendReceipt.key` is private and key-bound. `record_durable_append` is `#[cfg(test)]`, absent from production/library build. Cross-key commit is rejected. Production library check passes without the test-only mint API.
+
+### Remaining finding
+
+#### REV-019-F01 — MEDIUM — Narrative proof reference is still unverified free text
+
+**Location:** `src/sf/narrative_runtime.rs::resolve`, lines 44–87; `contiguous_stage`, lines 94–115.
+
+Replacing `bool` with `Option<&str>` improves non-empty checking, but the reference remains caller-controlled text. The resolver does not verify that:
+
+- the `EarliestEvidence` proof ref exists among relevant `edges[].evidence_ref` or an evidence store;
+- the final graph proof ref identifies an actual graph assembly record;
+- proof belongs to the same narrative/run/stage.
+
+Concrete bypass: `resolve("n", &[], &[(all seven stages, Some("x"))])` reaches `OriginAdoptionPropagationGraph` despite no evidence or graph record.
+
+**Fix:** introduce typed `StageProof { stage, narrative_key/run_id, artifact_ref }`; validate artifact type and ownership. At minimum, `EarliestEvidence` ref must match relevant evidence; final graph ref must match a graph-assembly record supplied by/queried from an authoritative store. Add regression full trace with fabricated/unrelated refs → stop before corresponding stage.
+
+### Verification
+
+```text
+cargo test --locked
+235 passed, 0 failed
+
+cargo +1.89.0 check --locked --lib
+PASS
+```
+
+Source files unchanged during review. Temporary production-boundary target removed after verification.
+
+### Final status
+
+**CHANGES REQUIRED** — REV-018 must not be treated as independently approved yet.
+
+---
+
+## REV-020 — Architecture amendment: Token Recent + Deployer/Social Reuse Intelligence
+
+**Tanggal:** 2026-09-01 00:36 UTC  
+**Mode:** Owner architecture decision / feature addition  
+**Scope:** PLAN SWI §8.3.1, graph relations, relational projections, refresh, dashboard, build order, acceptance gates  
+**Implementation status:** **PLANNED / NOT IMPLEMENTED**
+
+### Decision
+
+Add a token-centric recent-intelligence capability answering:
+
+```text
+What changed recently around this chain-qualified token?
+Which prior/new contracts reuse its deployer, authority, funder, or social identity?
+Which explicitly corroborated contracts are related across chains?
+What first-party or relevant X/web/TikTok evidence supports the relationship?
+```
+
+This is accepted product scope. It is a temporal projection over evidence and graph data, not a symbol-based merge and not an all-X firehose.
+
+### Frozen identity rules
+
+```text
+token   = chain_id + contract_address
+wallet  = chain_id + wallet_address
+X       = platform + immutable account/user ID
+Telegram= platform + chat/channel ID
+website = normalized registrable domain + time-bounded ownership evidence
+```
+
+Name, ticker, image, handle, and URL remain discovery clues only. Factory/launchpad/program addresses remain separate from project deployers. Historical social bindings retain validity windows and evidence.
+
+### Method / approaching
+
+```text
+1. Resolve anchor token by chain + contract.
+2. Extract deployer/creator, authority, fee payer, factory, initial funder,
+   authority changes, and social identities.
+3. Reverse lookup older/newer contracts linked to those actors/identities.
+4. Generate cross-chain candidates from metadata fingerprints and reverse indexes.
+5. Corroborate candidates; never merge by symbol/name alone.
+6. Trigger targeted X/web/TikTok lookup after activation or operator request.
+7. Normalize evidence-backed recent events.
+8. Dedupe reposts/provider copies using source dependency groups.
+9. Materialize per-token and per-family timelines sorted by occurred_at.
+```
+
+Activation gates: first meaningful liquidity, migration, credible caller, smart-wallet entry, fresh-wallet burst, revival wake, material volume/trade activation, social-profile CA/link change, or operator request. Dormant/tombstoned tokens remain event-wake only.
+
+### Relationship taxonomy
+
+```text
+SAME_DEPLOYER
+SAME_AUTHORITY
+SAME_FEE_PAYER
+SAME_FUNDER
+FUNDED_BY_KNOWN_DEPLOYER
+SAME_SOCIAL_ACCOUNT
+REUSED_SOCIAL_LINK
+OFFICIAL_CA_ANNOUNCEMENT
+CROSS_CHAIN_DEPLOYMENT
+DERIVATIVE_OF
+SUSPECTED_COPYCAT
+LIQUIDITY_ATTENTION_ROTATED_TO
+```
+
+Relations stay independent. Shared social/funder evidence does not automatically prove common ownership or official status.
+
+### X/social evidence contract
+
+Token-triggered lookup uses contract address, disambiguated name/symbol, immutable account ID/current and historical handles, domain, Telegram ID/URL, description phrases, image/OCR hash, aliases, deployer/caller/funder, and linked contracts.
+
+Every observation retains post/profile ID, immutable account ID, text/media hash, published and observed times, quote/repost/reply relation, profile CA/link change, raw evidence ref, parser version, coverage, and session health. Official CA announcements remain separate from mentions. Missing/challenged coverage is explicit `Insufficient`/`UNAVAILABLE`.
+
+### Confidence
+
+```text
+Exact         same on-chain signer/authority, immutable social ID,
+              or first-party account announcing exact chain-qualified CA
+Reconstructed new wallet funded by known deployer + reused social/domain + coherent time
+Estimated     several weaker corroborating signals
+Insufficient  name/symbol/image/handle similarity alone or contradictory evidence
+```
+
+Cross-chain family membership needs an authoritative relation or multiple independent corroborating signals. Ambiguous candidates remain separate nodes.
+
+### Recent projection contract
+
+Each event carries event type, anchor/related keys, chain-qualified contract, `occurred_at`, `observed_at`, relation, truth status, confidence components, evidence refs, dependency group, freshness, coverage, capability status, and retraction/supersession status.
+
+Default windows:
+
+```text
+1h | 24h | 7d | 30d
+```
+
+Dashboard additions:
+
+```text
+Token Recent Timeline
+Deployer/Social Reuse Panel
+cross-chain/social/deployer filters
+evidence + confidence + freshness + coverage texture
+copycat and official-announcement distinction
+```
+
+### Minimum acceptance
+
+1. Same-symbol cross-chain contracts without corroboration remain unrelated.
+2. Same chain-qualified deployer/authority creates exact relations; launchpad/factory stays separate.
+3. New wallet funded by known deployer plus immutable X ID becomes `Reconstructed`, not automatically official.
+4. Reused handle/domain without immutable ownership remains candidate/`Insufficient`.
+5. First-party exact-CA announcement creates evidence-backed `OFFICIAL_CA_ANNOUNCEMENT`.
+6. Explicit authoritative cross-chain announcements may join a family; symbol-only namesakes may not.
+7. Correlated copies collapse into one dependency group while preserving all evidence refs.
+8. Deleted/retracted evidence remains archived and supersedes current projection.
+9. Timeline sorts by `occurred_at`, exposes `observed_at`, chain, relation, evidence, confidence, freshness, and coverage.
+10. Dormant/tombstoned tokens receive no individual polling.
+
+### PLAN SWI amendment
+
+Canonical file updated:
+
+```text
+/root/PLAN-SWI-final-architecture-2026-08-29.md
+```
+
+Hash transition:
+
+```text
+old: 482e24ac6e0342dfe001aaf155f9d12f9879c4d1cfdc1123e37300a43d64d7d1
+new: 242b8091cdb81408d40175166262daf3bcda463bc33319bfdf3afd8c032bf63f
+```
+
+Updated sections: executive intelligence tree, §8.3.1 method, graph relations, relational projections, refresh tier, dashboard surfaces, build order, architecture acceptance gates, canonical summary.
+
+### Implementation boundary
+
+No runtime, DDL, worker, API, or dashboard implementation is approved by this entry. Worker must implement incrementally and return **READY FOR REVIEW**, not self-claim `APPROVED`.
+
+Suggested sequence:
+
+```text
+A. domain event/relation/proof types
+B. chain-qualified reverse indexes and candidate resolver
+C. evidence-bound social identity/history resolver
+D. recent projection + dedupe/retraction semantics
+E. X browser-worker token-triggered adapter
+F. API/dashboard surfaces
+G. ten acceptance scenarios + cross-chain collision fixtures
+```
+
+### Verdict
+
+**FEATURE ACCEPTED / NOT IMPLEMENTED** — architecture and approach frozen by this amendment.
+
+---
+
+## REV-021 — Implementasi REV-020 (Token Recent + Deployer/Social Reuse) + prerequisite fix
+
+**Tanggal:** 2026-09-01 (post-implementation)
+**Mode:** Implementation record (worker hermes) — **READY FOR REVIEW**, bukan self-claim `APPROVED`
+**Acuan:** REV-020 (feature contract) + REV-019-F01 (narrative proof) + REV-007-F01 (migration chain)
+**Scope:** sequence REV-020 A–G + dua prerequisite (migration bundle, narrative proof binding)
+
+### Hasil implementasi
+
+#### A — Domain types — `src/sf/recent.rs` (baru)
+- `RecentRelation` (13 frozen variant, `SCREAMING_SNAKE_CASE`): `SameDeployer`,
+  `SameAuthority`, `SameFeePayer`, `SameFunder`, `FundedByKnownDeployer`,
+  `SameSocialAccount`, `ReusedSocialLink`, `OfficialCaAnnouncement`,
+  `CrossChainDeployment`, `DerivativeOf`, `SuspectedCopycat`,
+  `LiquidityAttentionRotatedTo`.
+- `RecentConfidence` (`Exact`/`Reconstructed`/`Estimated`/`Insufficient`) + `rank()`.
+- `IdentityKey`/`IdentityKind` (token/wallet/social/website/telegram, chain-qualified).
+- `ActorExtraction`, `ActivationTrigger`, `Coverage`, `CapabilityStatus`,
+  `Freshness`, `Retraction`, `RecentEvent`, `RecentTimeline`, `CandidateRelation`.
+- `SocialEvidenceKind`, `SocialEvidenceObservation`, `trait TokenEvidenceAdapter`.
+
+#### B — Reverse index + candidate resolver — `src/sf/recent_runtime.rs` (baru)
+- `normalize_identity` (fail-closed, website `www.` strip via crate `url`).
+- `resolve_candidates` (deterministic order; factory/launchpad ≠ deployer;
+  `FundedByKnownDeployer` = `Reconstructed`; symbol-only never relates).
+
+#### C — Social evidence resolver
+- `build_lookup_query` (REV-020 line 1600 lookup terms, deduplicated).
+- `classify_social` (official-CA vs mention vs profile-change).
+- `InMemoryTokenEvidenceAdapter` (reference; concrete scraper transport deferred).
+
+#### D — Recent projection + dedupe/retraction
+- `build_timeline` (sort `occurred_at`, filter anchor).
+- `assign_dependency_group` (correlated copies collapse, evidence preserved).
+- `apply_retraction` (archive-not-delete; supersede status).
+- `coverage_status` (full/on_demand/unavailable/degraded; never coerce to zero).
+- `should_trigger_lookup` (dormant/archived/tombstoned = event-wake only).
+
+#### E — Browser-worker adapter
+- `BrowserPlatform` + variant `Web` (X/TikTok tetap).
+- `TokenEvidenceAdapter` trait + task enqueue boundary. Transport scraper
+  (self-hosted authorized-session) adalah follow-on, bukan bagian otomatis ini.
+
+#### F — API + dashboard
+- `GET /api/tokens/{chain}/{mint}/recent?window=1h|24h|7d|30d|all` (default `24h`).
+- `GET /api/tokens/{chain}/{mint}/relations`.
+- `src/sf/recent_store.rs` (sqlx `insert_recent_event`, `fetch_recent_timeline`,
+  `fetch_relations`; `FromRow` struct, bukan 17-tuple).
+- `static/index.html` dashboard (Token Recent Timeline + Deployer/Social Reuse
+  panel + filter cross-chain/social/deployer + confidence/freshness/coverage
+  texture + copycat vs official distinction).
+
+#### G — Acceptance fixtures — `tests/recent_intelligence_regressions.rs` (baru)
+- 10 skenario REV-020 minimum acceptance + 2 cross-chain collision fixture.
+
+### Prerequisite fix
+
+#### REV-007-F01 — Migration chain
+- `1016_transition_table.sql`: `ADD COLUMN IF NOT EXISTS` untuk
+  `capital_reservations.expires_at` (duplikat dari `1007` line 142) dan
+  `reconciliation_incidents.escalation_deadline`.
+- `1013_strategy_lab.sql`: `DROP CONSTRAINT` nama diperbaiki menjadi
+  `strategy_versions_lifecycle_state_check` (nama auto Postgres; nama lama
+  `..._lifecycle_check` tidak pernah match, sehingga CHECK lama menolak
+  `canary`/`paused`).
+
+#### REV-019-F01 — Narrative proof binding
+- `src/sf/narrative.rs`: `StageProof { stage, artifact_kind, artifact_ref }` +
+  `StageArtifactKind { EvidenceRef, GraphAssemblyRecord }`.
+- `src/sf/narrative_runtime.rs::contiguous_stage` kini validasi jenis artifact:
+  `EarliestEvidence` wajib `EvidenceRef`, final graph wajib `GraphAssemblyRecord`;
+  wrong-kind/empty ref berhenti di stage sebelumnya (fail-closed).
+
+### Migration baru
+- `swi-deploy/migrations/1018_recent_intelligence.sql`: enum `recent_relation`,
+  tabel `social_identities`, `recent_events` (append-only, `REVOKE UPDATE/DELETE/
+  TRUNCATE`), index `(token_identity, occurred_at)`, `(relation, occurred_at)`,
+  `(dependency_group)`, GIN `related_identities`.
+
+### Verifikasi
+```text
+cargo test --locked = 264 passed, 0 failed
+  (114 lib + 134 legacy + 12 acceptance REV-020 + 4 regression)
+cargo check --locked --all-targets = PASS (2 warning dead-code pre-existing)
+sqlglot (postgres): 1013/1016/1018 parse OK (DO $$ & REVOKE fallback Command, bukan error)
+```
+
+### Verdict
+
+**READY FOR REVIEW** — implementasi REV-020 A–G + prerequisite fix selesai dan
+test hijau. Blocker integration lama (wiring vertical slice, OIDC/WebAuthn,
+provider selector) tetap deferred. Browser scraper transport (self-hosted
+authorized-session X/TikTok) adalah follow-on terpisah; pure logic + API +
+acceptance scenario sudah lengkap.
+
+---
+
+## REV-022 — Independent review of REV-021
+
+**Tanggal:** 2026-09-01 07:35 UTC  
+**Mode:** Read-only implementation review  
+**Git HEAD:** `67ae903` + uncommitted REV-021 worktree  
+**PLAN SWI:** `242b8091cdb81408d40175166262daf3bcda463bc33319bfdf3afd8c032bf63f`  
+**Scope:** REV-020 A–G, REV-019-F01, migrations 1013/1016/1018.
+
+### Verdict
+
+**CHANGES REQUIRED / PARTIAL IMPLEMENTATION.** Tests and build pass, but REV-020 cannot be marked implemented.
+
+### Findings
+
+#### REV-022-F01 — HIGH — Candidate resolver is incomplete and promotes unverified edges to Exact
+
+**Location:** `src/sf/recent_runtime.rs::resolve_candidates`, lines 54–199.
+
+- `SameAuthority` and `SameFeePayer` are never emitted despite frozen actor fields/relations.
+- Cross-chain/deployer/funder edges become `Exact` without requiring `TruthStatus::Confirmed`, non-empty evidence, valid window, or source independence.
+- An empty/disputed caller-created `CrossChainDeployment` edge therefore joins a family as Exact.
+- Social reuse resolves to the social identity itself, not the other token/project using it.
+
+**Fix:** resolve every frozen relation from validated chain-qualified edges; require active valid window, confirmed truth, evidence, and the required corroboration class before Exact/family merge. Return the related token/project node for reuse relations.
+
+**Regression:** disputed/evidence-free cross-chain edge must remain candidate/non-Exact; same authority and fee payer must resolve; two tokens reusing one immutable social ID must return the other token.
+
+#### REV-022-F02 — HIGH — Official social announcement is caller-asserted
+
+**Location:** `src/sf/recent_runtime.rs::classify_social`, lines 326–334; `tests/recent_intelligence_regressions.rs::accept5_exact_ca_announcement_is_official`.
+
+`SocialEvidenceKind::OfficialCaAnnouncement` is mapped directly to the official relation. `SocialEvidenceObservation` carries no announced chain-qualified CA and no authoritative account binding. Any caller can label a mention as official.
+
+**Fix:** classification must compare an extracted exact CA to the anchor token and verify immutable author account against a time-valid official social binding; otherwise mention/candidate.
+
+**Regression:** unrelated author, wrong CA, missing raw evidence, or expired binding must not produce `OfficialCaAnnouncement`.
+
+#### REV-022-F03 — HIGH — Activation gate is reduced to lifecycle allowlist
+
+**Location:** `src/sf/recent_runtime.rs::should_trigger_lookup`, lines 283–289.
+
+All lifecycle strings except dormant/archived/tombstoned return true. The function accepts no `ActivationTrigger`, so created/pre-graduation/cooling tokens can be polled without first liquidity, migration, caller/wallet/volume/social wake, or operator request. This violates cheap-first/event-wake behavior.
+
+**Fix:** gate on typed lifecycle + typed activation trigger; dormant/dead only allow global wake/operator request; unknown lifecycle fails closed.
+
+**Regression:** unknown/created/cooling with no trigger reject; explicit allowed activation passes; dormant only wake/operator passes.
+
+#### REV-022-F04 — HIGH — Narrative StageProof remains forgeable
+
+**Location:** `src/sf/narrative.rs::StageProof`, lines 61–67; `src/sf/narrative_runtime.rs::resolve/contiguous_stage`, lines 44–117.
+
+Typed artifact kind does not bind proof to `narrative_key`, run, evidence store, or graph record. The resolver checks only non-empty free text + enum kind. Current positive test uses `ev-proof` while the actual edge ref is `ev`, yet final graph completes.
+
+**Fix:** authoritative artifact lookup/validated proof object bound to narrative/run/stage. Earliest evidence must match relevant stored evidence; final graph must match a stored graph-assembly record.
+
+**Regression:** fabricated ref, another narrative/run ref, and absent graph record must stop before that stage.
+
+#### REV-022-F05 — HIGH — Recent API lacks workspace isolation and relation projection corrupts data
+
+**Location:** `src/sf/recent_store.rs::fetch_recent_timeline`, lines 110–143; `fetch_relations`, lines 147–189; `src/api.rs::api_token_recent/api_token_relations`, lines 339–365.
+
+Queries filter only `token_identity`, despite `workspace_id` in schema. Same token across workspaces can mix/leak data. Relations use `DISTINCT ON (relation)`, discard additional targets, keep only the first `related_identity`, and hard-code every returned confidence to `Estimated`, losing Exact/Reconstructed/Insufficient and current truth/retraction state.
+
+**Fix:** require workspace identity in API/store filters; project one row per relation+target+valid version; preserve stored confidence/truth/evidence and exclude/surface superseded rows explicitly.
+
+**Regression:** two workspaces with same token stay isolated; two SameDeployer targets both return; Exact remains Exact; superseded relation is not returned as current.
+
+#### REV-022-F06 — HIGH — Existing funding-radar collection route was deleted
+
+**Location:** `src/api.rs::router`, lines 24–40; dead `api_radar_cases`, line 367.
+
+Adding recent routes replaced `/api/funding/radar/cases`; only `/{id}` remains. Existing collection endpoint now 404. Build warning confirms handler/row are dead code.
+
+**Fix:** restore `.route("/api/funding/radar/cases", get(api_radar_cases))`.
+
+**Regression:** router test confirms collection and detail routes both exist alongside recent endpoints.
+
+#### REV-022-F07 — MEDIUM — Correlated copies are grouped but not collapsed; retraction projection is not resolved
+
+**Location:** `src/sf/recent_runtime.rs::assign_dependency_group`, lines 228–244; `build_timeline`, lines 204–219; `apply_retraction`, lines 250–260.
+
+Both provider/repost copies remain separate timeline events; only a group label is assigned. Evidence refs are not merged into one projected event. `apply_retraction` merely changes the row already carrying `retraction`; it does not resolve a separate append-only retraction against its target/superseded event or select the current event.
+
+**Fix:** materialize one projected event per dependency group while preserving all evidence refs; model target event ID/ref and resolve append-only retraction/supersession into current + archived views.
+
+**Regression:** two correlated copies produce one projected event with both refs; a separate retraction row supersedes its target while both remain archived.
+
+#### REV-022-F08 — MEDIUM — In-memory timeline ordering is lexicographic, not chronological
+
+**Location:** `src/sf/recent_runtime.rs::build_timeline`, lines 204–219.
+
+RFC3339 strings with different offsets can sort incorrectly. Example: `2026-01-01T00:00:00+02:00` occurs before `2025-12-31T23:00:00Z` but string order reverses them.
+
+**Fix:** store/parse `DateTime<Utc>` and fail closed on malformed time; sort instants, then observed instant.
+
+**Regression:** mixed timezone offsets and malformed timestamp.
+
+#### REV-022-F09 — MEDIUM — Dashboard filters are no-op and API failures masquerade as no data
+
+**Location:** `static/index.html`, lines 89–116.
+
+Checkbox state is read but never applied to events/relations. Every non-2xx response is converted to `[]`, so DB/auth/server failures display “No recent events/relations” instead of explicit unavailable/error status.
+
+**Fix:** apply typed relation-category filters and render HTTP/capability failures distinctly from empty results.
+
+**Regression:** toggling each filter changes visible rows; 500/401 render error/unavailable, not empty.
+
+#### REV-022-F10 — HIGH — Migration fix edits shipped files; 1018 append-only protection is not authoritative
+
+**Location:** `swi-deploy/migrations/1013_strategy_lab.sql`, `1016_transition_table.sql`, `1018_recent_intelligence.sql` lines 100; REVIEW_BRIEF criterion 24.
+
+REV-021 edits existing 1013/1016 despite frozen immutable-migration rule. Already-applied databases will never receive those edits. `REVOKE ... FROM PUBLIC` does not stop table owner or explicitly granted application roles from UPDATE/DELETE/TRUNCATE; no append-only trigger/role grant test exists.
+
+**Fix:** revert shipped files; add forward-only corrective migration(s) after 1018. Enforce append-only with dedicated writer role/grants plus trigger/policy that rejects mutation (with narrowly controlled maintenance role if required).
+
+**Regression:** upgrade from pre-fix applied chain receives corrections; application writer can INSERT but UPDATE/DELETE/TRUNCATE fail.
+
+### Additional implementation gaps
+
+- `build_lookup_query` omits metadata name/symbol, descriptions, aliases, image/OCR hash, historical handles, Telegram/domain detail, caller, and linked contracts claimed by REV-021.
+- X/TikTok/web transport remains only a trait + empty in-memory adapter; no recent-event ingestion vertical slice exists. This is a declared follow-on, therefore not a new bug, but feature status remains partial rather than implemented.
+
+### Verification
+
+```text
+cargo +1.89.0 test --locked
+264 passed, 0 failed
+
+cargo +1.89.0 check --locked --all-targets
+PASS, 2 warnings
+  RadarCaseRow never constructed
+  api_radar_cases never used
+```
+
+Fresh/upgrade PostgreSQL replay: **NOT VERIFIED** in this review. Windows/Tailscale went offline while launching the disposable replay; REV-021's `sqlglot` parse is not execution proof.
+
+Source was not edited. Only this append-only review ledger entry is authorized when the Windows host returns online. Temporary `target-rev021-review/` should be removed after readback.
+
+### Final status
+
+**CHANGES REQUIRED / PARTIAL IMPLEMENTATION** — do not commit or mark REV-021 approved yet.
+
+
+### Database replay addendum
+
+Disposable PostgreSQL 18 replay completed after the Windows host returned online:
+
+```text
+canonical-only 1001..1018: PASS 18/18
+combined legacy 0001..0010 + canonical: FAIL at 1005_intelligence.sql
+ERROR: relation "tokens" already exists
+```
+
+Therefore the REV-021 edits make the canonical-only fresh path executable, including `1018`, but do **not** resolve the complete REV-007-F01 initialize/upgrade bundle claim. Migration immutability/upgrade-path finding `REV-022-F10` remains open.
+
+
+### Independent reviewer + PostgreSQL probe addendum
+
+Three independent scoped reviewers confirmed REV-022 and identified additional concrete failures:
+
+1. **Persistence INSERT is nonfunctional for non-null relation/timestamps.** `recent_store.rs::insert_recent_event` binds Rust strings to PostgreSQL `timestamptz` and `recent_relation`. PostgreSQL 18 prepared-statement probes fail:
+
+```text
+occurred_at: type timestamptz, expression text
+relation: type recent_relation, expression text
+```
+
+Use parsed `DateTime<Utc>` plus a typed SQLx enum or explicit validated casts. Add real PostgreSQL integration test for `insert_recent_event` with a non-null relation.
+
+2. **Identity/factory validation is fail-open.** Token/wallet identity accepts arbitrary non-chain-qualified strings; `deployer == factory` can still yield `SameDeployer/Exact`. Validate chain-qualified identities and explicitly exclude factory/launchpad actors from project-deployer identity.
+
+3. **`Reconstructed` is awarded too early.** One funding edge alone produces `FundedByKnownDeployer/Reconstructed`; REV-020 requires funding plus reused immutable social/domain and coherent time. Funding alone stays a weaker candidate.
+
+4. **Social history schema contradicts append-only history.** `UNIQUE(platform, immutable_user_id)` prevents a second time-versioned row, while UPDATE is intended to be forbidden. PostgreSQL probe confirms the second handle version fails unique constraint. Use a versioned identity/binding key and enforce one current version separately.
+
+5. **1016 does not enforce legal state transitions.** Database probe accepts direct `trade_intents.status: proposed → confirmed` without transition audit. A status vocabulary CHECK is not a transition table. Add forward migration with legal-edge table/trigger and append-only transition enforcement.
+
+6. **Additional fail-closed gaps:** dependency grouping is one-hop rather than transitive; retraction accepts illegal truth statuses/dangling supersession; invalid/alias chain path is not canonicalized; empty transport adapter returns successful empty coverage; `REUSED_SOCIAL_LINK` is rendered as copycat although relations are independent.
+
+These additions do not change the REV-022 verdict; they strengthen the same **CHANGES REQUIRED / PARTIAL IMPLEMENTATION** result.
