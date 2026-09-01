@@ -4,7 +4,9 @@
 //! material, and bot tokens are excluded from every payload.
 
 use crate::models::ChainKind;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::header;
+use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{Html, Json};
 use axum::routing::get;
@@ -15,10 +17,47 @@ use serde::Serialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
-/// Shared API state (database pool only; read-only surface).
+/// Shared API state (database pool only).
 #[derive(Clone)]
 pub struct ApiState {
     pub pool: PgPool,
+}
+
+/// Authenticated workspace, derived from the session cookie (REV-025-F04).
+/// Rejects with `401` when the request carries no valid session or the session
+/// has no workspace binding — never a hardcoded literal.
+pub struct Workspace(pub i64);
+
+impl FromRequestParts<ApiState> for Workspace {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ApiState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = parts
+            .headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cookie| {
+                cookie.split(';').find_map(|part| {
+                    let mut kv = part.trim().splitn(2, '=');
+                    match (kv.next(), kv.next()) {
+                        (Some(k), Some(v)) if k == crate::auth::SESSION_COOKIE => {
+                            Some(v.to_string())
+                        }
+                        _ => None,
+                    }
+                })
+            });
+        let Some(token) = token else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        crate::auth::workspace_for_session(&state.pool, &token)
+            .await
+            .map(Workspace)
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// Build the API router.
@@ -29,6 +68,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/wallets", get(api_wallets))
         .route("/api/wallets/{chain}/{address}/scores", get(api_wallet_scores))
         .route("/api/wallets/{chain}/{address}/labels", get(api_wallet_labels))
+        .route("/api/funding/radar/cases", get(api_radar_cases))
         .route("/api/tokens/{chain}/{mint}/report", get(api_token_report))
         .route("/api/tokens/{chain}/{mint}/recent", get(api_token_recent))
         .route("/api/tokens/{chain}/{mint}/relations", get(api_token_relations))
@@ -339,28 +379,46 @@ struct RecentQuery {
 
 async fn api_token_recent(
     State(state): State<ApiState>,
+    Workspace(workspace_id): Workspace,
     Path((chain, mint)): Path<(String, String)>,
     Query(query): Query<RecentQuery>,
 ) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::RecentEvent>>, StatusCode> {
+    // Canonical chain parsing: an invalid chain returns 400 (REV-023 §1).
+    if crate::models::ChainKind::parse(&chain).is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let window = query.window.as_deref().unwrap_or("24h");
     if !matches!(window, "1h" | "24h" | "7d" | "30d" | "all") {
         return Err(StatusCode::BAD_REQUEST);
     }
     let token_identity = format!("{chain}:{mint}");
-    let events = solana_whale_intelligence::sf::recent_store::fetch_recent_timeline(&state.pool, &token_identity, window)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events = solana_whale_intelligence::sf::recent_store::fetch_recent_timeline(
+        &state.pool,
+        workspace_id,
+        &token_identity,
+        window,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(events))
 }
 
 async fn api_token_relations(
     State(state): State<ApiState>,
+    Workspace(workspace_id): Workspace,
     Path((chain, mint)): Path<(String, String)>,
 ) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::CandidateRelation>>, StatusCode> {
+    if crate::models::ChainKind::parse(&chain).is_none() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let token_identity = format!("{chain}:{mint}");
-    let relations = solana_whale_intelligence::sf::recent_store::fetch_relations(&state.pool, &token_identity)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let relations = solana_whale_intelligence::sf::recent_store::fetch_relations(
+        &state.pool,
+        workspace_id,
+        &token_identity,
+    )
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(relations))
 }
 

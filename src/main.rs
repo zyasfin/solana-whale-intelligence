@@ -15,6 +15,8 @@ mod filter;
 mod funding_radar;
 #[cfg(all(test, feature = "pg_tests"))]
 mod funding_radar_pg_tests;
+#[cfg(all(test, feature = "pg_tests"))]
+mod recent_store_pg_tests;
 mod gmgn;
 mod graph;
 mod health;
@@ -796,7 +798,11 @@ async fn main() -> Result<()> {
                     .await
                     .with_context(|| format!("failed to bind api at {bind}"))?;
                 tracing::info!(%bind, "REST API listening (read-only)");
-                axum::serve(listener, api::router(api::ApiState { pool })).await?;
+                axum::serve(
+                    listener,
+                    api::router(api::ApiState { pool }),
+                )
+                .await?;
             }
             WatchAction::ServeAdmin { bind } => {
                 let database_url = require_database_url(&settings)?;

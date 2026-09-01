@@ -77,6 +77,26 @@ pub async fn validate_session(pool: &PgPool, token: &str) -> bool {
     }
 }
 
+/// Resolve the workspace bound to a valid session, or `None` when the session
+/// is invalid, expired, or carries no workspace binding (REV-025-F04). A
+/// workspace is derived from the authenticated session, never a hardcoded
+/// literal.
+pub async fn workspace_for_session(pool: &PgPool, token: &str) -> Option<i64> {
+    if token.is_empty() {
+        return None;
+    }
+    let hash = token_hash(token);
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT workspace_id FROM admin_sessions \
+         WHERE token_hash = $1 AND expires_at > now() AND workspace_id IS NOT NULL",
+    )
+    .bind(&hash)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    row.map(|(ws,)| ws)
+}
 /// Destroy a session (logout).
 pub async fn destroy_session(pool: &PgPool, token: &str) -> Result<()> {
     let hash = token_hash(token);
