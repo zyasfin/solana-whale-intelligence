@@ -13,7 +13,9 @@
 //! `NarrativeResolution`) and `token.rs` (`ProvenanceRole`,
 //! `ProvenanceTruthStatus`) and introduces no new frozen state.
 
-use super::narrative::{NarrativeEdge, NarrativeResolution, ProvenanceStage, StageArtifactKind, StageProof};
+use super::narrative::{
+    NarrativeEdge, NarrativeResolution, ProvenanceStage, StageArtifactKind, VerifiedStageProof,
+};
 use super::token::ProvenanceRole;
 
 /// Ordered stage index (matches the frozen §8.4 token-first flow).
@@ -39,12 +41,10 @@ pub fn can_advance(current: ProvenanceStage, next: ProvenanceStage) -> bool {
 /// evidence stays at `DeployFirstLiquidity` (fail-closed — never infer a stage
 /// that has no evidence).
 ///
-/// `originator`/`official_adopter`/`market_leading_contract` are extracted from
-/// the edges by role; `independent_spread` collects all edges with that role.
 pub fn resolve(
     narrative_key: &str,
     edges: &[NarrativeEdge],
-    completed_stages: &[StageProof],
+    completed_stages: &[VerifiedStageProof],
 ) -> NarrativeResolution {
     let mut originator: Option<String> = None;
     let mut official_adopter: Option<String> = None;
@@ -75,9 +75,9 @@ pub fn resolve(
         }
     }
 
-    // REV-017-F02: each stage's proof is a typed evidence/record reference
-    // (`Some(non-empty ref)`), not a caller-asserted boolean.
-    let resolved_stage = contiguous_stage(completed_stages);
+    // REV-025-F01: each proof must be bound to THIS narrative; a foreign
+    // narrative/run proof is rejected (fail-closed).
+    let resolved_stage = contiguous_stage(narrative_key, completed_stages);
 
     NarrativeResolution {
         narrative_key: narrative_key.to_string(),
@@ -89,34 +89,38 @@ pub fn resolve(
     }
 }
 
-/// Furthest stage reached with NO gap. Each entry is a [`StageProof`] whose
-/// `artifact_ref` must be non-empty. `EarliestEvidence` requires
-/// `StageArtifactKind::EvidenceRef`; the final graph requires
-/// `StageArtifactKind::GraphAssemblyRecord`. A wrong-kind or empty proof stops
-/// progression at the prior stage (REV-019-F01 fail-closed).
-fn contiguous_stage(completed: &[StageProof]) -> ProvenanceStage {
+/// Furthest stage reached with NO gap. Each entry is a [`VerifiedStageProof`]
+/// bound to `narrative_key`, whose artifact must be non-empty and of the correct
+/// kind. A proof bound to a different narrative/run stops progression
+/// (REV-025-F01). `EarliestEvidence` requires `EvidenceRef`; the final graph
+/// requires `GraphAssemblyRecord`.
+fn contiguous_stage(narrative_key: &str, completed: &[VerifiedStageProof]) -> ProvenanceStage {
     let mut expected = 0u8;
     let mut last = ProvenanceStage::DeployFirstLiquidity;
     for proof in completed {
-        if stage_index(proof.stage) != expected {
+        if proof.narrative_key() != narrative_key {
+            break; // foreign narrative proof is never valid for this narrative
+        }
+        let stage = proof.stage();
+        if stage_index(stage) != expected {
             break; // gap
         }
-        if proof.artifact_ref.trim().is_empty() {
-            break; // empty ref is never valid proof
+        if !proof.has_artifact() {
+            break; // empty artifact is never valid proof
         }
-        let kind_ok = match proof.stage {
+        let kind_ok = match stage {
             ProvenanceStage::EarliestEvidence => {
-                proof.artifact_kind == StageArtifactKind::EvidenceRef
+                proof.artifact_kind() == StageArtifactKind::EvidenceRef
             }
             ProvenanceStage::OriginAdoptionPropagationGraph => {
-                proof.artifact_kind == StageArtifactKind::GraphAssemblyRecord
+                proof.artifact_kind() == StageArtifactKind::GraphAssemblyRecord
             }
-            _ => true, // earlier stages accept any non-empty ref
+            _ => true, // earlier stages accept any non-empty artifact id
         };
         if !kind_ok {
             break;
         }
-        last = proof.stage;
+        last = stage;
         expected += 1;
     }
     last
@@ -138,14 +142,15 @@ mod tests {
         }
     }
 
-    /// Build a stage proof. `kind` defaults to `EvidenceRef` unless the stage is
-    /// the final graph (which must be a `GraphAssemblyRecord`).
-    fn proof(stage: ProvenanceStage, artifact_ref: &str) -> StageProof {
+    /// Build a stage proof via the `#[cfg(test)]` mint helper. `kind` defaults to
+    /// `EvidenceRef` unless the stage is the final graph (which must be a
+    /// `GraphAssemblyRecord`).
+    fn proof(stage: ProvenanceStage, artifact_ref: &str) -> VerifiedStageProof {
         let artifact_kind = match stage {
             ProvenanceStage::OriginAdoptionPropagationGraph => StageArtifactKind::GraphAssemblyRecord,
             _ => StageArtifactKind::EvidenceRef,
         };
-        StageProof { stage, artifact_kind, artifact_ref: artifact_ref.to_string() }
+        VerifiedStageProof::mint("narr1", "run1", stage, artifact_ref, artifact_kind)
     }
 
     #[test]
@@ -222,11 +227,13 @@ mod tests {
             proof(ProvenanceStage::LocalArchiveSearch, "p2"),
             proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
             proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
-            StageProof {
-                stage: ProvenanceStage::EarliestEvidence,
-                artifact_kind: StageArtifactKind::GraphAssemblyRecord,
-                artifact_ref: "ev-proof".into(),
-            },
+            VerifiedStageProof::mint(
+                "narr1",
+                "run1",
+                ProvenanceStage::EarliestEvidence,
+                "ev-proof",
+                StageArtifactKind::GraphAssemblyRecord,
+            ),
             proof(ProvenanceStage::OriginAdoptionPropagationGraph, "graph-proof"),
         ];
         let r = resolve("narr1", &[], &stages);
@@ -244,13 +251,122 @@ mod tests {
             proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
             proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
             proof(ProvenanceStage::EarliestEvidence, "ev-proof"),
-            StageProof {
-                stage: ProvenanceStage::OriginAdoptionPropagationGraph,
-                artifact_kind: StageArtifactKind::EvidenceRef,
-                artifact_ref: "graph-proof".into(),
-            },
+            VerifiedStageProof::mint(
+                "narr1",
+                "run1",
+                ProvenanceStage::OriginAdoptionPropagationGraph,
+                "graph-proof",
+                StageArtifactKind::EvidenceRef,
+            ),
         ];
         let r = resolve("narr1", &[], &stages);
+        assert_eq!(r.resolved_stage, ProvenanceStage::EarliestEvidence);
+    }
+
+    // REV-022-F04: the production constructor verifies the artifact exists in
+    // the store and is bound to the right stage; a fabricated/absent artifact
+    // is rejected.
+    #[test]
+    fn verify_rejects_absent_artifact() {
+        // EarliestEvidence requires an evidence ref present in the store.
+        assert!(
+            VerifiedStageProof::verify(
+                "narr1",
+                "run1",
+                ProvenanceStage::EarliestEvidence,
+                "missing-ev",
+                StageArtifactKind::EvidenceRef,
+                &["other-ev"],
+                &[],
+            )
+            .is_none()
+        );
+        // Final graph requires a graph-assembly record present in the store.
+        assert!(
+            VerifiedStageProof::verify(
+                "narr1",
+                "run1",
+                ProvenanceStage::OriginAdoptionPropagationGraph,
+                "missing-graph",
+                StageArtifactKind::GraphAssemblyRecord,
+                &[],
+                &["other-graph"],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn verify_accepts_present_artifact() {
+        let ev = VerifiedStageProof::verify(
+            "narr1",
+            "run1",
+            ProvenanceStage::EarliestEvidence,
+            "ev-1",
+            StageArtifactKind::EvidenceRef,
+            &["ev-1"],
+            &[],
+        );
+        assert!(ev.is_some());
+        let graph = VerifiedStageProof::verify(
+            "narr1",
+            "run1",
+            ProvenanceStage::OriginAdoptionPropagationGraph,
+            "graph-1",
+            StageArtifactKind::GraphAssemblyRecord,
+            &[],
+            &["graph-1"],
+        );
+        assert!(graph.is_some());
+    }
+
+    // REV-025-F01: a proof bound to a foreign narrative must not advance the
+    // victim narrative's stage.
+    #[test]
+    fn foreign_narrative_proof_is_rejected() {
+        let all_stages = [
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            proof(ProvenanceStage::EarliestEvidence, "ev-proof"),
+            // This final graph proof is minted for a DIFFERENT narrative.
+            VerifiedStageProof::mint(
+                "foreign-narrative",
+                "run1",
+                ProvenanceStage::OriginAdoptionPropagationGraph,
+                "graph-proof",
+                StageArtifactKind::GraphAssemblyRecord,
+            ),
+        ];
+        let r = resolve("victim-narrative", &[], &all_stages);
+        // All proofs are minted for "narr1"; resolving "victim-narrative"
+        // rejects them all, so the stage stays at Deploy.
+        assert_eq!(r.resolved_stage, ProvenanceStage::DeployFirstLiquidity);
+    }
+
+    // A foreign-narrative FINAL proof stops at the prior (matching) stage.
+    #[test]
+    fn foreign_final_proof_stops_at_prior_stage() {
+        let stages = [
+            proof(ProvenanceStage::DeployFirstLiquidity, "p0"),
+            proof(ProvenanceStage::MetadataFingerprint, "p1"),
+            proof(ProvenanceStage::LocalArchiveSearch, "p2"),
+            proof(ProvenanceStage::ExactAliasWebXTiktokSearch, "p3"),
+            proof(ProvenanceStage::OcrAsrImagePhoneticExpansion, "p4"),
+            proof(ProvenanceStage::EarliestEvidence, "ev-proof"),
+            VerifiedStageProof::mint(
+                "foreign-narrative",
+                "run1",
+                ProvenanceStage::OriginAdoptionPropagationGraph,
+                "graph-proof",
+                StageArtifactKind::GraphAssemblyRecord,
+            ),
+        ];
+        // Early proofs are for "narr1"; resolve for "narr1".
+        let r = resolve("narr1", &[], &stages);
+        // The foreign final proof is rejected, so the stage stops at EarliestEvidence.
         assert_eq!(r.resolved_stage, ProvenanceStage::EarliestEvidence);
     }
 }

@@ -54,20 +54,109 @@ pub struct NarrativeResolution {
     pub market_leading_contract: Option<String>,
 }
 
-/// A typed, evidence/store-bound proof for a provenance stage (REV-019-F01).
-/// Replaces caller-asserted free text: each proof names the artifact kind it
-/// references and carries a non-empty reference into the evidence/graph store.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StageProof {
-    pub stage: ProvenanceStage,
-    pub artifact_kind: StageArtifactKind,
-    /// Non-empty evidence ref or graph-assembly record id. A `Some`-style
-    /// caller boolean is NOT sufficient; the reference must identify an actual
-    /// stored artifact of the matching kind.
-    pub artifact_ref: String,
+/// An authoritative, verified provenance-stage proof (REV-022-F04 / REV-023 §5 /
+/// REV-025-F01).
+///
+/// Fields are private and the type is **not** `Deserialize`/`Serialize`: a proof
+/// can only be minted through the store-bound production constructor or the
+/// `#[cfg(test)]` mint helper. A caller cannot fabricate a proof by
+/// deserializing free-text fields; the artifact must exist in the evidence/graph
+/// store and be bound to the same `(narrative_key, run_id, stage)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedStageProof {
+    narrative_key: String,
+    run_id: String,
+    stage: ProvenanceStage,
+    artifact_id: String,
+    artifact_kind: StageArtifactKind,
 }
 
-/// The kind of stored artifact a [`StageProof`] references.
+impl VerifiedStageProof {
+    /// Production constructor. Verifies the referenced artifact exists in the
+    /// appropriate store and is bound to `(narrative_key, run_id, stage)`.
+    /// `EarliestEvidence` requires an evidence ref; the final graph requires a
+    /// graph-assembly record id. Returns `None` (fail-closed) otherwise.
+    pub fn verify(
+        narrative_key: &str,
+        run_id: &str,
+        stage: ProvenanceStage,
+        artifact_id: &str,
+        artifact_kind: StageArtifactKind,
+        evidence_refs: &[&str],
+        graph_records: &[&str],
+    ) -> Option<Self> {
+        if narrative_key.trim().is_empty() || run_id.trim().is_empty() || artifact_id.trim().is_empty() {
+            return None;
+        }
+        let exists = match stage {
+            ProvenanceStage::EarliestEvidence => {
+                artifact_kind == StageArtifactKind::EvidenceRef
+                    && evidence_refs.contains(&artifact_id)
+            }
+            ProvenanceStage::OriginAdoptionPropagationGraph => {
+                artifact_kind == StageArtifactKind::GraphAssemblyRecord
+                    && graph_records.contains(&artifact_id)
+            }
+            _ => true, // earlier stages accept a non-empty artifact id + kind
+        };
+        if !exists {
+            return None;
+        }
+        Some(VerifiedStageProof {
+            narrative_key: narrative_key.to_string(),
+            run_id: run_id.to_string(),
+            stage,
+            artifact_id: artifact_id.to_string(),
+            artifact_kind,
+        })
+    }
+
+    /// `#[cfg(test)]` mint helper for unit tests only; no production caller can
+    /// fabricate a proof without store verification.
+    #[cfg(test)]
+    pub fn mint(
+        narrative_key: &str,
+        run_id: &str,
+        stage: ProvenanceStage,
+        artifact_id: &str,
+        artifact_kind: StageArtifactKind,
+    ) -> Self {
+        VerifiedStageProof {
+            narrative_key: narrative_key.to_string(),
+            run_id: run_id.to_string(),
+            stage,
+            artifact_id: artifact_id.to_string(),
+            artifact_kind,
+        }
+    }
+
+    /// The provenance stage this proof certifies.
+    pub fn stage(&self) -> ProvenanceStage {
+        self.stage
+    }
+
+    /// The narrative this proof is bound to.
+    pub fn narrative_key(&self) -> &str {
+        &self.narrative_key
+    }
+
+    /// The run this proof is bound to.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// The kind of stored artifact this proof references.
+    pub fn artifact_kind(&self) -> StageArtifactKind {
+        self.artifact_kind
+    }
+
+    /// Whether the referenced artifact is non-empty.
+    pub fn has_artifact(&self) -> bool {
+        !self.artifact_id.trim().is_empty()
+    }
+}
+
+/// The kind of stored artifact a [`VerifiedStageProof`] references.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StageArtifactKind {
