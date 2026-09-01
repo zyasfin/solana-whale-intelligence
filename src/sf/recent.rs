@@ -14,12 +14,14 @@
 //! Name, ticker, image, handle, and URL remain discovery clues only.
 //! Factory/launchpad/program addresses remain separate from project deployers.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Relationship taxonomy (REV-020, 13 frozen variants). Relations stay
 /// independent: shared social/funder evidence does not automatically prove
 /// common ownership or official status.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "recent_relation", rename_all = "snake_case")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RecentRelation {
     SameDeployer,
@@ -168,18 +170,31 @@ pub enum CapabilityStatus {
 /// Source freshness of an observation (checked-at + age).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Freshness {
-    pub checked_at: String,
+    pub checked_at: DateTime<Utc>,
     pub age_seconds: u64,
 }
 
 /// A retraction/supersession record (archive-not-delete, principle #6). A
-/// retraction is a NEW event; it never mutates the superseded row.
+/// retraction is a NEW append-only row bound to a real target event ID; it
+/// never mutates the superseded row. Only `Superseded` and `Erroneous` are
+/// legal retraction statuses (REV-023 §4).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Retraction {
-    pub superseded_by: String,
-    pub retracted_at: String,
+    pub target_event_id: String,
+    pub retracted_at: DateTime<Utc>,
     /// Always `Superseded` or `Erroneous`.
     pub truth_status: super::core::TruthStatus,
+}
+
+/// An official social binding: an immutable account ID bound to a
+/// chain-qualified contract with a validity window. First-party exact-CA
+/// announcements require a binding valid at the observation time.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OfficialSocialBinding {
+    pub immutable_account_id: String,
+    pub chain_qualified_contract: String,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
 }
 
 /// A normalized evidence-backed recent event (REV-020 "Recent projection
@@ -189,13 +204,15 @@ pub struct Retraction {
 /// capability status, and retraction/supersession status.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecentEvent {
+    /// Immutable event ID (REV-023 §4). Retraction rows reference this ID.
+    pub event_id: String,
     pub event_type: String,
     pub anchor_identity: String,
     pub related_identities: Vec<IdentityKey>,
     /// Chain-qualified contract this event is anchored on.
     pub chain_qualified_contract: String,
-    pub occurred_at: String,
-    pub observed_at: String,
+    pub occurred_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
     pub relation: Option<RecentRelation>,
     pub truth_status: super::core::TruthStatus,
     /// Numeric confidence component (0..1, optional).
@@ -238,7 +255,8 @@ pub enum SocialEvidenceKind {
 }
 
 /// A single social observation (X/web/TikTok). Retains post/profile ID,
-/// immutable account ID, text/media hash, published/observed times, relation
+/// immutable account ID, text/media hash, published/observed times, the
+/// announced chain-qualified contract (when the post asserts one), relation
 /// kind, raw evidence ref, parser version, coverage, and session health.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SocialEvidenceObservation {
@@ -246,8 +264,11 @@ pub struct SocialEvidenceObservation {
     pub post_or_profile_id: String,
     pub immutable_account_id: String,
     pub text_media_hash: String,
-    pub published_at: String,
-    pub observed_at: String,
+    pub published_at: DateTime<Utc>,
+    pub observed_at: DateTime<Utc>,
+    /// The chain-qualified contract the observation announces (extracted CA),
+    /// when present. `None` means the post did not assert an exact CA.
+    pub announced_contract: Option<String>,
     pub relation_kind: SocialEvidenceKind,
     pub raw_ref: String,
     pub parser_version: String,
