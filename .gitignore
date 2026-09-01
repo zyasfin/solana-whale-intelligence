@@ -1,5 +1,6 @@
 /target
 /target-msrv-189
+/target-rev024-review
 .env
 *.bin
 tg-session*

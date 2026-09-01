@@ -73,11 +73,34 @@ function confidenceClass(c) {
   return map[c] || 'estimated';
 }
 
+// A relation's independent category (REV-023 §7). Categories are independent:
+// a `reused_social_link` is NOT a copycat; a `suspected_copycat` is.
+function relationCategory(rel) {
+  const r = (rel || '').toLowerCase();
+  if (r === 'cross_chain_deployment') return 'cross_chain';
+  if (r === 'official_ca_announcement') return 'official';
+  if (r === 'suspected_copycat') return 'copycat';
+  if (/^same_(social_account|deployer|authority|fee_payer|funder)$/.test(r)
+      || r === 'funded_by_known_deployer' || r === 'derivative_of'
+      || r === 'reused_social_link') {
+    if (r === 'same_social_account' || r === 'reused_social_link') return 'social';
+    return 'deployer';
+  }
+  return 'other';
+}
+
 function relationBadge(r) {
-  const isOfficial = /official_ca_announcement/i.test(r);
-  const isCopycat = /copycat|reused_social_link/i.test(r);
+  const cat = relationCategory(r);
+  const isOfficial = cat === 'official';
+  const isCopycat = cat === 'copycat';
   const cls = isOfficial ? 'official' : (isCopycat ? 'copycat' : 'estimated');
   return `<span class="badge ${cls}">${r}</span>`;
+}
+
+function categoriesOf(rel) {
+  // An event/relation may belong to several independent categories.
+  const cat = relationCategory(rel);
+  return cat === 'other' ? [] : [cat];
 }
 
 async function render() {
@@ -86,17 +109,43 @@ async function render() {
   const window = document.getElementById('window').value;
   if (!mint) { timeline.innerHTML = '<span class="muted">Enter a contract address.</span>'; relations.innerHTML = ''; return; }
 
-  const [recent, rel] = await Promise.all([
-    fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`).then(r => r.ok ? r.json() : []),
-    fetch(`/api/tokens/${chain}/${mint}/relations`).then(r => r.ok ? r.json() : []),
-  ]);
-
   const filterState = {};
   document.querySelectorAll('[data-filter]').forEach(cb => filterState[cb.dataset.filter] = cb.checked);
+  const active = Object.keys(filterState).filter(k => filterState[k]);
 
-  timeline.innerHTML = recent.length
-    ? recent.map(e => `
-      <div class="event" data-kinds="${(e.relation||'').toLowerCase()}">
+  function passesFilters(cats) {
+    if (active.length === 0) return true; // no category filter selected -> show all
+    return cats.some(c => active.includes(c));
+  }
+
+  const [recentResp, relResp] = await Promise.all([
+    fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`),
+    fetch(`/api/tokens/${chain}/${mint}/relations`),
+  ]);
+
+  // Distinct capability/error states (REV-023 §7): never collapse a failure to
+  // "no data".
+  function renderState(resp) {
+    if (resp.ok) return null;
+    if (resp.status === 401 || resp.status === 403) return 'auth failure';
+    if (resp.status >= 500) return 'DB/API failure';
+    return 'capability unavailable';
+  }
+
+  if (renderState(recentResp) || renderState(relResp)) {
+    const state = renderState(recentResp) || renderState(relResp);
+    timeline.innerHTML = `<span class="muted">${state}.</span>`;
+    relations.innerHTML = `<span class="muted">${state}.</span>`;
+    return;
+  }
+
+  const recent = await recentResp.json();
+  const rel = await relResp.json();
+
+  const recentShown = recent.filter(e => passesFilters(categoriesOf(e.relation)));
+  timeline.innerHTML = recentShown.length
+    ? recentShown.map(e => `
+      <div class="event" data-kinds="${categoriesOf(e.relation).join(' ')}">
         <div>${relationBadge(e.relation || 'unknown')}<span class="muted">${e.event_type}</span></div>
         <div>occurred ${e.occurred_at} · observed ${e.observed_at}</div>
         <div class="muted">confidence: <span class="${confidenceClass(e.confidence_level)}">${e.confidence_level}</span>
@@ -105,8 +154,9 @@ async function render() {
       </div>`).join('')
     : '<span class="muted">No recent events.</span>';
 
-  relations.innerHTML = rel.length
-    ? rel.map(c => `
+  const relShown = rel.filter(c => passesFilters(categoriesOf(c.relation)));
+  relations.innerHTML = relShown.length
+    ? relShown.map(c => `
       <div class="relation">
         <div>${relationBadge(c.relation)} → ${c.to_identity.kind}:${c.to_identity.value}</div>
         <div class="muted">confidence <span class="${confidenceClass(c.confidence)}">${c.confidence}</span> · evidence ${(c.evidence_refs||[]).join(', ') || 'none'}</div>
@@ -116,6 +166,8 @@ async function render() {
 
 form.addEventListener('submit', e => { e.preventDefault(); render(); });
 document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', render));
+// Initial load (page renders on open, not only on submit).
+render();
 </script>
 </body>
 </html>
