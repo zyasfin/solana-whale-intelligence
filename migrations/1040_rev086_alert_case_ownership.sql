@@ -1,0 +1,148 @@
+-- ============================================================================
+-- Signal Forge — Migration 1040: alert/case workspace ownership
+-- Canonical source: REVIEW_RESULT.md REV-086-F04 / REV-087-F04 (with F03 note).
+--
+-- THE DEFECT (REV-086-F04, reaffirmed REV-087-F04)
+-- `alerts.workspace_id` (1036:60) and `alerts.funding_case_id` (1035:116) are two
+-- INDEPENDENT foreign keys. Nothing in the schema said the referenced case must
+-- belong to the referencing row's workspace. The funding drain
+-- (workers.rs pending_funding_alerts) added `AND c.workspace_id = a.workspace_id`
+-- to its join, but a reader-side filter is not an invariant: a malformed or
+-- mis-backfilled row could still be INSERTED, and any future reader that omits the
+-- predicate would deliver workspace B's case text through workspace A's
+-- destination — a cross-tenant leak.
+--
+-- THE FIX
+-- Ownership becomes structural. PostgreSQL requires a foreign key's referenced
+-- column list to be backed by a unique constraint on exactly those columns, and
+-- funding_radar_cases had only PRIMARY KEY (id) (0001:258) and
+-- funding_radar_cases_tenant_uidx (workspace_id, chain, recipient) (1037:185) —
+-- so `UNIQUE (id, workspace_id)` is added first (redundant with the PK, legal, and
+-- cheap), then the single-column FK from 1035 is replaced by a composite one.
+--
+-- MATCH SIMPLE (the default) is REQUIRED, not MATCH FULL: alerts.workspace_id is
+-- NOT NULL (1036:75) while funding_case_id is nullable, and a 'signal' or
+-- 'unknown' subject row legitimately carries a NULL case. MATCH SIMPLE passes
+-- whenever any referencing column is NULL; MATCH FULL would reject those rows.
+--
+-- Rows that already violate ownership are reconciled BEFORE the constraint is
+-- added, or ADD CONSTRAINT would abort on a populated database. There is no
+-- correct owner to pick for such a row, so it is demoted to the audit class 1036
+-- created for exactly this purpose (subject_kind 'unknown', both subject columns
+-- NULL) rather than deleted — archive-not-delete.
+--
+-- NOTE ON REV-086-F03
+-- The companion finding (1037's partial merge, its jsonb_each abort on the
+-- schema's own 'null'::jsonb default, and its unreconciled alert dedup_key) is NOT
+-- fixed here. 1037 is shipped and immutable, and filename order reaches it BEFORE
+-- this file, so a corrective migration would arrive after the data was already
+-- destroyed. That repair lives in db.rs::preflight_repair_funding_case_identity,
+-- which runs before the filename-order loop — the same pattern 1039 established.
+--
+-- Forward-only: 1001..1039 are shipped and immutable. Idempotent.
+-- NOTE: no dollar-dollar sequence in comments (the 1031 lesson).
+-- ============================================================================
+
+DO $$
+DECLARE
+    v_demoted  bigint := 0;
+    v_orphaned bigint := 0;
+    v_conname  text;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'alerts'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'funding_radar_cases'
+    ) THEN
+        RAISE NOTICE 'alerts or funding_radar_cases absent; nothing to bind';
+        RETURN;
+    END IF;
+
+    -- ------------------------------------------------------------------
+    -- Reconcile violators first: a cross-tenant pairing has no right owner.
+    -- ------------------------------------------------------------------
+    UPDATE public.alerts a
+       SET subject_kind = 'unknown',
+           funding_case_id = NULL
+      FROM public.funding_radar_cases c
+     WHERE a.funding_case_id = c.id
+       AND a.workspace_id <> c.workspace_id;
+    GET DIAGNOSTICS v_demoted = ROW_COUNT;
+
+    -- A dangling case reference would also fail the new constraint. 1035 declared
+    -- ON DELETE SET NULL, so this should be empty, but a database that predates it
+    -- or was repaired by hand may not be.
+    UPDATE public.alerts a
+       SET subject_kind = 'unknown',
+           funding_case_id = NULL
+     WHERE a.funding_case_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM public.funding_radar_cases c WHERE c.id = a.funding_case_id
+       );
+    GET DIAGNOSTICS v_orphaned = ROW_COUNT;
+
+    -- ------------------------------------------------------------------
+    -- The referenced key the composite FK needs.
+    -- ------------------------------------------------------------------
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'funding_radar_cases_id_workspace_key'
+    ) THEN
+        ALTER TABLE public.funding_radar_cases
+            ADD CONSTRAINT funding_radar_cases_id_workspace_key UNIQUE (id, workspace_id);
+    END IF;
+
+    -- ------------------------------------------------------------------
+    -- Drop the redundant single-column FK from 1035. Its name was generated by
+    -- the server, so it is discovered rather than assumed.
+    -- ------------------------------------------------------------------
+    FOR v_conname IN
+        SELECT conname FROM pg_constraint
+         WHERE conrelid = 'public.alerts'::regclass
+           AND contype = 'f'
+           AND conkey = ARRAY[(SELECT attnum FROM pg_attribute
+                                WHERE attrelid = 'public.alerts'::regclass
+                                  AND attname = 'funding_case_id')]
+    LOOP
+        EXECUTE format('ALTER TABLE public.alerts DROP CONSTRAINT %I', v_conname);
+    END LOOP;
+
+    -- ------------------------------------------------------------------
+    -- Ownership as one constraint. The column-list SET NULL form nulls ONLY the
+    -- case reference on delete; a bare SET NULL would try to null the NOT NULL
+    -- workspace_id and fail.
+    -- ------------------------------------------------------------------
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'alerts_funding_case_workspace_fk'
+    ) THEN
+        ALTER TABLE public.alerts
+            ADD CONSTRAINT alerts_funding_case_workspace_fk
+            FOREIGN KEY (funding_case_id, workspace_id)
+            REFERENCES public.funding_radar_cases (id, workspace_id)
+            ON DELETE SET NULL (funding_case_id);
+    END IF;
+
+    -- ------------------------------------------------------------------
+    -- Replay-safe cutover record (1038 made `cutover` unique).
+    -- ------------------------------------------------------------------
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'schema_cutover_events'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM schema_cutover_events
+         WHERE cutover = 'alert_case_workspace_ownership'
+    ) THEN
+        INSERT INTO schema_cutover_events (cutover, detail)
+        VALUES (
+            'alert_case_workspace_ownership',
+            jsonb_build_object(
+                'migration', '1040_rev086_alert_case_ownership.sql',
+                'demoted_cross_tenant_alerts', v_demoted,
+                'demoted_orphaned_alerts', v_orphaned,
+                'reason', 'REV-086-F04: alerts.workspace_id and alerts.funding_case_id were independent FKs, so a malformed row could deliver another tenant''s case text through this tenant''s destination and only a reader-side join predicate stood in the way. Ownership is now a composite FK backed by UNIQUE (id, workspace_id), and claim_alert validates it at the boundary. REV-086-F03: the complete funding-case merge, JSON-shape normalization and alert dedup-key reconciliation run in the db.rs migrator preflight, because shipped migration 1037 executes before any later migration in filename order.'
+            )
+        );
+    END IF;
+END$$;
