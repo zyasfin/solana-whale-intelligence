@@ -40,11 +40,15 @@ pub fn normalize_identity(kind: IdentityKind, value: &str) -> Option<IdentityKey
             Some(IdentityKey { kind, value: host })
         }
         IdentityKind::Token | IdentityKind::Wallet => {
-            // Must be a chain-qualified, known-chain key (REV-025-F03).
-            canonical_chain(value)?;
+            // Must be a chain-qualified, known-chain key (REV-025-F03), and the
+            // emitted key is CANONICAL: REV-028 validated the chain but stored the
+            // caller's alias verbatim, so `sol:AAA` and `solana:AAA` stayed two
+            // distinct identities for the same asset (REV-029/REV-025-F03).
+            let chain = canonical_chain(value)?;
+            let (_, rest) = value.split_once(':')?;
             Some(IdentityKey {
                 kind,
-                value: value.to_string(),
+                value: format!("{chain}:{rest}"),
             })
         }
         IdentityKind::Social => {
@@ -76,6 +80,138 @@ fn chain_prefix(key: &str) -> Option<&str> {
     Some(chain)
 }
 
+/// Whether a social identity is an IMMUTABLE platform account ID, established by
+/// authoritative platform evidence (REV-031/REV-025-F02).
+///
+/// REV-030 inferred this from the string's SHAPE: anything without `@`, `/` or
+/// whitespace counted as immutable, so `x:alice` — a plain handle — was accepted
+/// and promoted funding to `Reconstructed`. Shape is not provenance. A handle can
+/// be renamed or transferred; only the platform's own account/user ID cannot.
+///
+/// The decision is now made against the workspace's `social_identities` records
+/// (migration 1018 + the versioned key from 1021), which store the immutable
+/// `immutable_user_id` alongside the handles observed for it. An identity counts
+/// as immutable only when a record asserts that this exact value IS the account
+/// ID for that platform.
+///
+/// Fail-closed: no matching record means not-immutable, which merely keeps
+/// confidence at `Estimated`. It never fabricates a relation.
+pub fn is_immutable_social_identity(
+    key: &str,
+    bindings: &[SocialIdentityRecord],
+) -> bool {
+    let Some((platform, id)) = key.split_once(':') else {
+        return false;
+    };
+    let platform = platform.trim().to_ascii_lowercase();
+    let id = id.trim();
+    if platform.is_empty() || id.is_empty() {
+        return false;
+    }
+    bindings.iter().any(|b| {
+        b.platform.trim().to_ascii_lowercase() == platform
+            && b.immutable_user_id.trim() == id
+            // A value that the record itself lists as a HANDLE is a mutable label,
+            // even if it also happens to appear as an id string somewhere.
+            && !b
+                .handles
+                .iter()
+                .any(|h| h.trim().eq_ignore_ascii_case(id))
+    })
+}
+
+/// An authoritative social-identity record, projected from `social_identities`.
+///
+/// `immutable_user_id` is the platform's own account/user ID; `handles` are the
+/// mutable labels observed for it (current + historical). Keeping both lets the
+/// resolver tell an account ID apart from a handle instead of guessing from
+/// punctuation (REV-031/REV-025-F02).
+///
+/// FIELDS ARE PRIVATE, and the type is neither `Deserialize` nor constructible by
+/// a caller (REV-033/REV-034). REV-032 gave it public fields, so a caller simply
+/// built the record it wanted and handed it in — the reviewer's probe reported
+/// `forged_reconstructed=true`. That was the fifth instance of the same mistake in
+/// this ledger: authority the caller can mint (GUC → audit row → public grant →
+/// caller-supplied slice → caller-built struct).
+///
+/// In production the only way to obtain these records is
+/// [`load_social_identity_records`], which reads the workspace-scoped
+/// `social_identities` current view. A `#[cfg(test)]` mint helper exists for unit
+/// tests, exactly as with `DurableAppendReceipt` and `VerifiedStageProof`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocialIdentityRecord {
+    platform: String,
+    immutable_user_id: String,
+    handles: Vec<String>,
+}
+
+impl SocialIdentityRecord {
+    /// Platform this record belongs to (`x`, `telegram`, ...).
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    /// The platform's own immutable account/user ID.
+    pub fn immutable_user_id(&self) -> &str {
+        &self.immutable_user_id
+    }
+
+    /// Mutable labels observed for this account (current + historical).
+    pub fn handles(&self) -> &[String] {
+        &self.handles
+    }
+
+    /// `#[cfg(test)]` mint helper: unit tests need fixtures, production callers
+    /// must go through [`records_from_store`].
+    #[cfg(test)]
+    pub fn mint(platform: &str, immutable_user_id: &str, handles: &[&str]) -> Self {
+        Self {
+            platform: platform.to_string(),
+            immutable_user_id: immutable_user_id.to_string(),
+            handles: handles.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+}
+
+/// Convert authoritative store rows into resolver-trusted records.
+///
+/// `pub(crate)` (REV-035-#4). REV-034 left this `pub`, so an external caller could
+/// hand it hand-built rows and still obtain `Reconstructed`. The rows themselves
+/// are now unmintable outside the crate ([`super::recent::StoredSocialIdentity`]),
+/// and this converter is no longer part of the public surface either — belt and
+/// braces, because the whole point is that authority cannot be produced by a
+/// caller.
+///
+/// Rows that are not usable as identity evidence are DROPPED rather than passed
+/// through: an empty platform or account ID cannot establish ownership, and a row
+/// whose account ID also appears among its own handles is self-contradictory.
+/// Fail-closed — a dropped row lowers confidence, it never fabricates a relation.
+pub(crate) fn records_from_store(
+    rows: impl IntoIterator<Item = super::recent::StoredSocialIdentity>,
+) -> Vec<SocialIdentityRecord> {
+    rows.into_iter()
+        .filter_map(|r| {
+            let platform = r.platform().trim().to_ascii_lowercase();
+            let id = r.immutable_user_id().trim().to_string();
+            if platform.is_empty() || id.is_empty() {
+                return None;
+            }
+            if r
+                .handles()
+                .iter()
+                .any(|h| h.trim().eq_ignore_ascii_case(&id))
+            {
+                return None; // contradictory: the "account ID" is also a handle
+            }
+            Some(SocialIdentityRecord {
+                platform,
+                immutable_user_id: id,
+                handles: r.handles().to_vec(),
+            })
+        })
+        .collect()
+}
+
 /// Parse an RFC3339 timestamp into unix seconds (None when unparseable).
 fn parse_secs(s: &str) -> Option<i64> {
     s.parse::<chrono::DateTime<chrono::Utc>>()
@@ -100,6 +236,109 @@ fn canonical_chain(key: &str) -> Option<&'static str> {
         "bsc" => Some("bsc"),
         _ => None,
     }
+}
+
+/// Whether two actor keys denote the same on-chain actor (REV-033/REV-034).
+///
+/// Both sides are canonicalized before comparison, so `sol:D` and `solana:D` are
+/// one actor. Fail-closed in both directions:
+///   * a `None` anchor actor matches nothing;
+///   * a key that is not chain-qualified with a KNOWN chain matches nothing, so an
+///     unqualified `D` can no longer produce an `Exact` relation.
+///
+/// Wallet-kind normalization is used because deployer/authority/fee-payer/funder
+/// are all wallet addresses under the frozen rule `wallet = chain_id + address`.
+/// Whether two wallet keys denote the same wallet (REV-037-F07).
+///
+/// The edge-to-edge counterpart of [`same_actor`]: both sides are canonicalized
+/// under the frozen rule `wallet = chain_id + address`, and a key that is not
+/// chain-qualified with a KNOWN chain matches nothing (fail-closed).
+///
+/// This exists as its own function because `same_actor` takes an `Option` anchor
+/// actor, and using it for an edge-to-edge join would have meant wrapping a value
+/// that is never optional. Three separate reviews found a raw comparison on a
+/// different branch, so every wallet-key comparison now routes through one of these
+/// two helpers and nothing compares wallet keys with `==`.
+fn same_wallet(a: &str, b: &str) -> bool {
+    let Some(a) = normalize_identity(IdentityKind::Wallet, a) else {
+        return false;
+    };
+    let Some(b) = normalize_identity(IdentityKind::Wallet, b) else {
+        return false;
+    };
+    a.value == b.value
+}
+
+/// Whether two token keys denote the same contract (REV-039-F06).
+///
+/// The token counterpart of [`same_wallet`]. Six raw token joins survived REV-038
+/// because I swept `wallet` comparisons and then wrote that no wallet key was
+/// compared with `==` — literally true, and misleading, since the token joins were
+/// untouched. The reviewer measured two distinct harms:
+///
+///   * alias spellings LOSE valid relations (`sol:BBB` node vs `solana:BBB` edge);
+///   * worse, an anchor `solana:AAA` against a node `sol:AAA` produced a
+///     SELF-RELATION — one contract with two accepted spellings was reported as a
+///     different token sharing its own deployer.
+///
+/// Self-exclusion is the reason this must be canonical rather than merely
+/// normalized on output: a comparison that fails to recognise identity cannot
+/// exclude it.
+fn same_token(a: &str, b: &str) -> bool {
+    let Some(a) = normalize_identity(IdentityKind::Token, a) else {
+        return false;
+    };
+    let Some(b) = normalize_identity(IdentityKind::Token, b) else {
+        return false;
+    };
+    a.value == b.value
+}
+
+/// Whether two social-identity keys denote the same account (REV-039-F06).
+///
+/// Found by enumerating every `==` on an entity key rather than by working from the
+/// reported list — the reviewer named five token joins and this was a sixth. It
+/// compares `platform:account_id` keys, so `X:Acct1` and `x:acct1` are one account.
+/// Fail-closed: a key that is not platform-qualified matches nothing, so a bare
+/// handle cannot be mistaken for an account identity.
+/// Canonical form of a social key: lowercase platform, verbatim account id.
+///
+/// `normalize_identity(IdentityKind::Social, ..)` validates the shape but returns
+/// the value UNCHANGED — it does not fold the platform. Discovered while making the
+/// tests below pass rather than by reading the code, which is why they exist. The
+/// account id is deliberately NOT case-folded: platforms treat account ids as
+/// opaque, and `is_immutable_social_identity` compares ids verbatim too, so folding
+/// here would disagree with the authority check.
+fn canonical_social_key(key: &str) -> Option<String> {
+    // Shape validation stays with the frozen helper.
+    normalize_identity(IdentityKind::Social, key)?;
+    let (platform, id) = key.split_once(':')?;
+    let platform = platform.trim().to_ascii_lowercase();
+    let id = id.trim();
+    if platform.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some(format!("{platform}:{id}"))
+}
+
+fn same_social_identity(a: &str, b: &str) -> bool {
+    match (canonical_social_key(a), canonical_social_key(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn same_actor(anchor_actor: Option<&str>, edge_actor: &str) -> bool {
+    let Some(anchor_actor) = anchor_actor else {
+        return false;
+    };
+    let Some(a) = normalize_identity(IdentityKind::Wallet, anchor_actor) else {
+        return false;
+    };
+    let Some(b) = normalize_identity(IdentityKind::Wallet, edge_actor) else {
+        return false;
+    };
+    a.value == b.value
 }
 
 /// Whether an edge is authoritative enough to support an `Exact`/family merge
@@ -146,19 +385,64 @@ fn edge_is_authoritative(edge: &EntityEdge, now_secs: i64) -> bool {
 ///   similarity alone never yields a relation.
 /// - Social reuse returns the OTHER token/project using the identity, never the
 ///   social identity itself.
+/// `social_bindings` carries the authoritative `social_identities` records used to
+/// decide whether a reused identity is an immutable account ID or a mutable handle
+/// (REV-031/REV-025-F02). An empty slice means "no authoritative binding known",
+/// which keeps funding corroboration at `Estimated` — fail-closed.
+///
+/// REV-035-#4: production code should call
+/// [`resolve_candidates_from_store`](super::recent_store::resolve_candidates_from_store),
+/// which performs the social lookup INSIDE the operation instead of accepting
+/// bindings from its caller. This function stays public because the resolver logic
+/// is pure and worth testing directly, but since `SocialIdentityRecord` cannot be
+/// minted outside the crate, an external caller can only ever pass an empty slice
+/// here — which is the fail-closed answer.
 pub fn resolve_candidates(
     anchor: &ActorExtraction,
     nodes: &[EntityNode],
     edges: &[EntityEdge],
+    social_bindings: &[SocialIdentityRecord],
     now_secs: i64,
 ) -> Vec<CandidateRelation> {
     let mut out: Vec<CandidateRelation> = Vec::new();
-    let mut seen: HashSet<(String, RecentRelation)> = HashSet::new();
+    // Dedupe key is (canonical value, kind, relation): the kind belongs in the key
+    // because a Token and a Wallet may share a value (cf. REV-027 on the SQL side).
+    let mut seen: HashSet<(String, IdentityKind, RecentRelation)> = HashSet::new();
+
+    // ONE emit boundary for every resolver path (REV-031/REV-025-F03).
+    //
+    // REV-030 canonicalized only the actor-reverse-lookup path and claimed the
+    // resolver was universally canonical. It was not: CrossChainDeployment,
+    // FundedByKnownDeployer, and the standalone social-reuse path still emitted raw
+    // keys, so `eth:BBB` and `ethereum:BBB` produced two relations for one asset.
+    // Patching each site invites the same omission again, so emission is funnelled
+    // through this closure: it normalizes the identity, rejects anything
+    // unqualified/unknown-chain (fail-closed), and dedupes on the CANONICAL key.
+    // No path may construct a `CandidateRelation` directly.
+    let mut emit = |kind: IdentityKind,
+                    raw_value: &str,
+                    relation: RecentRelation,
+                    confidence: RecentConfidence,
+                    evidence_refs: Vec<String>| {
+        let Some(identity) = normalize_identity(kind, raw_value) else {
+            return; // unqualified / unknown chain resolves nothing
+        };
+        let key = (identity.value.clone(), identity.kind, relation);
+        if !seen.insert(key) {
+            return;
+        }
+        out.push(CandidateRelation {
+            to_identity: identity,
+            relation,
+            confidence,
+            evidence_refs,
+        });
+    };
 
     let anchor_token = &anchor.token;
     // Fail-closed: an anchor with an unknown/unqualified chain resolves nothing.
     let Some(anchor_chain) = canonical_chain(anchor_token) else {
-        return out;
+        return Vec::new();
     };
 
     // Cross-chain deployment: an authoritative edge from the anchor token to a
@@ -168,7 +452,10 @@ pub fn resolve_candidates(
         if e.edge_type != EdgeType::CrossChainDeployment {
             continue;
         }
-        if e.from_entity_key != *anchor_token {
+        // REV-039-F06: canonical, so a cross-chain edge recorded as `sol:AAA`
+        // still matches the anchor `solana:AAA`. Raw equality silently dropped the
+        // whole cross-chain branch for alias-spelled sources.
+        if !same_token(&e.from_entity_key, anchor_token) {
             continue;
         }
         // Distinct canonical chains + authoritative edge required.
@@ -180,24 +467,15 @@ pub fn resolve_candidates(
         if !distinct_chain || !edge_is_authoritative(e, now_secs) {
             continue;
         }
-        let confidence = if edge_is_authoritative(e, now_secs) {
-            RecentConfidence::Exact
-        } else {
-            RecentConfidence::Insufficient
-        };
-        let rel = CandidateRelation {
-            to_identity: IdentityKey {
-                kind: IdentityKind::Token,
-                value: e.to_entity_key.clone(),
-            },
-            relation: RecentRelation::CrossChainDeployment,
-            confidence,
-            evidence_refs: e.evidence_refs.clone(),
-        };
-        let key = (e.to_entity_key.clone(), rel.relation);
-        if seen.insert(key) {
-            out.push(rel);
-        }
+        // Reaching here already required `edge_is_authoritative`, so the edge is
+        // Exact by construction.
+        emit(
+            IdentityKind::Token,
+            &e.to_entity_key,
+            RecentRelation::CrossChainDeployment,
+            RecentConfidence::Exact,
+            e.evidence_refs.clone(),
+        );
     }
 
     // Actor-based reverse lookup: for each token node, compare
@@ -210,25 +488,57 @@ pub fn resolve_candidates(
 
     for node in token_nodes {
         let other = &node.entity_key;
-        if other == anchor_token {
+        // REV-039-F06: SELF-EXCLUSION must be canonical. This raw comparison was
+        // the most damaging of the six: an anchor `solana:AAA` against a node
+        // `sol:AAA` is the SAME contract, but raw equality did not recognise it, so
+        // the token was reported as another token sharing its own deployer
+        // (`alias_self_relation=1`). A comparison that cannot recognise identity
+        // cannot exclude it.
+        if same_token(other, anchor_token) {
             continue;
         }
-        for e in edges.iter().filter(|e| e.to_entity_key == *other) {
+        // REV-025-F03: the TARGET key must be canonical too, not just the anchor.
+        // A Confirmed, evidence-backed `DeployedBy` edge pointing at `bogus:BBB`
+        // previously yielded `SameDeployer/Exact` because only the anchor chain
+        // was validated. An unknown/unqualified target chain resolves nothing.
+        //
+        // REV-029: the emitted key is normalized as well, so an alias spelling
+        // (`sol:` vs `solana:`) cannot split one asset into two relations.
+        let Some(other_canonical) =
+            normalize_identity(IdentityKind::Token, other).map(|k| k.value)
+        else {
+            continue;
+        };
+        // REV-039-F06: canonical node-to-edge join. A node `sol:BBB` and an edge
+        // targeting `solana:BBB` are one contract; raw equality lost the relation.
+        for e in edges.iter().filter(|e| same_token(&e.to_entity_key, other)) {
             let actor = &e.from_entity_key;
             // Factory/launchpad is never a project deployer.
-            if anchor.factory.as_deref() == Some(actor.as_str()) {
+            //
+            // REV-035: this exclusion was still a raw string comparison, found
+            // while sweeping for the class of bug rather than the one instance the
+            // reviewer reported. It fails in the dangerous direction: a factory
+            // recorded as `sol:FACTORY` against an edge actor `solana:FACTORY`
+            // would NOT be excluded, so a launchpad address shared by thousands of
+            // unrelated tokens would be treated as a common deployer and produce
+            // `SameDeployer`/`Exact` between strangers. Canonical comparison makes
+            // the exclusion hold across alias spellings.
+            if same_actor(anchor.factory.as_deref(), actor) {
                 continue;
             }
             let authoritative = edge_is_authoritative(e, now_secs);
+            // REV-033/REV-034: actor identities are compared CANONICALLY, not as
+            // raw strings. REV-032 canonicalized the emitted target but left the
+            // comparison on both sides raw, so the reviewer measured:
+            //   actor=sol:D    edge=solana:D  -> count=0  (valid relation LOST)
+            //   actor=D        edge=D         -> Exact    (unqualified actor ACCEPTED)
+            // `same_actor` fixes both directions: an alias pair matches, and a key
+            // that is not chain-qualified matches nothing at all (fail-closed).
             let relation = match e.edge_type {
-                EdgeType::DeployedBy
-                    if anchor.deployer.as_deref() == Some(actor.as_str()) =>
-                {
+                EdgeType::DeployedBy if same_actor(anchor.deployer.as_deref(), actor) => {
                     Some((RecentRelation::SameDeployer, authoritative))
                 }
-                EdgeType::FundedBy
-                    if anchor.initial_funder.as_deref() == Some(actor.as_str()) =>
-                {
+                EdgeType::FundedBy if same_actor(anchor.initial_funder.as_deref(), actor) => {
                     Some((RecentRelation::SameFunder, authoritative))
                 }
                 _ => None,
@@ -236,14 +546,10 @@ pub fn resolve_candidates(
             // SameAuthority / SameFeePayer are resolved from explicit edges
             // carrying the matching actor (REV-022-F01: these were never emitted).
             let relation = relation.or_else(|| match e.edge_type {
-                EdgeType::SameAuthority
-                    if anchor.authority.as_deref() == Some(actor.as_str()) =>
-                {
+                EdgeType::SameAuthority if same_actor(anchor.authority.as_deref(), actor) => {
                     Some((RecentRelation::SameAuthority, authoritative))
                 }
-                EdgeType::SameFeePayer
-                    if anchor.fee_payer.as_deref() == Some(actor.as_str()) =>
-                {
+                EdgeType::SameFeePayer if same_actor(anchor.fee_payer.as_deref(), actor) => {
                     Some((RecentRelation::SameFeePayer, authoritative))
                 }
                 _ => None,
@@ -254,19 +560,13 @@ pub fn resolve_candidates(
                 } else {
                     RecentConfidence::Insufficient
                 };
-                let rel = CandidateRelation {
-                    to_identity: IdentityKey {
-                        kind: IdentityKind::Token,
-                        value: other.clone(),
-                    },
+                emit(
+                    IdentityKind::Token,
+                    &other_canonical,
                     relation,
                     confidence,
-                    evidence_refs: e.evidence_refs.clone(),
-                };
-                let key = (other.clone(), relation);
-                if seen.insert(key) {
-                    out.push(rel);
-                }
+                    e.evidence_refs.clone(),
+                );
             }
         }
     }
@@ -278,48 +578,102 @@ pub fn resolve_candidates(
         if e.edge_type != EdgeType::FundedBy {
             continue;
         }
-        if anchor.deployer.as_deref() != Some(e.from_entity_key.as_str()) {
+        // REV-035-#6: this branch was the ONE actor comparison REV-034 missed.
+        // I added `same_actor` to the direct deployer/authority/fee-payer/funder
+        // branch and then wrote that actor comparison was canonical — it was not,
+        // and the reviewer measured both failure directions here:
+        //   anchor `sol:D1`  + edge `solana:D1` -> count=0  (valid relation LOST)
+        //   anchor `D1`      + edge `D1`        -> Reconstructed (bare actor ACCEPTED)
+        // Fixing the example instead of the class is exactly the pattern I keep
+        // repeating, so the comparison is funnelled through the same helper.
+        if !same_actor(anchor.deployer.as_deref(), &e.from_entity_key) {
             continue;
         }
+        // REV-037-F07: the node lookup is a wallet-key join too, so it is
+        // canonicalized for the same reason as the corroboration edge. A wallet node
+        // recorded as `sol:W` would otherwise not match a funding edge targeting
+        // `solana:W`, and the whole `FundedByKnownDeployer` branch would silently
+        // skip a real funded wallet.
         let is_wallet = nodes.iter().any(|n| {
-            n.entity_key == e.to_entity_key && n.node_type == super::graph::NodeType::Wallet
+            same_wallet(&n.entity_key, &e.to_entity_key)
+                && n.node_type == super::graph::NodeType::Wallet
         });
         if !is_wallet {
             continue;
         }
         let authoritative = edge_is_authoritative(e, now_secs);
-        // A real reused-social/domain edge: the funded wallet (or a token bound
-        // to it) reuses one of the anchor's immutable social identities
-        // (REV-025-F02). Merely *having* a social identity is not evidence.
-        let reused_social_edge = edges.iter().any(|re| {
-            re.edge_type == EdgeType::ReusedSocialLink
-                && re.from_entity_key == e.to_entity_key
-                && anchor.social_identities.iter().any(|s| &re.to_entity_key == s)
+        // A real reused-social/domain edge: the funded wallet reuses one of the
+        // anchor's immutable social identities (REV-025-F02). Merely *having* a
+        // social identity is not evidence.
+        //
+        // REV-027 re-review: the corroborating edge must ALSO be authoritative.
+        // Previously any `ReusedSocialLink` edge counted, so a disputed, expired,
+        // or evidence-free social edge could promote authoritative funding all the
+        // way to `Reconstructed`. The corroboration is now held to exactly the
+        // same bar as the funding edge itself (Confirmed + evidence + valid
+        // window), and the reused identity must be a chain/platform-qualified
+        // immutable ID — a bare handle is never ownership.
+        // REV-029/REV-025-F02: authority, identity match, and time window must all
+        // hold on the SAME edge. REV-028 split them into two independent scans, so
+        // a second (weaker) `ReusedSocialLink` edge could supply the time window
+        // for an edge that never carried it — corroboration assembled from parts.
+        // `corroborating_social_edge` returns the ONE edge satisfying every
+        // condition at once, or `None`.
+        let funding_at = parse_secs(&e.occurred_at);
+        let corroborating_social_edge = funding_at.and_then(|occ| {
+            edges.iter().find(|re| {
+                re.edge_type == EdgeType::ReusedSocialLink
+                    // REV-037-F07: the funded wallet and the wallet that reused the
+                    // identity must be compared CANONICALLY. This was the third
+                    // actor comparison left raw: REV-034 fixed the direct-actor
+                    // branch, REV-036 fixed the funding source and factory, and I
+                    // claimed to have swept the class both times. The reviewer
+                    // measured what remained:
+                    //   funding target solana:W, reuse source solana:W -> Reconstructed
+                    //   funding target solana:W, reuse source sol:W    -> Estimated
+                    // A valid relation lost its corroboration purely because of
+                    // alias spelling. `same_wallet` is the same canonicalization
+                    // used everywhere else, so this join cannot drift again.
+                    && same_wallet(&re.from_entity_key, &e.to_entity_key)
+                    // same bar as the funding edge: Confirmed + evidence + active window
+                    && edge_is_authoritative(re, now_secs)
+                    // the reused identity is one of the anchor's, and it is an
+                    // immutable platform-qualified account ID — never a handle
+                    // REV-039-F06: canonical social-identity join. Not in the
+                    // reviewer's list of five — found by enumerating every `==` on
+                    // an entity key instead of working from the reported set. A
+                    // reuse edge recorded as `X:Acct1` against an anchor identity
+                    // `x:acct1` is the same account, and raw equality dropped the
+                    // corroboration.
+                    && anchor.social_identities.iter().any(|s| {
+                        same_social_identity(&re.to_entity_key, s)
+                            && is_immutable_social_identity(s, social_bindings)
+                    })
+                    // and THIS edge's own validity window contains the funding:
+                    // an identity reused only AFTER the funding is not evidence for it
+                    && parse_secs(&re.valid_from).map(|vf| occ >= vf).unwrap_or(false)
+                    && re
+                        .valid_until
+                        .as_deref()
+                        .and_then(parse_secs)
+                        .map(|vu| occ <= vu)
+                        .unwrap_or(true)
+            })
         });
-        let coherent_time = parse_secs(&e.valid_from)
-            .zip(parse_secs(&e.occurred_at))
-            .map(|(vf, occ)| occ >= vf)
-            .unwrap_or(false);
-        let confidence = if authoritative && reused_social_edge && coherent_time {
+        let confidence = if authoritative && corroborating_social_edge.is_some() {
             RecentConfidence::Reconstructed
         } else if authoritative {
             RecentConfidence::Estimated
         } else {
             RecentConfidence::Insufficient
         };
-        let rel = CandidateRelation {
-            to_identity: IdentityKey {
-                kind: IdentityKind::Wallet,
-                value: e.to_entity_key.clone(),
-            },
-            relation: RecentRelation::FundedByKnownDeployer,
+        emit(
+            IdentityKind::Wallet,
+            &e.to_entity_key,
+            RecentRelation::FundedByKnownDeployer,
             confidence,
-            evidence_refs: e.evidence_refs.clone(),
-        };
-        let key = (e.to_entity_key.clone(), rel.relation);
-        if seen.insert(key) {
-            out.push(rel);
-        }
+            e.evidence_refs.clone(),
+        );
     }
 
     // Reused social link without immutable-ownership evidence → candidate only.
@@ -330,32 +684,33 @@ pub fn resolve_candidates(
             if e.edge_type != EdgeType::ReusedSocialLink {
                 continue;
             }
-            if e.to_entity_key == *identity {
+            // REV-039-F06: canonical on both sides of this path too — the social
+            // identity lookup and the token node lookup.
+            if same_social_identity(&e.to_entity_key, identity) {
                 // `from` is the other project reusing the identity. Only a TOKEN
                 // project produces a ReusedSocialLink candidate relation; a
                 // wallet reusing the identity is used for `Reconstructed`
                 // corroboration, not a standalone reuse relation.
                 let is_token = nodes.iter().any(|n| {
-                    n.entity_key == e.from_entity_key
+                    same_token(&n.entity_key, &e.from_entity_key)
                         && n.node_type == super::graph::NodeType::Token
                 });
                 if !is_token {
                     continue;
                 }
-                let other_token = e.from_entity_key.clone();
-                let rel = CandidateRelation {
-                    to_identity: IdentityKey {
-                        kind: IdentityKind::Token,
-                        value: other_token,
-                    },
-                    relation: RecentRelation::ReusedSocialLink,
-                    confidence: RecentConfidence::Insufficient,
-                    evidence_refs: e.evidence_refs.clone(),
-                };
-                let key = (e.to_entity_key.clone(), rel.relation);
-                if seen.insert(key) {
-                    out.push(rel);
-                }
+                // REV-032: this path also deduped on the SOCIAL identity key
+                // (`e.to_entity_key`) rather than on the emitted TOKEN target, so
+                // two different projects reusing one identity collapsed into a
+                // single relation and one of them silently disappeared. The shared
+                // `emit` boundary keys on the emitted target, which fixes both the
+                // alias split and this collapse.
+                emit(
+                    IdentityKind::Token,
+                    &e.from_entity_key,
+                    RecentRelation::ReusedSocialLink,
+                    RecentConfidence::Insufficient,
+                    e.evidence_refs.clone(),
+                );
             }
         }
     }
@@ -636,6 +991,30 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000; // 2027-01-15T00:00:00Z-ish, after all test edges.
 
+    /// Authoritative social-identity records for the tests: `x:12345` and
+    /// `x:acct1`/`x:acct_immutable_1` are real immutable account IDs, and `alice`
+    /// is recorded as a HANDLE of `x:12345` so it can never pass as an account ID
+    /// (REV-031/REV-025-F02).
+    fn bindings() -> Vec<SocialIdentityRecord> {
+        vec![
+            SocialIdentityRecord {
+                platform: "x".into(),
+                immutable_user_id: "12345".into(),
+                handles: vec!["alice".into(), "@alice".into()],
+            },
+            SocialIdentityRecord {
+                platform: "x".into(),
+                immutable_user_id: "acct1".into(),
+                handles: vec![],
+            },
+            SocialIdentityRecord {
+                platform: "x".into(),
+                immutable_user_id: "acct_immutable_1".into(),
+                handles: vec![],
+            },
+        ]
+    }
+
     fn dt(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse::<chrono::DateTime<chrono::Utc>>().unwrap()
     }
@@ -700,7 +1079,9 @@ mod tests {
             freshness: None,
             coverage,
             capability_status: super::super::recent::CapabilityStatus::Available,
+            missing_inputs: vec![],
             retraction: None,
+            is_current_coverage: false,
         }
     }
 
@@ -729,7 +1110,7 @@ mod tests {
     fn same_symbol_cross_chain_stays_unrelated() {
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
+            deployer: Some("solana:D1".into()),
             authority: None,
             fee_payer: None,
             factory: None,
@@ -739,7 +1120,7 @@ mod tests {
         };
         let nodes = vec![token_node("sol:AAA"), token_node("eth:BBB")];
         let edges: Vec<EntityEdge> = vec![];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert!(out.is_empty(), "symbol similarity alone must not relate contracts");
     }
 
@@ -747,7 +1128,7 @@ mod tests {
     fn same_deployer_creates_exact_relation() {
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
+            deployer: Some("solana:D1".into()),
             authority: None,
             fee_payer: None,
             factory: None,
@@ -756,11 +1137,206 @@ mod tests {
             social_identities: vec![],
         };
         let nodes = vec![token_node("sol:AAA"), token_node("sol:BBB")];
-        let edges = vec![edge(EdgeType::DeployedBy, "wallet:D1", "sol:BBB", &["ev1"])];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let edges = vec![edge(EdgeType::DeployedBy, "solana:D1", "sol:BBB", &["ev1"])];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].relation, RecentRelation::SameDeployer);
         assert_eq!(out[0].confidence, RecentConfidence::Exact);
+    }
+
+    // REV-027 / REV-025-F03: the TARGET token key must be canonical too. A
+    // Confirmed, evidence-backed DeployedBy edge to a bogus-chain target used to
+    // yield SameDeployer/Exact because only the anchor chain was validated.
+    #[test]
+    fn bogus_target_chain_resolves_nothing() {
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: Some("solana:D1".into()),
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec![],
+        };
+        // Target `bogus:BBB` carries an unknown chain prefix.
+        let nodes = vec![token_node("sol:AAA"), token_node("bogus:BBB")];
+        let edges = vec![edge(EdgeType::DeployedBy, "solana:D1", "bogus:BBB", &["ev1"])];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
+        assert!(
+            out.is_empty(),
+            "an unknown target chain must not produce a relation, let alone Exact"
+        );
+
+        // An unqualified target (no chain prefix at all) is likewise rejected.
+        let nodes2 = vec![token_node("sol:AAA"), token_node("BBB")];
+        let edges2 = vec![edge(EdgeType::DeployedBy, "solana:D1", "BBB", &["ev1"])];
+        assert!(resolve_candidates(&anchor, &nodes2, &edges2, &bindings(), NOW).is_empty());
+    }
+
+    // REV-029/REV-025-F03: an alias chain spelling must canonicalize, so the same
+    // asset cannot appear as two identities.
+    #[test]
+    fn alias_chain_spellings_canonicalize() {
+        let a = normalize_identity(IdentityKind::Token, "sol:AAA").unwrap();
+        let b = normalize_identity(IdentityKind::Token, "solana:AAA").unwrap();
+        assert_eq!(a.value, b.value, "sol: and solana: must produce one key");
+        assert_eq!(a.value, "solana:AAA");
+
+        let rh = normalize_identity(IdentityKind::Wallet, "rh:W1").unwrap();
+        assert_eq!(rh.value, "robinhood:W1");
+        let eth = normalize_identity(IdentityKind::Token, "eth:T1").unwrap();
+        assert_eq!(eth.value, "ethereum:T1");
+    }
+
+    // REV-029/REV-025-F03: the resolver must EMIT canonical target keys, and two
+    // alias spellings of one target must collapse to a single relation.
+    #[test]
+    fn resolver_emits_canonical_target_and_dedupes_aliases() {
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: Some("solana:D1".into()),
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec![],
+        };
+        // The SAME target asset spelled two ways.
+        let nodes = vec![
+            token_node("sol:AAA"),
+            token_node("sol:BBB"),
+            token_node("solana:BBB"),
+        ];
+        let edges = vec![
+            edge(EdgeType::DeployedBy, "solana:D1", "sol:BBB", &["ev1"]),
+            edge(EdgeType::DeployedBy, "solana:D1", "solana:BBB", &["ev2"]),
+        ];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
+        assert_eq!(out.len(), 1, "alias spellings must collapse into one relation");
+        assert_eq!(out[0].to_identity.value, "solana:BBB", "target key must be canonical");
+    }
+
+    // REV-029/REV-025-F02: a mutable handle is not immutable ownership, so it
+    // cannot corroborate funding up to `Reconstructed`.
+    // REV-031/REV-025-F02: immutability comes from an authoritative record, NOT
+    // from the string's shape. REV-030 accepted `x:alice` because it contained no
+    // `@`, slash or whitespace — a plain handle passing as an account ID.
+    #[test]
+    fn handle_is_not_immutable_social_identity() {
+        let b = bindings();
+        // Backed by a record -> immutable.
+        assert!(is_immutable_social_identity("x:12345", &b));
+        assert!(is_immutable_social_identity("x:acct1", &b));
+
+        // THE REV-031 BYPASS: opaque-looking, but recorded as a handle of x:12345.
+        assert!(
+            !is_immutable_social_identity("x:alice", &b),
+            "a handle must never pass as an immutable account ID"
+        );
+
+        // No authoritative record at all -> fail-closed, whatever the shape.
+        assert!(!is_immutable_social_identity("x:99999", &b));
+        assert!(!is_immutable_social_identity("telegram:100200300", &b));
+        // Malformed keys stay rejected.
+        assert!(!is_immutable_social_identity("x:", &b));
+        assert!(!is_immutable_social_identity("12345", &b));
+        // An empty binding set never asserts immutability.
+        assert!(!is_immutable_social_identity("x:12345", &[]));
+    }
+
+    // REV-029/REV-025-F02: authority, identity match and time window must hold on
+    // ONE edge. REV-028 scanned for them separately, so a second weaker edge could
+    // supply the time window for an edge that never carried it.
+    #[test]
+    fn time_window_cannot_come_from_a_second_edge() {
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: Some("sol:D1".into()),
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec!["x:12345".into()],
+        };
+        let nodes = vec![token_node("sol:AAA"), wallet_node("sol:W1")];
+        let funding = edge(EdgeType::FundedBy, "sol:D1", "sol:W1", &["ev-fund"]);
+
+        // Edge A: authoritative + identity matches, but its window ENDS before the
+        // funding occurred (2026-01-01), so it cannot corroborate.
+        let mut expired = edge(EdgeType::ReusedSocialLink, "sol:W1", "x:12345", &["ev-a"]);
+        expired.valid_from = "2025-01-01T00:00:00Z".into();
+        expired.valid_until = Some("2025-06-01T00:00:00Z".into());
+
+        // Edge B: window DOES contain the funding, but it is disputed and carries
+        // the identity only incidentally — it must not lend its window to edge A.
+        let mut weak = edge(EdgeType::ReusedSocialLink, "sol:W1", "x:12345", &[]);
+        weak.truth_status = TruthStatus::Disputed;
+
+        let out = resolve_candidates(&anchor, &nodes, &[funding, expired, weak], &bindings(), NOW);
+        let funded = out
+            .iter()
+            .find(|c| c.relation == RecentRelation::FundedByKnownDeployer)
+            .expect("funding relation present");
+        assert_eq!(
+            funded.confidence,
+            RecentConfidence::Estimated,
+            "a window borrowed from a second edge must not reach Reconstructed"
+        );
+    }
+
+    // REV-027 / REV-025-F02: the corroborating ReusedSocialLink edge must itself
+    // be authoritative. A disputed or evidence-free social edge must not promote
+    // authoritative funding to `Reconstructed`.
+    #[test]
+    fn non_authoritative_social_edge_does_not_reach_reconstructed() {
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: Some("sol:D1".into()),
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec!["x:12345".into()],
+        };
+        let nodes = vec![token_node("sol:AAA"), wallet_node("sol:W1")];
+
+        let funding = edge(EdgeType::FundedBy, "sol:D1", "sol:W1", &["ev-fund"]);
+
+        // Case 1: social edge is DISPUTED -> not authoritative.
+        let mut disputed = edge(EdgeType::ReusedSocialLink, "sol:W1", "x:12345", &["ev-soc"]);
+        disputed.truth_status = TruthStatus::Disputed;
+        let out = resolve_candidates(&anchor, &nodes, &[funding.clone(), disputed], &bindings(), NOW);
+        let funded = out
+            .iter()
+            .find(|c| c.relation == RecentRelation::FundedByKnownDeployer)
+            .expect("funding relation present");
+        assert_eq!(
+            funded.confidence,
+            RecentConfidence::Estimated,
+            "disputed social corroboration must stay Estimated, not Reconstructed"
+        );
+
+        // Case 2: social edge has NO evidence -> not authoritative.
+        let no_evidence = edge(EdgeType::ReusedSocialLink, "sol:W1", "x:12345", &[]);
+        let out2 = resolve_candidates(&anchor, &nodes, &[funding.clone(), no_evidence], &bindings(), NOW);
+        let funded2 = out2
+            .iter()
+            .find(|c| c.relation == RecentRelation::FundedByKnownDeployer)
+            .expect("funding relation present");
+        assert_eq!(funded2.confidence, RecentConfidence::Estimated);
+
+        // Case 3: fully authoritative social edge inside its window -> Reconstructed.
+        let good = edge(EdgeType::ReusedSocialLink, "sol:W1", "x:12345", &["ev-soc"]);
+        let out3 = resolve_candidates(&anchor, &nodes, &[funding, good], &bindings(), NOW);
+        let funded3 = out3
+            .iter()
+            .find(|c| c.relation == RecentRelation::FundedByKnownDeployer)
+            .expect("funding relation present");
+        assert_eq!(funded3.confidence, RecentConfidence::Reconstructed);
     }
 
     #[test]
@@ -768,8 +1344,8 @@ mod tests {
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
             deployer: None,
-            authority: Some("wallet:A1".into()),
-            fee_payer: Some("wallet:F1".into()),
+            authority: Some("solana:A1".into()),
+            fee_payer: Some("solana:F1".into()),
             factory: None,
             initial_funder: None,
             authority_changes: vec![],
@@ -777,10 +1353,10 @@ mod tests {
         };
         let nodes = vec![token_node("sol:AAA"), token_node("sol:BBB")];
         let edges = vec![
-            edge(EdgeType::SameAuthority, "wallet:A1", "sol:BBB", &["ev-a"]),
-            edge(EdgeType::SameFeePayer, "wallet:F1", "sol:BBB", &["ev-f"]),
+            edge(EdgeType::SameAuthority, "solana:A1", "sol:BBB", &["ev-a"]),
+            edge(EdgeType::SameFeePayer, "solana:F1", "sol:BBB", &["ev-f"]),
         ];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert!(out.iter().any(|c| c.relation == RecentRelation::SameAuthority));
         assert!(out.iter().any(|c| c.relation == RecentRelation::SameFeePayer));
     }
@@ -801,16 +1377,20 @@ mod tests {
         let mut e = edge(EdgeType::CrossChainDeployment, "sol:AAA", "eth:BBB", &["ev"]);
         e.truth_status = TruthStatus::Disputed;
         let edges = vec![e];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert!(out.is_empty(), "disputed cross-chain edge must not produce Exact");
     }
 
+    // Wallet keys are chain-qualified (`solana:W9`), per the frozen identity rule
+    // `wallet = chain_id + wallet_address`. These fixtures previously used
+    // `wallet:W9`, which is NOT chain-qualified: the shared emit boundary now
+    // rejects it, which is how REV-032-F01 surfaced.
     #[test]
     fn funded_by_known_deployer_is_reconstructed() {
         // Funding + reused social identity + coherent time -> Reconstructed.
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
+            deployer: Some("solana:D1".into()),
             authority: None,
             fee_payer: None,
             factory: None,
@@ -818,17 +1398,18 @@ mod tests {
             authority_changes: vec![],
             social_identities: vec!["x:acct1".into()],
         };
-        let nodes = vec![token_node("sol:AAA"), wallet_node("wallet:W9")];
+        let nodes = vec![token_node("sol:AAA"), wallet_node("solana:W9")];
         // Funding edge + a real reused-social edge (wallet reuses the anchor's
         // social identity) -> Reconstructed.
         let edges = vec![
-            edge(EdgeType::FundedBy, "wallet:D1", "wallet:W9", &["ev2"]),
-            edge(EdgeType::ReusedSocialLink, "wallet:W9", "x:acct1", &["ev-reuse"]),
+            edge(EdgeType::FundedBy, "solana:D1", "solana:W9", &["ev2"]),
+            edge(EdgeType::ReusedSocialLink, "solana:W9", "x:acct1", &["ev-reuse"]),
         ];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].relation, RecentRelation::FundedByKnownDeployer);
         assert_eq!(out[0].confidence, RecentConfidence::Reconstructed);
+        assert_eq!(out[0].to_identity.value, "solana:W9");
     }
 
     #[test]
@@ -836,7 +1417,7 @@ mod tests {
         // No social corroboration -> funding alone is Estimated, not Reconstructed.
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
+            deployer: Some("solana:D1".into()),
             authority: None,
             fee_payer: None,
             factory: None,
@@ -844,28 +1425,64 @@ mod tests {
             authority_changes: vec![],
             social_identities: vec![],
         };
-        let nodes = vec![token_node("sol:AAA"), wallet_node("wallet:W9")];
-        let edges = vec![edge(EdgeType::FundedBy, "wallet:D1", "wallet:W9", &["ev2"])];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let nodes = vec![token_node("sol:AAA"), wallet_node("solana:W9")];
+        let edges = vec![edge(EdgeType::FundedBy, "solana:D1", "solana:W9", &["ev2"])];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, RecentConfidence::Estimated);
+    }
+
+    // REV-032-F01: a non-chain-qualified wallet key must NOT be emitted at all.
+    // Before the shared boundary, the FundedByKnownDeployer path emitted
+    // `e.to_entity_key` verbatim, so `wallet:W9` (no chain) became a relation
+    // target and violated the frozen identity rule.
+    #[test]
+    fn unqualified_wallet_target_is_not_emitted() {
+        // The ANCHOR and the funding actor are canonical on purpose, so the only
+        // thing under test is the TARGET key: `wallet:W9` carries a kind prefix,
+        // not a chain, so it is not a valid identity and must resolve to nothing.
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: Some("solana:D1".into()),
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec![],
+        };
+        // Deliberately NOT chain-qualified. Do not "fix" this key: the whole
+        // point of the test is that an unqualified target is dropped.
+        const UNQUALIFIED_TARGET: &str = "wallet:W9";
+        let nodes = vec![token_node("sol:AAA"), wallet_node(UNQUALIFIED_TARGET)];
+        let edges = vec![edge(
+            EdgeType::FundedBy,
+            "solana:D1",
+            UNQUALIFIED_TARGET,
+            &["ev2"],
+        )];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
+        assert!(
+            out.is_empty(),
+            "`wallet:W9` is not chain-qualified and must not be emitted as a target, got {out:?}"
+        );
     }
 
     #[test]
     fn factory_is_not_deployer() {
         let anchor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
+            deployer: Some("solana:D1".into()),
             authority: None,
             fee_payer: None,
-            factory: Some("program:F1".into()),
+            factory: Some("solana:F1_FACTORY".into()),
             initial_funder: None,
             authority_changes: vec![],
             social_identities: vec![],
         };
         let nodes = vec![token_node("sol:AAA"), token_node("sol:BBB")];
-        let edges = vec![edge(EdgeType::DeployedBy, "program:F1", "sol:BBB", &["ev3"])];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let edges = vec![edge(EdgeType::DeployedBy, "solana:F1_FACTORY", "sol:BBB", &["ev3"])];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert!(out.is_empty(), "factory/launchpad address stays separate from deployer");
     }
 
@@ -888,7 +1505,7 @@ mod tests {
             "eth:BBB",
             &["ev4"],
         )];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].relation, RecentRelation::CrossChainDeployment);
         assert_eq!(out[0].confidence, RecentConfidence::Exact);
@@ -909,9 +1526,42 @@ mod tests {
         };
         let nodes = vec![token_node("sol:AAA"), token_node("sol:BBB")];
         let edges = vec![edge(EdgeType::ReusedSocialLink, "sol:BBB", "x:acct1", &["ev-r"])];
-        let out = resolve_candidates(&anchor, &nodes, &edges, NOW);
-        assert!(out.iter().any(|c| c.to_identity.value == "sol:BBB"));
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
+        // The target is the other TOKEN, emitted canonically (`sol:` -> `solana:`),
+        // and never the social identity itself.
+        assert!(out.iter().any(|c| c.to_identity.value == "solana:BBB"));
         assert!(!out.iter().any(|c| c.to_identity.value == "x:acct1"));
+    }
+
+    // REV-032-F02: this path deduped on the SOCIAL identity, so two different
+    // projects reusing one identity collapsed and one silently disappeared.
+    #[test]
+    fn two_projects_reusing_one_identity_both_surface() {
+        let anchor = ActorExtraction {
+            token: "sol:AAA".into(),
+            deployer: None,
+            authority: None,
+            fee_payer: None,
+            factory: None,
+            initial_funder: None,
+            authority_changes: vec![],
+            social_identities: vec!["x:acct1".into()],
+        };
+        let nodes = vec![
+            token_node("sol:AAA"),
+            token_node("sol:BBB"),
+            token_node("sol:CCC"),
+        ];
+        let edges = vec![
+            edge(EdgeType::ReusedSocialLink, "sol:BBB", "x:acct1", &["ev-b"]),
+            edge(EdgeType::ReusedSocialLink, "sol:CCC", "x:acct1", &["ev-c"]),
+        ];
+        let out = resolve_candidates(&anchor, &nodes, &edges, &bindings(), NOW);
+        assert!(out.iter().any(|c| c.to_identity.value == "solana:BBB"));
+        assert!(
+            out.iter().any(|c| c.to_identity.value == "solana:CCC"),
+            "the second project reusing the same identity must not be swallowed"
+        );
     }
 
     #[test]
@@ -1085,18 +1735,18 @@ mod tests {
     fn build_lookup_query_dedupes() {
         let actor = ActorExtraction {
             token: "sol:AAA".into(),
-            deployer: Some("wallet:D1".into()),
-            authority: Some("wallet:A1".into()),
-            fee_payer: Some("wallet:F1".into()),
-            factory: Some("program:FACTORY".into()),
+            deployer: Some("solana:D1".into()),
+            authority: Some("solana:A1".into()),
+            fee_payer: Some("solana:F1".into()),
+            factory: Some("solana:FACTORY".into()),
             initial_funder: Some("wallet:FUND1".into()),
             authority_changes: vec!["wallet:OLD1".into()],
             social_identities: vec!["x:acct1".into()],
         };
         let q = build_lookup_query(&actor);
         assert!(q.contains(&"sol:AAA".to_string()));
-        assert!(q.contains(&"wallet:D1".to_string()));
-        assert!(q.contains(&"program:FACTORY".to_string()));
+        assert!(q.contains(&"solana:D1".to_string()));
+        assert!(q.contains(&"solana:FACTORY".to_string()));
         assert!(q.contains(&"wallet:OLD1".to_string()));
         assert!(q.contains(&"x:acct1".to_string()));
         // deterministic dedup: no duplicate entries

@@ -151,6 +151,28 @@ pub async fn record_edge_evidence(
 /// Promotion requires pair confidence >= 0.70. Existing memberships are
 /// revoked (not deleted) when their confidence falls below the threshold
 /// through missing evidence; historical edges remain untouched.
+///
+/// REV-072-F06 (HIGH): the component is MERGED onto one canonical cluster.
+///
+/// This used to take the first existing cluster containing any member (`LIMIT 1`)
+/// and write the whole component into it, leaving every OTHER cluster those members
+/// belonged to active. The schema permitted it — uniqueness is only
+/// `(cluster_id, chain, address)` — so one wallet could hold several active
+/// memberships at once. `evaluate_token_signals` counts `COUNT(DISTINCT cluster_id)`
+/// as a hard entry gate documented as "two INDEPENDENT eligible clusters", so a
+/// single wallet in two active clusters passed that gate by itself and a rejected
+/// token became an accepted signal.
+///
+/// If a member is active in clusters A and B then A and B are one component, so the
+/// correct state is one cluster, not "keep A and forget B". Every overlapping
+/// cluster is therefore folded into the smallest cluster id and its superseded
+/// memberships are revoked — the same retirement every other path in this schema
+/// uses. Migration 1032 performs the identical merge for existing data and then
+/// installs a partial unique index on `(chain, address) WHERE revoked_at IS NULL`,
+/// so the invariant survives a caller that forgets it.
+///
+/// The whole rebuild runs in ONE transaction: a merge that committed halfway would
+/// leave a wallet in two clusters, which is exactly the state being eliminated.
 pub async fn rebuild_cluster_for(
     db: &PgPool,
     chain: ChainKind,
@@ -184,47 +206,98 @@ pub async fn rebuild_cluster_for(
         cluster_members.insert(from.clone());
         cluster_members.insert(to.clone());
     }
+    let members: Vec<String> = cluster_members.iter().cloned().collect();
 
-    // Find or create a cluster that already contains any member.
-    let existing: Option<(i64,)> = sqlx::query_as(
+    let mut tx = db.begin().await?;
+
+    // EVERY cluster any member is currently active in — not just the first one.
+    // Taking one and ignoring the rest is what left a wallet counted twice.
+    let existing: Vec<i64> = sqlx::query_scalar(
         r#"
-        SELECT cluster_id FROM wallet_cluster_members
+        SELECT DISTINCT cluster_id FROM wallet_cluster_members
          WHERE chain = $1 AND address = ANY($2) AND revoked_at IS NULL
-         LIMIT 1
+         ORDER BY cluster_id
         "#,
     )
     .bind(chain.as_str())
-    .bind(&rows.iter().map(|(f, _t, _)| f.clone()).chain(std::iter::once(address.to_string())).collect::<Vec<_>>())
-    .fetch_optional(db)
+    .bind(&members)
+    .fetch_all(&mut *tx)
     .await?;
-    let cluster_id: i64 = match existing {
-        Some((id,)) => id,
+
+    // The smallest existing id is canonical, so repeated rebuilds converge on one
+    // cluster instead of ping-ponging between equally valid choices.
+    let cluster_id: i64 = match existing.first() {
+        Some(id) => *id,
         None => {
             sqlx::query_scalar::<_, i64>("INSERT INTO wallet_clusters DEFAULT VALUES RETURNING cluster_id")
-                .fetch_one(db)
+                .fetch_one(&mut *tx)
                 .await?
         }
     };
 
-    for member in &cluster_members {
-        sqlx::query(
-            r#"
-            INSERT INTO wallet_cluster_members (cluster_id, chain, address, membership_kind, confidence)
-            VALUES ($1, $2, $3, 'soft', $4)
-            ON CONFLICT (cluster_id, chain, address) DO UPDATE
-                SET confidence = EXCLUDED.confidence,
-                    revoked_at = NULL
-            "#,
+    // Fold the superseded clusters in: their members join the canonical cluster and
+    // their old memberships are revoked, so the component is one cluster afterwards.
+    // Members of a superseded cluster that are NOT in this component still move —
+    // they were transitively connected through the shared wallet, which is what made
+    // the clusters overlap in the first place.
+    for superseded in existing.iter().copied().filter(|id| *id != cluster_id) {
+        let moved: Vec<String> = sqlx::query_scalar(
+            "SELECT address FROM wallet_cluster_members \
+              WHERE cluster_id = $1 AND chain = $2 AND revoked_at IS NULL",
         )
-        .bind(cluster_id)
+        .bind(superseded)
         .bind(chain.as_str())
-        .bind(member)
-        .bind(decimal_from_f64(MEMBERSHIP_THRESHOLD))
-        .execute(db)
+        .fetch_all(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE wallet_cluster_members SET revoked_at = now() \
+              WHERE cluster_id = $1 AND chain = $2 AND revoked_at IS NULL",
+        )
+        .bind(superseded)
+        .bind(chain.as_str())
+        .execute(&mut *tx)
+        .await?;
+        for member in moved {
+            upsert_membership(&mut tx, cluster_id, chain, &member).await?;
+        }
     }
 
+    for member in &members {
+        upsert_membership(&mut tx, cluster_id, chain, member).await?;
+    }
+
+    tx.commit().await?;
     Ok(Some(cluster_id))
+}
+
+/// Activate one membership in the canonical cluster.
+///
+/// Revoking the superseded row first and re-inserting here is what keeps at most one
+/// ACTIVE membership per `(chain, address)` — the invariant migration 1032 enforces
+/// with a partial unique index, so a violation is a constraint error rather than a
+/// silently double-counted cluster.
+async fn upsert_membership(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cluster_id: i64,
+    chain: ChainKind,
+    address: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO wallet_cluster_members (cluster_id, chain, address, membership_kind, confidence)
+        VALUES ($1, $2, $3, 'soft', $4)
+        ON CONFLICT (cluster_id, chain, address) DO UPDATE
+            SET confidence = EXCLUDED.confidence,
+                revoked_at = NULL
+        "#,
+    )
+    .bind(cluster_id)
+    .bind(chain.as_str())
+    .bind(address)
+    .bind(decimal_from_f64(MEMBERSHIP_THRESHOLD))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Trace wallet lineage: funding sources and destinations, stopping at
@@ -237,24 +310,40 @@ pub struct TraceStep {
     pub endpoint: bool,
 }
 
+/// Trace a wallet's funding lineage, stopping at flow-only endpoints.
+///
+/// REV-058-F02 (HIGH): the flow-only policy lookup is workspace-scoped AND respects
+/// expiry.
+///
+/// Two defects in one query. It accepted no workspace, so a `flow_only` label created
+/// by another tenant silently truncated THIS tenant's traversal — a cross-workspace
+/// policy leak with no visible cause. And it ignored `expires_at`, so a label that had
+/// already expired kept suppressing traversal forever; every other label consumer in
+/// this crate checks `(expires_at IS NULL OR expires_at > now())`, and this one was the
+/// outlier.
+///
+/// `workspace_id` is required rather than optional: an unscoped trace is precisely the
+/// bug, and a defaulted one would hide it again.
+///
+/// REV-064-F06: scoping and expiry were right, the QUESTION was wrong. Asking
+/// "does any active row say `flow_only`?" bypasses the disposition authority:
+/// a manual `watch` beside an automatic `flow_only` resolves to `watch`, yet the
+/// existence check still truncated the trace. Traversal now reads the effective
+/// disposition (`db::active_disposition`) and applies the shared
+/// `db::disposition_stops_traversal` rule, so no consumer re-implements policy and
+/// an unknown disposition surfaces as an error instead of being ranked as "walk".
 pub async fn trace_wallet(
     db: &PgPool,
+    workspace_id: i64,
     chain: ChainKind,
     address: &str,
     max_depth: u32,
 ) -> Result<Vec<TraceStep>> {
-    let labels: Vec<(String,)> = sqlx::query_as(
-        r#"
-        SELECT DISTINCT kind FROM wallet_labels
-         WHERE chain = $1 AND address = $2 AND disposition = 'flow_only'
-           AND revoked_at IS NULL
-        "#,
-    )
-    .bind(chain.as_str())
-    .bind(address)
-    .fetch_all(db)
-    .await?;
-    let is_flow_endpoint = !labels.is_empty();
+    let is_flow_endpoint =
+        match crate::db::active_disposition(db, workspace_id, chain.as_str(), address).await? {
+            Some(disposition) => crate::db::disposition_stops_traversal(&disposition)?,
+            None => false,
+        };
 
     let mut steps = Vec::new();
     if is_flow_endpoint {

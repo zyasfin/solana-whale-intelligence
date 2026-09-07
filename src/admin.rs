@@ -1,5 +1,5 @@
-//! Fully functional admin panel: password auth, RPC provider management,
-//! Telegram channel management, wallet labels/blocklist, and dashboard UI.
+//! Fully functional admin panel: password auth, API-key pools, Telegram channel
+//! management, wallet labels/blocklist, and dashboard UI.
 //!
 //! Every mutation endpoint requires a valid session. Secrets are never
 //! returned; RPC API keys are managed by env-var reference, never raw value.
@@ -55,10 +55,18 @@ async fn require_auth(state: &AdminState, headers: &HeaderMap) -> Result<(), Sta
     let Some(token) = session_token(headers) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    if auth::validate_session(&state.pool, &token).await {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
+    match auth::validate_session(&state.pool, &token).await {
+        Ok(true) => Ok(()),
+        // `Ok(false)` is a real invalid/expired session -> 401.
+        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+        // A DB failure is not "bad session": surface it as 500 (REV-060-F06).
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "session validation failed; refusing to report a session as invalid"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -85,11 +93,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/metrics/overview", get(metrics_overview))
         .route("/api/metrics/signals/timeline", get(metrics_signals_timeline))
         .route("/api/metrics/radar/trend", get(metrics_radar_trend))
-        // RPC providers
-        .route("/api/rpc-providers", get(list_rpc_providers).post(create_rpc_provider))
-        .route("/api/rpc-providers/bulk", post(bulk_create_rpc_providers))
-        .route("/api/rpc-providers/{id}", post(update_rpc_provider).delete(delete_rpc_provider))
-        .route("/api/rpc-providers/{id}/toggle", post(toggle_rpc_provider))
+        // RPC providers: REMOVED. Migration 0006_drop_rpc_providers.sql dropped the
+        // `rpc_providers` table (superseded by the API-keys panel: helius_keys /
+        // gmgn_keys). The routes are removed with the table (REV-028-F01).
         // Telegram channels
         .route("/api/telegram/channels", get(list_channels).post(add_channel))
         .route("/api/telegram/channels/bulk", post(bulk_add_channels))
@@ -102,11 +108,21 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/wallets", get(list_wallets))
         .route("/api/wallets/{chain}/{address}/scores", get(wallet_scores))
         .route("/api/tokens/{chain}/{mint}/report", get(token_report))
+        // Recent intelligence: the admin router serves the Token Recent dashboard
+        // (`serve_dashboard` returns the same HTML as the read API), but did not
+        // expose the endpoints that page fetches, so both panels always rendered
+        // an error (REV-027-F09). Registered here against the same handlers the
+        // read API uses, so workspace-from-session authorization is identical.
+        .route("/api/tokens/{chain}/{mint}/recent", get(token_recent))
+        .route("/api/tokens/{chain}/{mint}/relations", get(token_relations))
         .route("/api/funding/radar/cases", get(radar_cases))
         .route("/api/funding/radar/cases/{id}", get(radar_case))
         .route("/api/signals", get(list_signals))
         .route("/api/signals/rejections", get(signal_rejections))
         .route("/api/clusters", get(list_clusters))
+        // Queue backpressure control (REV-076-F02: the durable authority workers read)
+        .route("/api/queues", get(list_queue_state))
+        .route("/api/queues/{name}/pause", post(set_queue_pause))
         // Settings (env read-only + runtime editable)
         .route("/api/settings/env", get(settings_env))
         .route("/api/settings/runtime", get(settings_runtime_get).post(settings_runtime_save))
@@ -121,11 +137,26 @@ pub fn router(state: AdminState) -> Router {
 
 async fn serve_dashboard(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     if auth::auth_configured() {
-        let authed = match session_token(&headers) {
-            Some(token) => auth::validate_session(&state.pool, &token).await,
+        // REV-062-F07: `validate_session(...).unwrap_or(false)` treated a DB error
+        // as an invalid session — an outage or a missing table became a redirect to
+        // /login instead of a 500. `Ok(false)` is a genuine bad/expired session
+        // (client-side -> 401); `Err` is a server-side failure and must surface as
+        // 500 so an operator sees the real cause, not a flood of 401s.
+        let ok = match session_token(&headers) {
+            Some(token) => match auth::validate_session(&state.pool, &token).await {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "session validation failed on the dashboard; refusing to call the session invalid"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            },
             None => false,
         };
-        if !authed {
+        if !ok {
             return Redirect::to("/login").into_response();
         }
     }
@@ -173,12 +204,22 @@ async fn login_submit(
     }
     let hash = auth::password_hash().unwrap_or_default();
     if !auth::verify_password(form.password.trim(), &hash) {
-        let _ = auth::record_attempt(&state.pool, &key, false, Some(ip), ua).await;
+        // REV-064-F07: a failed attempt that is not RECORDED is a rate limiter that
+        // does not exist — the audit row is what `is_rate_limited` counts, so
+        // swallowing this error turns brute-force protection off silently. Fail closed.
+        if auth::record_attempt(&state.pool, &key, false, Some(ip), ua).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         return Html(LOGIN_HTML.replace("<!--ERROR-->", r#"<div class="err">password salah</div>"#)).into_response();
     }
-    let _ = auth::record_attempt(&state.pool, &key, true, Some(ip), ua).await;
-    let _ = auth::clear_attempts(&state.pool, &key).await;
-    match auth::create_session(&state.pool, Some(ip), ua).await {
+    // REV-064-F07: a store failure on the success path must not hand out a session.
+    //
+    // REV-067-F07: the three successful-login writes (audit the success, clear the
+    // failure counter, insert the session) are ONE transaction. As three separate
+    // statements a failure in the second or third returned 500 with no cookie —
+    // correct as a response — while the earlier writes stayed committed, leaving an
+    // audit trail and counter describing a login the client never got. All or none.
+    match auth::establish_session(&state.pool, &key, Some(ip), ua).await {
         Ok(token) => {
             let cookie = auth::session_cookie_value(&token);
             let mut response = Redirect::to("/").into_response();
@@ -189,9 +230,16 @@ async fn login_submit(
     }
 }
 
+/// REV-064-F07: logout must not answer "logged out" when the server-side session
+/// still exists. It used to discard the `destroy_session` error, clear the cookie
+/// and redirect — the browser looked logged out while the token stayed valid for
+/// anyone holding it. A store failure is now a 500 and the cookie is left alone,
+/// so the client's state never claims more than the server did.
 async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(token) = session_token(&headers) {
-        let _ = auth::destroy_session(&state.pool, &token).await;
+        if auth::destroy_session(&state.pool, &token).await.is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
     let mut response = Redirect::to("/login").into_response();
     response
@@ -206,31 +254,42 @@ struct AuthStatus {
     authenticated: bool,
 }
 
-async fn auth_status(State(state): State<AdminState>, headers: HeaderMap) -> Json<AuthStatus> {
+async fn auth_status(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatus>, StatusCode> {
     let configured = auth::auth_configured();
     let authenticated = if configured {
         match session_token(&headers) {
-            Some(token) => auth::validate_session(&state.pool, &token).await,
+            Some(token) => match auth::validate_session(&state.pool, &token).await {
+                // REV-062-F07: a DB error during validation is a server-side failure,
+                // never "authenticated: false" — which would read as a logged-out
+                // session and hide the actual outage. Surface it as 500.
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "session validation failed in auth_status; refusing to report not-authenticated"
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            },
             None => false,
         }
     } else {
         true
     };
-    Json(AuthStatus {
+    Ok(Json(AuthStatus {
         configured,
         authenticated,
-    })
+    }))
 }
-
 async fn api_health(State(state): State<AdminState>, headers: HeaderMap) -> Result<Json<serde_json::Value>, StatusCode> {
     require_auth(&state, &headers).await?;
     let latency = crate::db::latency_ms(&state.pool).await.unwrap_or(-1.0);
     let radar = crate::health::radar_stage_counts(&state.pool).await.unwrap_or_default();
     let telegram = crate::health::telegram_health(&state.pool).await.unwrap_or_default();
-    let rpc_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rpc_providers WHERE enabled")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(0);
     Ok(Json(serde_json::json!({
         "status": "ok",
         "database_latency_ms": latency,
@@ -242,7 +301,6 @@ async fn api_health(State(state): State<AdminState>, headers: HeaderMap) -> Resu
             "allowlisted": telegram.allowlisted, "active": telegram.active,
             "messages_stored": telegram.messages_stored,
         },
-        "rpc_providers_enabled": rpc_count,
     })))
 }
 
@@ -259,12 +317,13 @@ fn clamp_hours(h: Option<i64>, default: i64) -> i64 {
     h.unwrap_or(default).clamp(1, 168)
 }
 
+/// REV-072-F06 (HIGH): accepted/rejected counts are workspace-owned policy outcomes.
 async fn metrics_signals_timeline(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Query(query): Query<MetricsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
     let hours = clamp_hours(query.hours, 24);
     let rows = sqlx::query_as::<_, (DateTime<Utc>, i64, i64)>(
         r#"
@@ -272,10 +331,12 @@ async fn metrics_signals_timeline(
                COUNT(*) FILTER (WHERE status = 'accepted') AS accepted,
                COUNT(*) FILTER (WHERE status = 'rejected') AS rejected
           FROM signal_evaluations
-         WHERE evaluated_at > now() - ($1 || ' hours')::interval
+         WHERE workspace_id = $1
+           AND evaluated_at > now() - ($2 || ' hours')::interval
          GROUP BY t ORDER BY t
         "#,
     )
+    .bind(workspace_id)
     .bind(hours)
     .fetch_all(&state.pool)
     .await
@@ -316,18 +377,24 @@ async fn metrics_radar_trend(
     ))
 }
 
+/// REV-072-F06: `signals_24h` is a workspace-owned count; the rest of this overview
+/// is infrastructure-wide and stays unscoped because those tables carry no tenancy.
 async fn metrics_overview(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
     let wallets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallets")
         .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens")
         .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let clusters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wallet_clusters")
         .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let signals_24h: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM signals WHERE created_at > now() - interval '24 hours'")
+    let signals_24h: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM signals \
+          WHERE workspace_id = $1 AND created_at > now() - interval '24 hours'",
+    )
+        .bind(workspace_id)
         .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let radar_open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM funding_radar_cases WHERE stage NOT IN ('dismissed','deployed')")
         .fetch_one(&state.pool).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -340,227 +407,16 @@ async fn metrics_overview(
 }
 
 // ---------------------------------------------------------------------------
-// RPC providers CRUD
+// RPC providers CRUD — REMOVED (REV-028-F01).
+//
+// Migration 0006_drop_rpc_providers.sql dropped the `rpc_providers` table and
+// its comment states "its UI and routes are removed in the same change" — but
+// the handlers were left behind, so every one of them (plus `api_health`, which
+// counted enabled providers) raised `relation "rpc_providers" does not exist`
+// on any migrated database. The feature is superseded by the API-keys panel
+// (`helius_keys` / `gmgn_keys`, migration 0005). Do not reintroduce these
+// routes without a forward migration recreating the table.
 // ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct RpcProviderRow {
-    id: i64,
-    chain: String,
-    name: String,
-    url: String,
-    api_key_ref: Option<String>,
-    enabled: bool,
-    rpc_rate_per_second: i32,
-    enhanced_rate_per_second: i32,
-    wallet_rate_per_second: i32,
-    kind: String,
-    last_ok_at: Option<DateTime<Utc>>,
-    last_error: Option<String>,
-}
-
-async fn list_rpc_providers(State(state): State<AdminState>, headers: HeaderMap) -> Result<Json<Vec<RpcProviderRow>>, StatusCode> {
-    require_auth(&state, &headers).await?;
-    let rows = sqlx::query_as::<
-        _,
-        (i64, String, String, String, Option<String>, bool, i32, i32, i32, String, Option<DateTime<Utc>>, Option<String>),
-    >(
-        r#"
-        SELECT id, chain, name, url, api_key_ref, enabled,
-               rpc_rate_per_second, enhanced_rate_per_second, wallet_rate_per_second,
-               kind, last_ok_at, last_error
-          FROM rpc_providers ORDER BY chain, name
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(rows.into_iter().map(|r| RpcProviderRow {
-        id: r.0, chain: r.1, name: r.2, url: r.3, api_key_ref: r.4, enabled: r.5,
-        rpc_rate_per_second: r.6, enhanced_rate_per_second: r.7, wallet_rate_per_second: r.8,
-        kind: r.9, last_ok_at: r.10, last_error: r.11,
-    }).collect()))
-}
-
-#[derive(Deserialize)]
-struct RpcProviderForm {
-    chain: String,
-    name: String,
-    url: String,
-    api_key_ref: Option<String>,
-    kind: Option<String>,
-    rpc_rate_per_second: Option<i32>,
-    enhanced_rate_per_second: Option<i32>,
-    wallet_rate_per_second: Option<i32>,
-}
-
-async fn create_rpc_provider(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Json(form): Json<RpcProviderForm>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_write_auth(&state, &headers).await?;
-    if ChainKind::parse(&form.chain).is_none() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let id: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO rpc_providers (chain, name, url, api_key_ref, kind,
-                                   rpc_rate_per_second, enhanced_rate_per_second, wallet_rate_per_second)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (chain, name) DO UPDATE
-            SET url = EXCLUDED.url,
-                api_key_ref = EXCLUDED.api_key_ref,
-                kind = EXCLUDED.kind,
-                rpc_rate_per_second = EXCLUDED.rpc_rate_per_second,
-                enhanced_rate_per_second = EXCLUDED.enhanced_rate_per_second,
-                wallet_rate_per_second = EXCLUDED.wallet_rate_per_second
-        RETURNING id
-        "#,
-    )
-    .bind(&form.chain)
-    .bind(&form.name)
-    .bind(&form.url)
-    .bind(&form.api_key_ref)
-    .bind(form.kind.as_deref().unwrap_or("rpc"))
-    .bind(form.rpc_rate_per_second.unwrap_or(10))
-    .bind(form.enhanced_rate_per_second.unwrap_or(2))
-    .bind(form.wallet_rate_per_second.unwrap_or(2))
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "id": id, "ok": true })))
-}
-
-#[derive(Deserialize)]
-struct BulkRpcProviderEntry {
-    name: String,
-    url: String,
-    api_key_ref: Option<String>,
-    kind: Option<String>,
-    rpc_rate_per_second: Option<i32>,
-    enhanced_rate_per_second: Option<i32>,
-    wallet_rate_per_second: Option<i32>,
-}
-
-#[derive(Deserialize)]
-struct BulkRpcProviderForm {
-    chain: String,
-    providers: Vec<BulkRpcProviderEntry>,
-}
-
-async fn bulk_create_rpc_providers(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Json(form): Json<BulkRpcProviderForm>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_write_auth(&state, &headers).await?;
-    if ChainKind::parse(&form.chain).is_none() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    for p in &form.providers {
-        if p.name.trim().is_empty() || p.url.trim().is_empty() {
-            skipped += 1;
-            continue;
-        }
-        sqlx::query(
-            r#"
-            INSERT INTO rpc_providers (chain, name, url, api_key_ref, kind,
-                                       rpc_rate_per_second, enhanced_rate_per_second, wallet_rate_per_second)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (chain, name) DO UPDATE
-                SET url = EXCLUDED.url,
-                    api_key_ref = EXCLUDED.api_key_ref,
-                    kind = EXCLUDED.kind,
-                    rpc_rate_per_second = EXCLUDED.rpc_rate_per_second,
-                    enhanced_rate_per_second = EXCLUDED.enhanced_rate_per_second,
-                    wallet_rate_per_second = EXCLUDED.wallet_rate_per_second
-            "#,
-        )
-        .bind(&form.chain)
-        .bind(&p.name)
-        .bind(&p.url)
-        .bind(&p.api_key_ref)
-        .bind(p.kind.as_deref().unwrap_or("rpc"))
-        .bind(p.rpc_rate_per_second.unwrap_or(10))
-        .bind(p.enhanced_rate_per_second.unwrap_or(2))
-        .bind(p.wallet_rate_per_second.unwrap_or(2))
-        .execute(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        imported += 1;
-    }
-    Ok(Json(serde_json::json!({ "ok": true, "imported": imported, "skipped": skipped })))
-}
-
-#[derive(Deserialize)]
-struct RpcProviderUpdate {
-    url: Option<String>,
-    api_key_ref: Option<String>,
-    rpc_rate_per_second: Option<i32>,
-    enhanced_rate_per_second: Option<i32>,
-    wallet_rate_per_second: Option<i32>,
-}
-
-async fn update_rpc_provider(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(form): Json<RpcProviderUpdate>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_write_auth(&state, &headers).await?;
-    sqlx::query(
-        r#"
-        UPDATE rpc_providers SET
-            url = COALESCE($2, url),
-            api_key_ref = COALESCE($3, api_key_ref),
-            rpc_rate_per_second = COALESCE($4, rpc_rate_per_second),
-            enhanced_rate_per_second = COALESCE($5, enhanced_rate_per_second),
-            wallet_rate_per_second = COALESCE($6, wallet_rate_per_second)
-         WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .bind(&form.url)
-    .bind(&form.api_key_ref)
-    .bind(form.rpc_rate_per_second)
-    .bind(form.enhanced_rate_per_second)
-    .bind(form.wallet_rate_per_second)
-    .execute(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-async fn toggle_rpc_provider(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_write_auth(&state, &headers).await?;
-    sqlx::query("UPDATE rpc_providers SET enabled = NOT enabled WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
-
-async fn delete_rpc_provider(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    require_write_auth(&state, &headers).await?;
-    sqlx::query("DELETE FROM rpc_providers WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
-}
 
 // ---------------------------------------------------------------------------
 // Telegram channels CRUD
@@ -733,18 +589,30 @@ async fn list_labels(
     Path((chain, address)): Path<(String, String)>,
 ) -> Result<Json<Vec<LabelRow>>, StatusCode> {
     require_auth(&state, &headers).await?;
-    if ChainKind::parse(&chain).is_none() {
+    // REV-056-F01 (HIGH): the workspace comes from the authenticated session, and the
+    // query filters on it. Without this filter the reviewer read workspace A's private
+    // label from a workspace B session over real HTTP.
+    let workspace_id = require_workspace(&state, &headers).await?;
+    // REV-053-F03: `wallet_labels.chain` stores the canonical spelling, so binding the
+    // raw path segment made `/sol/<address>/labels` return an empty list for a wallet
+    // that has labels under `solana`.
+    let Some(chain) = ChainKind::parse(&chain) else {
         return Err(StatusCode::BAD_REQUEST);
-    }
+    };
     let rows = sqlx::query_as::<_, (i64, String, String, bool, i32, bool)>(
         r#"
-        SELECT id, kind, disposition, manual, confidence, revoked_at IS NULL AS active
+        SELECT id, kind, disposition, manual, confidence,
+               -- REV-058-F02 (same class): an EXPIRED label is not active. Reporting
+               -- `revoked_at IS NULL` showed it as active while the policy queries had
+               -- already stopped honouring it.
+               (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())) AS active
           FROM wallet_labels
-         WHERE chain = $1 AND address = $2
+         WHERE workspace_id = $1 AND chain = $2 AND address = $3
          ORDER BY created_at DESC
         "#,
     )
-    .bind(chain)
+    .bind(workspace_id)
+    .bind(chain.as_str())
     .bind(&address)
     .fetch_all(&state.pool)
     .await
@@ -768,6 +636,8 @@ async fn add_label(
     Json(form): Json<LabelForm>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_write_auth(&state, &headers).await?;
+    // REV-056-F01: the label is OWNED by the session's workspace.
+    let workspace_id = require_workspace(&state, &headers).await?;
     let Some(chain) = ChainKind::parse(&chain) else {
         return Err(StatusCode::BAD_REQUEST);
     };
@@ -778,6 +648,7 @@ async fn add_label(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     crate::db::add_wallet_label(
         &state.pool,
+        workspace_id,
         chain.as_str(),
         &address,
         &form.kind,
@@ -799,17 +670,61 @@ async fn revoke_label(
     Path((chain, address, id)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_write_auth(&state, &headers).await?;
-    if ChainKind::parse(&chain).is_none() {
+    // REV-056-F01 (HIGH): a revoke is a DESTRUCTIVE cross-tenant action. The reviewer
+    // revoked workspace A's label from a workspace B session and the DB confirmed it.
+    // The workspace now participates in the `WHERE`, so another tenant's row is simply
+    // not addressable.
+    let workspace_id = require_workspace(&state, &headers).await?;
+    // REV-053-F03: this is a MUTATION whose `WHERE` bound the raw path segment, so
+    // `/sol/<address>/labels/<id>/revoke` matched no row and still returned
+    // `{"ok": true}` — an operator was told the label was revoked while it stayed
+    // active.
+    let Some(chain) = ChainKind::parse(&chain) else {
         return Err(StatusCode::BAD_REQUEST);
-    }
-    sqlx::query("UPDATE wallet_labels SET revoked_at = now() WHERE id = $1 AND chain = $2 AND address = $3")
+    };
+    // REV-056-F03: `AND revoked_at IS NULL` restricts this to ACTIVE rows.
+    //
+    // Without it a replay matched the already-revoked row, overwrote `revoked_at` with
+    // a fresh `now()`, and reported `revoked=1` a second time — destroying the original
+    // revocation timestamp (audit evidence) and claiming work that did not happen.
+    let result = sqlx::query(
+        "UPDATE wallet_labels SET revoked_at = now() \
+          WHERE id = $1 AND workspace_id = $2 AND chain = $3 AND address = $4 \
+            AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(workspace_id)
+    .bind(chain.as_str())
+    .bind(&address)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if result.rows_affected() == 0 {
+        // Distinguish "already revoked" from "no such label": the first is an
+        // idempotent no-op the caller can safely ignore, the second is a real 404. A
+        // single answer for both is what made the replay look like fresh work.
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM wallet_labels \
+              WHERE id = $1 AND workspace_id = $2 AND chain = $3 AND address = $4 \
+                AND revoked_at IS NOT NULL)",
+        )
         .bind(id)
-        .bind(chain)
+        .bind(workspace_id)
+        .bind(chain.as_str())
         .bind(&address)
-        .execute(&state.pool)
+        .fetch_one(&state.pool)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+        if already {
+            return Ok(Json(serde_json::json!({
+                "ok": true, "revoked": 0, "already_revoked": true
+            })));
+        }
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(serde_json::json!({
+        "ok": true, "revoked": result.rows_affected(), "already_revoked": false
+    })))
 }
 
 #[derive(Deserialize)]
@@ -824,37 +739,88 @@ async fn import_blocklist(
     Json(form): Json<BlocklistForm>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     require_write_auth(&state, &headers).await?;
+    // REV-056-F01: imported blocks belong to the importing workspace.
+    let workspace_id = require_workspace(&state, &headers).await?;
     let Some(chain) = ChainKind::parse(&form.chain) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let mut imported = 0u32;
-    for address in &form.addresses {
-        let address = address.trim();
-        if address.is_empty() || address.starts_with('#') {
-            continue;
-        }
-        let _ = crate::db::upsert_wallet(&state.pool, chain.as_str(), address, Utc::now(), "blocklist").await;
-        let _ = crate::db::add_wallet_label(
-            &state.pool,
-            chain.as_str(),
-            address,
-            "manual_block",
-            "skip",
-            "admin blocklist import",
-            "manual",
-            100,
-            true,
-            None,
-        )
-        .await;
-        imported += 1;
-    }
+
+    // REV-056-F05 / REV-058-F03: ONE transactional implementation, shared with the CLI
+    // (`db::import_blocklist_tx`). A blocklist that is half-applied is not a blocklist,
+    // and having two copies of that rule is how the CLI stayed non-transactional after
+    // this handler was fixed.
+    let imported = crate::db::import_blocklist_tx(
+        &state.pool,
+        workspace_id,
+        chain.as_str(),
+        &form.addresses,
+        "admin blocklist import",
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!(error = %e, "blocklist import failed; nothing was committed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(Json(serde_json::json!({ "ok": true, "imported": imported })))
 }
 
 // ---------------------------------------------------------------------------
 // Read views (delegate to the read-only surface for list endpoints)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Queue backpressure control (REV-076-F02)
+// ---------------------------------------------------------------------------
+
+/// REV-076-F02: pause/lag was process-local memory with no writer — the gate
+/// worked but nothing operational could ever pause anything, so "backpressure"
+/// was a claim, not a mechanism. `queue_state` is the durable authority: workers
+/// read it in `queue_allowed`, and these endpoints write it under write-auth with
+/// an audit row. Unknown queue names are rejected against the frozen vocabulary
+/// rather than silently creating a row no worker will ever read.
+async fn list_queue_state(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    require_auth(&state, &headers).await?;
+    let rows = sqlx::query_as::<_, (String, bool, i64, DateTime<Utc>, String)>(
+        "SELECT queue, paused, lag_seconds, updated_at, updated_by FROM queue_state ORDER BY queue",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(rows.into_iter().map(|r| serde_json::json!({
+        "queue": r.0, "paused": r.1, "lag_seconds": r.2, "updated_at": r.3, "updated_by": r.4,
+    })).collect()))
+}
+
+#[derive(Deserialize)]
+struct QueuePauseBody {
+    paused: bool,
+}
+
+async fn set_queue_pause(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<QueuePauseBody>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    require_write_auth(&state, &headers).await?;
+    if !crate::queues::ALL_QUEUES.contains(&name.as_str()) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    sqlx::query(
+        "INSERT INTO queue_state (queue, paused, updated_at, updated_by) \
+         VALUES ($1, $2, now(), 'admin') \
+         ON CONFLICT (queue) DO UPDATE SET paused = $2, updated_at = now(), updated_by = 'admin'",
+    )
+    .bind(&name)
+    .bind(body.paused)
+    .execute(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "queue": name, "paused": body.paused })))
+}
 
 // ---------------------------------------------------------------------------
 // Settings (environment read-only + runtime editable)
@@ -976,8 +942,13 @@ async fn settings_secret_set(
     headers: HeaderMap,
     Json(form): Json<SecretSetForm>,
 ) -> Response {
-    if require_write_auth(&state, &headers).await.is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // REV-067-F07: `is_err() -> 401` collapsed every auth outcome into "bad
+    // session", so a validation-store failure (which `require_auth` deliberately
+    // maps to 500) was reported as unauthorized. The operator then sees 401s
+    // instead of the outage, and the taxonomy this codebase already enforces
+    // elsewhere is broken at exactly one route. Propagate the exact status.
+    if let Err(status) = require_write_auth(&state, &headers).await {
+        return status.into_response();
     }
     if !SECRET_KEYS.contains(&form.name.as_str()) || form.value.trim().is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1214,7 +1185,14 @@ async fn list_wallets(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_auth(&state, &headers).await?;
-    let chain = query.chain.unwrap_or_else(|| "solana".to_string());
+    let workspace_id = require_workspace(&state, &headers).await?;
+    // REV-056-F04: this bound the raw query value with NO parsing at all, so
+    // `?chain=sol` was a false-empty page and `?chain=anything` silently returned
+    // nothing rather than 400.
+    let chain = match query.chain.as_deref() {
+        None => ChainKind::Solana,
+        Some(raw) => ChainKind::parse(raw).ok_or(StatusCode::BAD_REQUEST)?,
+    };
     let limit = query.limit.unwrap_or(50).clamp(1, 1000);
     let search = query.q.map(|s| format!("%{s}%"));
     let rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, String)>(
@@ -1225,7 +1203,7 @@ async fn list_wallets(
          ORDER BY last_seen DESC LIMIT $3
         "#,
     )
-    .bind(&chain)
+    .bind(chain.as_str())
     .bind(&search)
     .bind(limit)
     .fetch_all(&state.pool)
@@ -1233,7 +1211,23 @@ async fn list_wallets(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut out = Vec::new();
     for (chain, address, last_seen, source) in rows {
-        let disposition = crate::db::active_disposition(&state.pool, &chain, &address).await.ok().flatten();
+        // REV-056-F01: workspace-owned labels only.
+        //
+        // REV-058-F07: a failed lookup must not be reported as "no disposition". A
+        // safety classification that disappears because of a DB error is worse than an
+        // error page, because nothing tells the operator it disappeared.
+        let disposition =
+            crate::db::active_disposition(&state.pool, workspace_id, &chain, &address)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        address = %crate::models::short_addr(&address),
+                        error = %e,
+                        "active-disposition lookup failed; refusing to report the wallet \
+                         as unclassified"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         out.push(serde_json::json!({
             "chain": chain, "address": address, "last_seen": last_seen,
             "source": source, "disposition": disposition,
@@ -1248,6 +1242,12 @@ async fn wallet_scores(
     Path((chain, address)): Path<(String, String)>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
     require_auth(&state, &headers).await?;
+    // REV-056-F04: the raw path segment was bound with no parsing, so
+    // `/api/wallets/sol/<address>/scores` returned an empty history for a wallet that
+    // has scores under `solana`, and an invalid chain returned 200 instead of 400.
+    let Some(chain) = ChainKind::parse(&chain) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
     let rows = sqlx::query_as::<_, (DateTime<Utc>, i32, i32, i32, bool)>(
         r#"
         SELECT as_of, skill_score, copyability_score, conviction, provisional
@@ -1255,7 +1255,7 @@ async fn wallet_scores(
          ORDER BY as_of DESC LIMIT 100
         "#,
     )
-    .bind(chain)
+    .bind(chain.as_str())
     .bind(&address)
     .fetch_all(&state.pool)
     .await
@@ -1286,6 +1286,86 @@ async fn token_report(
             "why_now": r.why_now, "counter_evidence": r.counter_evidence,
         })),
     })))
+}
+
+/// Resolve the workspace bound to the caller's session (REV-027-F09).
+///
+/// Workspace-scoped reads must derive the workspace from the authenticated
+/// session, never a literal. A session without a binding fails closed with 401,
+/// exactly like the read API's `Workspace` extractor.
+async fn require_workspace(state: &AdminState, headers: &HeaderMap) -> Result<i64, StatusCode> {
+    let Some(token) = session_token(headers) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    match crate::auth::workspace_for_session(&state.pool, &token).await {
+        Ok(Some(id)) => Ok(id),
+        // `Ok(None)` is a real unbound/invalid session -> 401.
+        Ok(None) => Err(StatusCode::UNAUTHORIZED),
+        // A DB failure is a server-side problem, not a bad session (REV-060-F06).
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "workspace lookup failed; refusing to report a session as invalid"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+#[derive(Deserialize)]
+struct RecentQuery {
+    window: Option<String>,
+}
+
+async fn token_recent(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((chain, mint)): Path<(String, String)>,
+    Query(query): Query<RecentQuery>,
+) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::RecentEvent>>, StatusCode> {
+    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
+    // REV-053-F03: the parsed chain BUILDS the key. Validating the raw segment and
+    // then interpolating it meant `/sol/<mint>` queried a key that is never written,
+    // returning 200 with `[]` for a token that has rows under `solana:<mint>`.
+    let Some(chain) = ChainKind::parse(&chain) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let window = query.window.as_deref().unwrap_or("24h");
+    if !matches!(window, "1h" | "24h" | "7d" | "30d" | "all") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let token_identity = format!("{}:{}", chain.as_str(), mint);
+    solana_whale_intelligence::sf::recent_store::fetch_recent_timeline(
+        &state.pool,
+        workspace_id,
+        &token_identity,
+        window,
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn token_relations(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path((chain, mint)): Path<(String, String)>,
+) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::CandidateRelation>>, StatusCode> {
+    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
+    // REV-053-F03: canonical key, same reason as `token_recent`.
+    let Some(chain) = ChainKind::parse(&chain) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let token_identity = format!("{}:{}", chain.as_str(), mint);
+    solana_whale_intelligence::sf::recent_store::fetch_relations(
+        &state.pool,
+        workspace_id,
+        &token_identity,
+    )
+    .await
+    .map(Json)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn radar_cases(
@@ -1331,16 +1411,20 @@ async fn radar_case(
     })))
 }
 
+/// REV-072-F06 (HIGH): scoped to the session's workspace, like every other
+/// policy-dependent read.
 async fn list_signals(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let rows = sqlx::query_as::<_, (i64, String, String, String, i32, DateTime<Utc>)>(
-        "SELECT id, chain, mint, signal_kind, score, created_at FROM signals ORDER BY created_at DESC LIMIT $1",
+        "SELECT id, chain, mint, signal_kind, score, created_at FROM signals \
+          WHERE workspace_id = $1 ORDER BY created_at DESC LIMIT $2",
     )
+    .bind(workspace_id)
     .bind(limit)
     .fetch_all(&state.pool)
     .await
@@ -1350,16 +1434,19 @@ async fn list_signals(
     })).collect()))
 }
 
+/// REV-072-F06: rejections are the tenant's own policy answers.
 async fn signal_rejections(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
-    require_auth(&state, &headers).await?;
+    let workspace_id = require_workspace(&state, &headers).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let rows = sqlx::query_as::<_, (String, String, String, String, DateTime<Utc>)>(
-        "SELECT chain, mint, signal_kind, rejection_code, evaluated_at FROM signal_evaluations WHERE status = 'rejected' ORDER BY evaluated_at DESC LIMIT $1",
+        "SELECT chain, mint, signal_kind, rejection_code, evaluated_at FROM signal_evaluations \
+          WHERE workspace_id = $1 AND status = 'rejected' ORDER BY evaluated_at DESC LIMIT $2",
     )
+    .bind(workspace_id)
     .bind(limit)
     .fetch_all(&state.pool)
     .await

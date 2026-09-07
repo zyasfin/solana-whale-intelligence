@@ -26,7 +26,15 @@ pub mod recent;
 pub mod strategy;
 pub mod cost_basis;
 pub mod recent_runtime;
+pub mod recent_pipeline;
+/// Live-database tests for the production pipeline (REV-046-A4).
+#[cfg(all(test, feature = "pg_tests"))]
+mod recent_pipeline_pg_tests;
 pub mod recent_store;
+/// Authority-boundary tests that must mint social-identity store rows, and so
+/// must live inside the crate rather than as an integration test (REV-037-F06).
+#[cfg(test)]
+mod recent_authority_tests;
 pub mod ingest_runtime;
 pub mod signal_gate;
 pub mod wallet_runtime;

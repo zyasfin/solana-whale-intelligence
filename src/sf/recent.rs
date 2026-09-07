@@ -17,9 +17,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Relationship taxonomy (REV-020, 13 frozen variants). Relations stay
+/// Relationship taxonomy (REV-020, 12 frozen variants). Relations stay
 /// independent: shared social/funder evidence does not automatically prove
 /// common ownership or official status.
+///
+/// The count is **12**, matching the `recent_relation` enum in migration 1018
+/// one-for-one. REV-021's prose said "13"; that was a miscount, not a missing
+/// variant (REV-028-F10).
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, sqlx::Type)]
 #[sqlx(type_name = "recent_relation", rename_all = "snake_case")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -98,7 +102,9 @@ impl RecentConfidence {
 }
 
 /// Identity kind for a chain-qualified entity (REV-020 frozen identity rules).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `Hash` is derived so the kind can participate in a relation-dedupe key: a
+/// Token and a Wallet sharing the same `value` are distinct targets (REV-027).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum IdentityKind {
     Token,
@@ -106,6 +112,19 @@ pub enum IdentityKind {
     Social,
     Website,
     Telegram,
+}
+
+impl IdentityKind {
+    /// Stable lowercase wire form for persistence/display parity.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityKind::Token => "token",
+            IdentityKind::Wallet => "wallet",
+            IdentityKind::Social => "social",
+            IdentityKind::Website => "website",
+            IdentityKind::Telegram => "telegram",
+        }
+    }
 }
 
 /// A chain-qualified identity key. `value` encodes the frozen rule:
@@ -224,7 +243,32 @@ pub struct RecentEvent {
     pub freshness: Option<Freshness>,
     pub coverage: Coverage,
     pub capability_status: CapabilityStatus,
+    /// Authoritative inputs that were NOT available when this event was resolved
+    /// (REV-050-F04 / REV-051 "Coverage disclosure").
+    ///
+    /// The resolver fails closed on a missing actor, which is correct — but an
+    /// event that says only "no relation" reads as "no reuse", and those are
+    /// different facts. Naming the absent inputs is what makes the difference
+    /// visible to the API, the dashboard, and an alert consumer. Empty means
+    /// nothing is claimed to be missing; non-empty forces `coverage != Full`
+    /// (constraint `recent_events_missing_inputs_not_full`, migration 1030).
+    pub missing_inputs: Vec<String>,
     pub retraction: Option<Retraction>,
+    /// True when this row is the CURRENT coverage state for its anchor, as decided
+    /// by the store's canonical order (`occurred_at DESC, id DESC`).
+    ///
+    /// REV-062-F03: the dashboard used to derive "current" itself by sorting the
+    /// returned events on `occurred_at` alone. Two disclosures sharing a timestamp
+    /// then resolved in whatever order the engine returned them, which can differ
+    /// from the order the STORE considers canonical — so the UI could display a
+    /// different current state than the one every server-side policy read uses. An
+    /// invalid timestamp made the comparator `NaN` on top of that.
+    ///
+    /// "Which state is in force" is a server-side fact with one answer, so the
+    /// server states it. The UI reads this flag instead of re-deriving a ranking it
+    /// cannot see the tie-breaker for. Non-coverage rows are always `false`.
+    #[serde(default)]
+    pub is_current_coverage: bool,
 }
 
 /// A per-token timeline of recent events, sorted by `occurred_at`.
@@ -274,6 +318,82 @@ pub struct SocialEvidenceObservation {
     pub parser_version: String,
     pub coverage: Coverage,
     pub session_health: super::browser::SessionHealth,
+}
+
+/// A workspace-scoped projection of one `social_identities` row, as read from the
+/// authoritative store (REV-033/REV-034).
+///
+/// FIELDS ARE PRIVATE and there is no public constructor (REV-035-#4).
+///
+/// REV-034 made `SocialIdentityRecord`'s fields private but left THIS type a fully
+/// public wire struct, and left `records_from_store` public. So the forgery just
+/// moved one layer back: the reviewer built `StoredSocialIdentity` values by hand,
+/// passed them to the public converter, and obtained `Reconstructed` again
+/// (`forged_store_row_count=1 reconstructed=true`). Their verdict is the right one
+/// — "a public wrapper around public wire rows is not authority".
+///
+/// The only way to obtain one of these is [`Self::from_store_row`], which is
+/// `pub(crate)` and called solely by `recent_store` after a real query against the
+/// workspace-scoped current view. Outside this crate the type is opaque: it can be
+/// read, never minted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSocialIdentity {
+    platform: String,
+    immutable_user_id: String,
+    /// Current handle plus every historical handle observed for this account.
+    handles: Vec<String>,
+}
+
+impl StoredSocialIdentity {
+    /// Mint from a row the store actually read. `pub(crate)` on purpose: only
+    /// `recent_store` may call it, and only after querying the authoritative view.
+    pub(crate) fn from_store_row(
+        platform: String,
+        immutable_user_id: String,
+        handles: Vec<String>,
+    ) -> Self {
+        Self {
+            platform,
+            immutable_user_id,
+            handles,
+        }
+    }
+
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    pub fn immutable_user_id(&self) -> &str {
+        &self.immutable_user_id
+    }
+
+    pub fn handles(&self) -> &[String] {
+        &self.handles
+    }
+
+    /// Fixture minting for in-crate unit tests only (REV-037-F06).
+    ///
+    /// `#[cfg(test)]`, NOT a Cargo feature. REV-036 gated this behind a
+    /// `test_fixtures` feature so integration tests could reach it; the reviewer
+    /// then enabled that feature from a downstream crate and minted authority
+    /// records at will. Features are additive and dependency-selectable, so they
+    /// cannot express "tests only". `#[cfg(test)]` can: it exists only while
+    /// compiling THIS crate's own test harness, and no dependent can turn it on.
+    ///
+    /// Tests that need minted authority therefore live inside the crate; see
+    /// `sf::recent_authority_tests`.
+    #[cfg(test)]
+    pub fn mint_for_tests(
+        platform: &str,
+        immutable_user_id: &str,
+        handles: &[&str],
+    ) -> Self {
+        Self {
+            platform: platform.to_string(),
+            immutable_user_id: immutable_user_id.to_string(),
+            handles: handles.iter().map(|h| h.to_string()).collect(),
+        }
+    }
 }
 
 /// Token-triggered evidence adapter boundary. The concrete self-hosted

@@ -127,11 +127,27 @@ pub struct WalletSyncOutcome {
     pub transfers_new: u32,
     pub trades_new: u32,
     pub completed: bool,
+    /// The wallet's authoritative disposition forbade deep-sync (REV-067-F06).
+    ///
+    /// Reported rather than silently returning zeros: a caller must be able to tell
+    /// "this wallet has no history" from "we are not allowed to fetch it".
+    pub skipped_by_policy: bool,
 }
 
 /// Fetch and ingest wallet history page by page (single-address API).
+///
+/// REV-067-F06: `workspace_id` is REQUIRED and the disposition is enforced here.
+/// `models::Disposition` declares `skip` = "excluded from deep-sync", and this was
+/// the boundary that never checked: a `skip` wallet still deep-synced and persisted
+/// its whole history. The workspace is not optional for the same reason it is not
+/// optional in `graph::trace_wallet` — an unscoped policy read is the bug, and a
+/// defaulted one hides it.
+///
+/// A store failure or an unknown disposition PROPAGATES (`effective_disposition` is
+/// fail-closed); it must never be read as "no policy, go ahead".
 pub async fn sync_wallet(
     pool: &PgPool,
+    workspace_id: i64,
     helius: &crate::helius::HeliusPool,
     chain: ChainKind,
     address: &str,
@@ -143,7 +159,16 @@ pub async fn sync_wallet(
         transfers_new: 0,
         trades_new: 0,
         completed: false,
+        skipped_by_policy: false,
     };
+    if !crate::filter::effective_disposition(pool, workspace_id, chain, address)
+        .await?
+        .allows_deep_sync()
+    {
+        outcome.skipped_by_policy = true;
+        outcome.completed = true;
+        return Ok(outcome);
+    }
     let mut before: Option<String> = None;
     for _ in 0..max_pages {
         let _ = chain; // chain is recorded per-transaction by the adapters.
@@ -236,6 +261,7 @@ pub async fn store_gmgn_wallet_observation(
 /// Ingest one transfer into the funding radar (when thresholds qualify).
 pub async fn ingest_funding_transfer(
     pool: &PgPool,
+    workspace_id: i64,
     transfer: &NormalizedTransfer,
     native_usd_price: Option<rust_decimal::Decimal>,
     config: &crate::config::FundingRadarConfig,
@@ -253,7 +279,7 @@ pub async fn ingest_funding_transfer(
     // Match commitment from the transfer's payload.
     let mut event = event;
     event.commitment = transfer.commitment.max(Commitment::Processed);
-    crate::funding_radar::ingest_funding_event(pool, event, config, percentile_threshold).await
+    crate::funding_radar::ingest_funding_event(pool, workspace_id, event, config, percentile_threshold).await
 }
 
 #[cfg(test)]

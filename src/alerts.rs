@@ -6,7 +6,6 @@
 
 #![allow(dead_code)]  // planned API surface; runtime wiring lands with the workers
 
-use anyhow::{anyhow, Result};
 
 /// An outbound alert message.
 #[derive(Clone, Debug)]
@@ -44,14 +43,37 @@ pub fn compose_funding_alert(recipient: &str, chain: &str, confidence: u32, summ
     }
 }
 
+/// The endpoint the Bot API call goes to.
+///
+/// REV-074-F03: a parameter rather than a hardcoded host, because the delivery
+/// retry semantics must be testable without contacting the real Telegram API — a
+/// test that cannot force a 500-then-200 sequence cannot prove retry at all.
+/// Production passes `TELEGRAM_BOT_API_BASE`.
+pub const TELEGRAM_BOT_API_BASE: &str = "https://api.telegram.org";
+
+/// How a failed send is classified for the outbox (REV-074-F03).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendFailure {
+    /// 429 with Retry-After — retry after the server-provided delay.
+    RateLimited(u64),
+    /// Timeout/5xx/transport — retryable with backoff.
+    Transient,
+    /// Other 4xx — permanent; retrying cannot help.
+    Permanent,
+}
+
 /// Send a message through the Bot API `sendMessage`.
+///
+/// Returns `Ok(())` on 2xx, `Err(SendFailure)` otherwise. The distinction is the
+/// outbox contract: only `Ok` may mark a row sent.
 pub async fn send_message(
     http: &reqwest::Client,
+    bot_api_base: &str,
     bot_token: &str,
     chat_id: &str,
     text: &str,
-) -> Result<()> {
-    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+) -> std::result::Result<(), SendFailure> {
+    let url = format!("{bot_api_base}/bot{bot_token}/sendMessage");
     let response = http
         .post(&url)
         .json(&serde_json::json!({
@@ -61,12 +83,35 @@ pub async fn send_message(
         }))
         .send()
         .await
-        .map_err(|e| anyhow!("telegram send failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        return Err(anyhow!("telegram send failed with status {status}"));
+        .map_err(|_| SendFailure::Transient)?;
+    let status = response.status();
+    if status.is_success() {
+        // REV-076-F03: the Bot API answers 200 with `{"ok":false,...}` for some
+        // errors. HTTP success is transport, not delivery: only `ok == true`
+        // counts, and anything else is a permanent failure (retrying a rejected
+        // request cannot help).
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| SendFailure::Transient)?;
+        if body.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+            return Ok(());
+        }
+        return Err(SendFailure::Permanent);
     }
-    Ok(())
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        return Err(SendFailure::RateLimited(retry_after));
+    }
+    if status.is_server_error() {
+        return Err(SendFailure::Transient);
+    }
+    Err(SendFailure::Permanent)
 }
 
 #[cfg(test)]

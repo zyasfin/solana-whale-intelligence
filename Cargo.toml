@@ -43,6 +43,20 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # Postgres integration tests (require DATABASE_URL / TEST_DATABASE_URL).
 pg_tests = []
 
+# REV-037-F05/F06: there is deliberately NO `test_fixtures` feature.
+#
+# REV-036 added one so integration tests could mint social-identity store rows.
+# Two things went wrong. (a) Cargo features are additive and dependency-selectable,
+# so any downstream crate could switch it on and mint authority records — the
+# reviewer did exactly that and reached `Reconstructed`. A feature is a build
+# option, never a caller authorization boundary. (b) The default `cargo test` /
+# `cargo check --all-targets` stopped compiling, because the integration test
+# needed an undocumented feature combination.
+#
+# Tests that need to mint authority now live INSIDE the crate under
+# `#[cfg(test)]` (`src/sf/recent_authority_tests.rs`), which no dependency can
+# enable and which keeps the default commands working.
+
 [dev-dependencies]
 tokio-test = "0.4"
 

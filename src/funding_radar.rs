@@ -97,9 +97,14 @@ pub fn recipient_is_fresh(event: &FundingEvent, config: &FundingRadarConfig) -> 
 /// Ingest one funding event: store the raw observation, then create or update
 /// a radar case when thresholds and freshness are satisfied.
 ///
+/// REV-080-F02: `workspace_id` is REQUIRED — the retry drain derives due intent
+/// from durable case state, and an untenanted case is derivable by every tenant.
+/// It is a parameter rather than a default for the same reason as the labels.
+///
 /// Returns the radar case when one exists after ingestion.
 pub async fn ingest_funding_event(
     db: &PgPool,
+    workspace_id: i64,
     event: FundingEvent,
     config: &FundingRadarConfig,
     percentile_threshold_sol: Option<Decimal>,
@@ -109,20 +114,20 @@ pub async fn ingest_funding_event(
 
     // Only confirmed events open radar cases (processed may reorg).
     if event.commitment < Commitment::Confirmed {
-        return fetch_case(db, event.chain, &event.to_address).await;
+        return fetch_case(db, workspace_id, event.chain, &event.to_address).await;
     }
     if !recipient_is_fresh(&event, config) {
-        return fetch_case(db, event.chain, &event.to_address).await;
+        return fetch_case(db, workspace_id, event.chain, &event.to_address).await;
     }
     if !qualifies_as_large_funding(&event, config, percentile_threshold_sol) {
-        return fetch_case(db, event.chain, &event.to_address).await;
+        return fetch_case(db, workspace_id, event.chain, &event.to_address).await;
     }
 
     // Ensure the recipient wallet row exists (FK).
     crate::db::upsert_wallet(db, event.chain.as_str(), &event.to_address, event.observed_at, "funding_radar").await?;
     crate::db::upsert_wallet(db, event.chain.as_str(), &event.from_address, event.observed_at, "funding_radar").await?;
 
-    let existing = fetch_case(db, event.chain, &event.to_address).await?;
+    let existing = fetch_case(db, workspace_id, event.chain, &event.to_address).await?;
     let window_ends = event.observed_at + chrono::Duration::days(config.preparation_window_days as i64);
 
     match existing {
@@ -144,7 +149,7 @@ pub async fn ingest_funding_event(
             .await?;
             let fanout = count_fresh_children(db, event.chain, &event.to_address, config).await?;
             update_case_fanout(db, case.id, fanout).await?;
-            fetch_case(db, event.chain, &event.to_address).await
+            fetch_case(db, workspace_id, event.chain, &event.to_address).await
         }
         _ => {
             // Create a new funded case.
@@ -152,15 +157,16 @@ pub async fn ingest_funding_event(
             let case_id: i64 = sqlx::query_scalar(
                 r#"
                 INSERT INTO funding_radar_cases
-                    (chain, recipient, first_funded_at, first_funding_usd, first_funding_native,
+                    (chain, recipient, workspace_id, first_funded_at, first_funding_usd, first_funding_native,
                      source_address, source_kind, fanout_count, deploy_window_ends_at,
                      stage, confidence, evidence)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, 0, $8, 'funded', $9, $10)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, 'funded', $10, $11)
                 RETURNING id
                 "#,
             )
             .bind(event.chain.as_str())
             .bind(&event.to_address)
+            .bind(workspace_id)
             .bind(event.observed_at)
             .bind(event.amount_usd)
             .bind(event.native_amount)
@@ -192,7 +198,7 @@ pub async fn ingest_funding_event(
                 }),
             )
             .await?;
-            fetch_case(db, event.chain, &event.to_address).await
+            fetch_case(db, workspace_id, event.chain, &event.to_address).await
         }
     }
 }
@@ -254,7 +260,7 @@ async fn count_fresh_children(
 }
 
 /// Fetch the current radar case for a recipient.
-pub async fn fetch_case(db: &PgPool, chain: ChainKind, recipient: &str) -> Result<Option<FundingRadarCase>> {
+pub async fn fetch_case(db: &PgPool, workspace_id: i64, chain: ChainKind, recipient: &str) -> Result<Option<FundingRadarCase>> {
     let row = sqlx::query_as::<
         _,
         (
@@ -279,11 +285,10 @@ pub async fn fetch_case(db: &PgPool, chain: ChainKind, recipient: &str) -> Resul
                source_address, source_kind, fanout_count, deploy_window_ends_at, stage,
                confidence, evidence, updated_at
           FROM funding_radar_cases
-         WHERE chain = $1 AND recipient = $2
-         ORDER BY id DESC
-         LIMIT 1
+         WHERE workspace_id = $1 AND chain = $2 AND recipient = $3
         "#,
     )
+    .bind(workspace_id)
     .bind(chain.as_str())
     .bind(recipient)
     .fetch_optional(db)
@@ -315,12 +320,13 @@ pub async fn fetch_case(db: &PgPool, chain: ChainKind, recipient: &str) -> Resul
 /// - A `processed`-only event never promotes a case.
 pub async fn evaluate_radar_case(
     db: &PgPool,
+    workspace_id: i64,
     chain: ChainKind,
     recipient: &str,
     now: DateTime<Utc>,
     config: &FundingRadarConfig,
 ) -> Result<FundingRadarDecision> {
-    let Some(case) = fetch_case(db, chain, recipient).await? else {
+    let Some(case) = fetch_case(db, workspace_id, chain, recipient).await? else {
         return Ok(FundingRadarDecision {
             case_id: 0,
             chain,
@@ -414,7 +420,7 @@ pub async fn evaluate_radar_case(
     if distinct_kinds.len() >= required && non_infrastructure && case.stage == RadarStage::Funded {
         let confidence = preparation_confidence(&case, config, &distinct_kinds);
         update_stage(db, case.id, RadarStage::Preparation, confidence, None).await?;
-        let updated = fetch_case(db, chain, recipient).await?.unwrap_or(case);
+        let updated = fetch_case(db, workspace_id, chain, recipient).await?.unwrap_or(case);
         let alert = if confidence >= config.preparation_alert_confidence {
             Some(RadarAlert::preparation(
                 &updated,

@@ -15,14 +15,17 @@ pub const QUEUE_FUNDING_RADAR: &str = "funding_radar";
 pub const QUEUE_TELEGRAM_INGEST: &str = "telegram_ingest";
 pub const QUEUE_SEED_SYNC: &str = "seed_sync";
 pub const QUEUE_HISTORICAL_BACKFILL: &str = "historical_backfill";
+/// Periodic signal evaluation over tracked tokens (REV-074-F02).
+pub const QUEUE_SIGNAL_EVAL: &str = "signal_eval";
 
 /// All queues in precedence order (index 0 = highest).
-pub const ALL_QUEUES: [&str; 5] = [
+pub const ALL_QUEUES: [&str; 6] = [
     QUEUE_LIVE_WATCH,
     QUEUE_FUNDING_RADAR,
     QUEUE_TELEGRAM_INGEST,
     QUEUE_SEED_SYNC,
     QUEUE_HISTORICAL_BACKFILL,
+    QUEUE_SIGNAL_EVAL,
 ];
 
 /// Runtime pause state per queue.
@@ -94,6 +97,7 @@ mod tests {
         assert_eq!(ALL_QUEUES[2], QUEUE_TELEGRAM_INGEST);
         assert_eq!(ALL_QUEUES[3], QUEUE_SEED_SYNC);
         assert_eq!(ALL_QUEUES[4], QUEUE_HISTORICAL_BACKFILL);
+        assert_eq!(ALL_QUEUES[5], QUEUE_SIGNAL_EVAL);
     }
 
     #[test]
@@ -111,7 +115,10 @@ mod tests {
     fn pausing_one_pauses_only_lowest() {
         let mut state = QueueState::new();
         state.pause_bottom_up(1);
-        assert!(state.is_paused(QUEUE_HISTORICAL_BACKFILL));
+        // REV-074-F02: `signal_eval` is the lowest-precedence queue, so the first
+        // bottom-up pause hits it; backfill pauses second.
+        assert!(state.is_paused(QUEUE_SIGNAL_EVAL));
+        assert!(!state.is_paused(QUEUE_HISTORICAL_BACKFILL));
         assert!(!state.is_paused(QUEUE_SEED_SYNC));
         assert!(!state.is_paused(QUEUE_TELEGRAM_INGEST));
         assert!(!state.is_paused(QUEUE_FUNDING_RADAR));
@@ -127,7 +134,7 @@ mod tests {
         assert!(!state.backfill_allowed(60), "lag 90s exceeds 60s threshold");
 
         state.set_lag(QUEUE_HISTORICAL_BACKFILL, 10);
-        state.pause_bottom_up(1);
+        state.pause_bottom_up(2); // signal_eval + backfill (precedence order)
         assert!(!state.backfill_allowed(60), "paused backfill never runs");
     }
 

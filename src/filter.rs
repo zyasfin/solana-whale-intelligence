@@ -82,28 +82,28 @@ pub fn classify_bot(
 ///
 /// Manual labels always win. Automatic labels are recorded with
 /// `manual = false` so they can be revoked later.
+///
+/// REV-056-F01: labels are workspace-owned, so both the manual-authority lookup and
+/// the automatic write are scoped. Reading another tenant's manual block here would let
+/// their classification silently suppress this workspace's research, and writing
+/// without an owner would recreate the unowned rows the finding is about.
 pub async fn apply_automatic_disposition(
     db: &PgPool,
+    workspace_id: i64,
     chain: ChainKind,
     address: &str,
     classification: &BotClassification,
     observed_at: DateTime<Utc>,
 ) -> Result<Disposition> {
-    // Manual authority: any active manual label for this wallet wins.
-    let manual: Option<(String,)> = sqlx::query_as(
-        r#"
-        SELECT disposition FROM wallet_labels
-         WHERE chain = $1 AND address = $2 AND manual = true
-           AND revoked_at IS NULL
-           AND (expires_at IS NULL OR expires_at > now())
-         LIMIT 1
-        "#,
-    )
-    .bind(chain.as_str())
-    .bind(address)
-    .fetch_optional(db)
-    .await?;
-    if let Some((manual_disposition,)) = manual {
+    // Manual authority: any active manual label for this wallet IN THIS WORKSPACE
+    // wins. REV-062-F06: this used to be its own `SELECT ... LIMIT 1` over manual
+    // labels, which returned an ARBITRARY row when a wallet held several manual
+    // labels (`watch` + `skip`). It now calls `manual_disposition`, the same
+    // manual-first + restrictiveness-ranking helper every other policy read uses,
+    // so a manual `skip` always beats an arbitrary `watch` and the result is
+    // caller-independent.
+    let manual = crate::db::manual_disposition(db, workspace_id, chain.as_str(), address).await?;
+    if let Some(manual_disposition) = manual {
         if let Some(disposition) = Disposition::parse(&manual_disposition) {
             return Ok(disposition);
         }
@@ -116,6 +116,7 @@ pub async fn apply_automatic_disposition(
     let kind = classification.kind.expect("auto_skip implies kind");
     crate::db::add_wallet_label(
         db,
+        workspace_id,
         chain.as_str(),
         address,
         kind.as_str(),
@@ -142,14 +143,54 @@ pub async fn apply_automatic_disposition(
     Ok(Disposition::Skip)
 }
 
-/// The effective disposition for scoring inclusion.
+/// The authoritative effective disposition for a wallet, fail-closed.
 ///
-/// `skip` wallets never contribute alpha; their funding edges are retained by
-/// the graph module regardless of this decision.
-pub fn scoring_disposition(active: Option<&str>) -> Disposition {
-    match active {
-        Some(value) => Disposition::parse(value).unwrap_or(Disposition::Watch),
-        None => Disposition::Watch,
+/// REV-067-F06: `scoring_disposition(Option<&str>)` was a pure mapper that turned an
+/// UNKNOWN value into `Watch`. Every other policy reader (`db::active_disposition`,
+/// `db::restrictiveness_rank`, `graph::trace_wallet`) treats an unrecognised
+/// disposition as an ERROR, because a label that stopped meaning the vocabulary is a
+/// schema bug and silently downgrading it to `Watch` is a policy decision made by a
+/// typo. One contract, one behaviour.
+///
+/// A store failure is likewise an error, never `Watch`: "we could not read the
+/// policy" and "the policy is watch" are different facts and only one of them
+/// permits scoring.
+///
+/// `None` (no active label) legitimately means `Watch`: nothing has classified this
+/// wallet, so it is monitored but contributes no alpha.
+pub async fn effective_disposition(
+    db: &PgPool,
+    workspace_id: i64,
+    chain: ChainKind,
+    address: &str,
+) -> Result<Disposition> {
+    match crate::db::active_disposition(db, workspace_id, chain.as_str(), address).await? {
+        Some(value) => Disposition::parse(&value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown wallet disposition '{value}'; the label vocabulary is \
+                 [skip, flow_only, watch, score]"
+            )
+        }),
+        None => Ok(Disposition::Watch),
+    }
+}
+
+impl Disposition {
+    /// May this wallet's history be deep-synced?
+    ///
+    /// `models::Disposition` declares `skip` = "excluded from deep-sync/scoring".
+    /// The contract was documented and never enforced (REV-067-F06).
+    pub fn allows_deep_sync(self) -> bool {
+        !matches!(self, Disposition::Skip)
+    }
+
+    /// May this wallet be scored / contribute alpha?
+    ///
+    /// Only `score` does. `watch` is explicitly "no scoring contribution yet",
+    /// `flow_only` is "graph edges only, excluded from alpha", `skip` is excluded
+    /// outright.
+    pub fn allows_scoring(self) -> bool {
+        matches!(self, Disposition::Score)
     }
 }
 
@@ -202,12 +243,15 @@ mod tests {
         }
     }
 
+    // REV-067-F06: the contract in `models.rs` names four dispositions and what each
+    // one permits. It was documentation only until the boundaries enforced it, so it
+    // is pinned here: `score` is the only one that may contribute alpha, and only
+    // `skip` is excluded from deep-sync.
     #[test]
-    fn unknown_wallet_defaults_to_watch() {
-        assert_eq!(scoring_disposition(None), Disposition::Watch);
-        assert_eq!(scoring_disposition(Some("skip")), Disposition::Skip);
-        assert_eq!(scoring_disposition(Some("flow_only")), Disposition::FlowOnly);
-        assert_eq!(scoring_disposition(Some("score")), Disposition::Score);
-        assert_eq!(scoring_disposition(Some("garbage")), Disposition::Watch);
+    fn the_disposition_contract_decides_deep_sync_and_scoring() {
+        assert!(Disposition::Score.allows_deep_sync() && Disposition::Score.allows_scoring());
+        assert!(Disposition::Watch.allows_deep_sync() && !Disposition::Watch.allows_scoring());
+        assert!(Disposition::FlowOnly.allows_deep_sync() && !Disposition::FlowOnly.allows_scoring());
+        assert!(!Disposition::Skip.allows_deep_sync() && !Disposition::Skip.allows_scoring());
     }
 }

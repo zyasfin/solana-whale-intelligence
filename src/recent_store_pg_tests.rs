@@ -17,7 +17,7 @@ use solana_whale_intelligence::sf::recent::{
     CapabilityStatus, Coverage, RecentConfidence, RecentEvent, RecentRelation,
 };
 use solana_whale_intelligence::sf::recent_store::{
-    fetch_recent_timeline, fetch_relations, insert_recent_event,
+    append_recent_event_if_absent, fetch_recent_timeline, fetch_relations,
 };
 
 fn event(
@@ -43,16 +43,21 @@ fn event(
         freshness: None,
         coverage: Coverage::Full,
         capability_status: CapabilityStatus::Available,
+        missing_inputs: vec![],
         retraction: None,
+        is_current_coverage: false,
     }
 }
 
 /// Typed round-trip: a non-null relation + timestamptz bind directly.
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn insert_and_fetch_typed_event(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let e = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
-    let id = insert_recent_event(&pool, 1, &e).await.expect("insert");
-    assert!(id > 0);
+    assert!(
+        append_recent_event_if_absent(&pool, 1, &e).await.expect("insert"),
+        "the first append must insert"
+    );
 
     let rows = fetch_recent_timeline(&pool, 1, "sol:AAA", "all").await.expect("fetch");
     assert_eq!(rows.len(), 1);
@@ -62,10 +67,11 @@ async fn insert_and_fetch_typed_event(pool: PgPool) {
 }
 
 /// Workspace isolation: the same token in a different workspace is not leaked.
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn workspace_isolation(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let e = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
-    insert_recent_event(&pool, 1, &e).await.expect("insert ws1");
+    append_recent_event_if_absent(&pool, 1, &e).await.expect("insert ws1");
 
     let ws2 = fetch_recent_timeline(&pool, 2, "sol:AAA", "all").await.expect("fetch ws2");
     assert!(ws2.is_empty(), "workspace 2 must not see workspace 1 rows");
@@ -73,8 +79,9 @@ async fn workspace_isolation(pool: PgPool) {
 
 /// Relation projection: multiple targets under the same relation all survive,
 /// and the stored confidence is preserved (not hard-coded `Estimated`).
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn relation_projection_preserves_confidence_and_targets(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let mut e1 = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
     e1.related_identities = vec![solana_whale_intelligence::sf::recent::IdentityKey {
         kind: solana_whale_intelligence::sf::recent::IdentityKind::Token,
@@ -85,8 +92,8 @@ async fn relation_projection_preserves_confidence_and_targets(pool: PgPool) {
         kind: solana_whale_intelligence::sf::recent::IdentityKind::Token,
         value: "sol:CCC".into(),
     }];
-    insert_recent_event(&pool, 1, &e1).await.expect("insert e1");
-    insert_recent_event(&pool, 1, &e2).await.expect("insert e2");
+    append_recent_event_if_absent(&pool, 1, &e1).await.expect("insert e1");
+    append_recent_event_if_absent(&pool, 1, &e2).await.expect("insert e2");
 
     let rels = fetch_relations(&pool, 1, "sol:AAA").await.expect("relations");
     assert_eq!(rels.len(), 2, "two SameDeployer targets must both survive");

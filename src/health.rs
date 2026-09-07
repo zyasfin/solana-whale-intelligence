@@ -111,12 +111,32 @@ pub async fn telegram_health(db: &PgPool) -> Result<TelegramHealth> {
 }
 
 /// Full health report (secrets redacted).
+/// Retention-maintenance view for the health report (REV-046-A3.4/A3.6).
+///
+/// Passed in rather than queried, because the interesting facts live in the running
+/// task, not in the database: a task that died silently leaves the tables looking
+/// perfectly normal. `None` means no maintenance task is running in this process
+/// (e.g. `serve-admin`), which is reported as `not_running` rather than as healthy.
+#[derive(Debug, Default, Clone)]
+pub struct MaintenanceView {
+    pub running: bool,
+    pub stale: bool,
+    pub last_success: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    pub rows_pruned_total: u64,
+    pub oldest_retained: Option<String>,
+    pub next_run: Option<String>,
+    pub interval_secs: i64,
+}
+
 pub async fn report(
     db: &PgPool,
     chains: Vec<ChainHealth>,
     helius_provider_count: usize,
     gmgn_configured: bool,
     gmgn_bucket_tokens: Option<f64>,
+    maintenance: Option<MaintenanceView>,
 ) -> Result<serde_json::Value> {
     let start = Instant::now();
     let db_latency = match crate::db::latency_ms(db).await {
@@ -191,6 +211,31 @@ pub async fn report(
         },
         "report_duration_ms": start.elapsed().as_secs_f64() * 1000.0,
     });
+
+    // REV-046-A3.6: a stale or failing maintenance task degrades health. Without
+    // this, a silently dead pruner looks identical to a healthy one until storage
+    // fills up — the failure has to be visible while it is still cheap to fix.
+    let mut report = report;
+    if let Some(m) = maintenance {
+        let degraded = m.stale || m.last_error.is_some();
+        report["retention"] = json!({
+            "running": m.running,
+            "stale": m.stale,
+            "interval_secs": m.interval_secs,
+            "last_success": m.last_success,
+            "last_error": m.last_error,
+            "last_error_at": m.last_error_at,
+            "rows_pruned_total": m.rows_pruned_total,
+            "oldest_retained": m.oldest_retained,
+            "next_run": m.next_run,
+        });
+        if degraded {
+            report["status"] = json!("degraded");
+        }
+    } else {
+        // Stated explicitly: this process runs no pruner. Silence would read as ok.
+        report["retention"] = json!({ "running": false, "reason": "not_running_in_this_process" });
+    }
     Ok(report)
 }
 

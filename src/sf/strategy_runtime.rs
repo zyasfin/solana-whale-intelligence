@@ -63,11 +63,17 @@ pub fn negative_findings(outcomes: &[ShadowOutcome]) -> usize {
     outcomes.iter().map(|o| o.rejected_candidates.len()).sum()
 }
 
-/// Whether a shadow outcome passed (no rejected candidates and has metrics).
+/// Whether a shadow outcome passed: no rejected candidates AND metrics present.
 /// A shadow with rejected candidates is a FAIL (fail-closed — rejection means
-/// the candidate did not survive shadow).
+/// the candidate did not survive shadow). Empty metrics are also a FAIL: an
+/// unmeasured shadow is not a passing shadow (missing != safe, principle #3).
 pub fn shadow_passed(outcome: &ShadowOutcome) -> bool {
-    !outcome.rejected_candidates.is_empty() == false && outcome.metrics != serde_json::Value::Null
+    let has_metrics = outcome
+        .metrics
+        .as_object()
+        .map(|m| !m.is_empty())
+        .unwrap_or(false);
+    outcome.rejected_candidates.is_empty() && has_metrics
 }
 
 /// Whether a paper execution produced a positive PnL (None -> false, fail-closed).
@@ -126,6 +132,26 @@ mod tests {
             rejected_candidates: vec!["cand1".into()],
         };
         assert!(!shadow_passed(&fail));
+    }
+
+    // REV-028-F11: an unmeasured shadow (empty metrics object) is NOT a pass.
+    // Missing measurement is not safety (principle #3).
+    #[test]
+    fn shadow_without_metrics_is_not_passed() {
+        let unmeasured = ShadowOutcome {
+            strategy_version_id: "v1".into(),
+            window_start: "2026-01-01".into(),
+            window_end: "2026-01-08".into(),
+            metrics: serde_json::json!({}),
+            rejected_candidates: vec![],
+        };
+        assert!(!shadow_passed(&unmeasured), "empty metrics must not pass");
+
+        let null_metrics = ShadowOutcome {
+            metrics: serde_json::Value::Null,
+            ..unmeasured.clone()
+        };
+        assert!(!shadow_passed(&null_metrics), "null metrics must not pass");
     }
 
     #[test]

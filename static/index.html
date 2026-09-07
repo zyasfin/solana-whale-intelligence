@@ -1,173 +1,360 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Signal Forge — Token Recent</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; margin: 0; background: #0d1117; color: #c9d1d9; }
-  header { padding: 16px 24px; border-bottom: 1px solid #21262d; }
-  h1 { font-size: 18px; margin: 0; }
-  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
-  form { display: flex; gap: 8px; margin-bottom: 24px; flex-wrap: wrap; }
-  input, select, button { background: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; }
-  button { cursor: pointer; }
-  .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 800px) { .panels { grid-template-columns: 1fr; } }
-  .panel { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px; }
-  .panel h2 { font-size: 14px; margin: 0 0 12px; color: #58a6ff; }
-  .event, .relation { border-top: 1px solid #21262d; padding: 8px 0; font-size: 13px; }
-  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; margin-right: 4px; }
-  .exact { background: #1f6feb33; color: #58a6ff; }
-  .reconstructed { background: #a371f733; color: #bc8cff; }
-  .estimated { background: #d2992233; color: #e3b341; }
-  .insufficient { background: #f8514933; color: #f85149; }
-  .copycat { background: #f8514933; color: #f85149; }
-  .official { background: #2ea04333; color: #3fb950; }
-  .muted { color: #8b949e; }
-  .filters { display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px; flex-wrap: wrap; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Signal Forge — Token Recent</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0;
+      background: #0d1117;
+      color: #c9d1d9;
+    }
+
+    header {
+      padding: 16px 24px;
+      border-bottom: 1px solid #21262d;
+    }
+
+    h1 {
+      font-size: 18px;
+      margin: 0;
+    }
+
+    main {
+      padding: 24px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    form {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+
+    input,
+    select,
+    button {
+      background: #161b22;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 6px 10px;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    .panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 800px) {
+      .panels {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    .panel h2 {
+      font-size: 14px;
+      margin: 0 0 12px;
+      color: #58a6ff;
+    }
+
+    .event,
+    .relation {
+      border-top: 1px solid #21262d;
+      padding: 8px 0;
+      font-size: 13px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 1px 7px;
+      border-radius: 10px;
+      font-size: 11px;
+      margin-right: 4px;
+    }
+
+    .exact {
+      background: #1f6feb33;
+      color: #58a6ff;
+    }
+
+    .reconstructed {
+      background: #a371f733;
+      color: #bc8cff;
+    }
+
+    .estimated {
+      background: #d2992233;
+      color: #e3b341;
+    }
+
+    .insufficient {
+      background: #f8514933;
+      color: #f85149;
+    }
+
+    .copycat {
+      background: #f8514933;
+      color: #f85149;
+    }
+
+    .official {
+      background: #2ea04333;
+      color: #3fb950;
+    }
+
+    .muted {
+      color: #8b949e;
+    }
+
+    .filters {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      flex-wrap: wrap;
+    }
+  </style>
 </head>
+
 <body>
-<header><h1>Signal Forge — Token Recent + Deployer/Social Reuse</h1></header>
-<main>
-  <form id="query-form">
-    <input id="chain" placeholder="chain (solana)" value="solana" size="12">
-    <input id="mint" placeholder="contract address" size="40">
-    <select id="window">
-      <option value="1h">1h</option>
-      <option value="24h" selected>24h</option>
-      <option value="7d">7d</option>
-      <option value="30d">30d</option>
-      <option value="all">all</option>
-    </select>
-    <button type="submit">Load</button>
-  </form>
+  <header>
+    <h1>Signal Forge — Token Recent + Deployer/Social Reuse</h1>
+  </header>
+  <main>
+    <form id="query-form">
+      <input id="chain" placeholder="chain (solana)" value="solana" size="12">
+      <input id="mint" placeholder="contract address" size="40">
+      <select id="window">
+        <option value="1h">1h</option>
+        <option value="24h" selected>24h</option>
+        <option value="7d">7d</option>
+        <option value="30d">30d</option>
+        <option value="all">all</option>
+      </select>
+      <button type="submit">Load</button>
+    </form>
 
-  <div class="filters" id="filters">
-    <label><input type="checkbox" data-filter="cross_chain" checked> cross-chain</label>
-    <label><input type="checkbox" data-filter="social" checked> social</label>
-    <label><input type="checkbox" data-filter="deployer" checked> deployer</label>
-  </div>
+    <!-- All five independent relation categories are user-filterable (REV-027-F09).
+       official/copycat were previously hidden by default rather than togglable. -->
+    <div class="filters" id="filters">
+      <label><input type="checkbox" data-filter="cross_chain" checked> cross-chain</label>
+      <label><input type="checkbox" data-filter="social" checked> social reuse</label>
+      <label><input type="checkbox" data-filter="deployer" checked> deployer/authority/funder</label>
+      <label><input type="checkbox" data-filter="official" checked> official CA</label>
+      <label><input type="checkbox" data-filter="copycat" checked> suspected copycat</label>
+    </div>
 
-  <div class="panels">
-    <section class="panel">
-      <h2>Token Recent Timeline</h2>
-      <div id="timeline"><span class="muted">No query yet.</span></div>
-    </section>
-    <section class="panel">
-      <h2>Deployer / Social Reuse</h2>
-      <div id="relations"><span class="muted">No query yet.</span></div>
-    </section>
-  </div>
-</main>
+    <div class="panels">
+      <section class="panel">
+        <h2>Token Recent Timeline</h2>
+        <div id="timeline"><span class="muted">No query yet.</span></div>
+      </section>
+      <section class="panel">
+        <h2>Deployer / Social Reuse</h2>
+        <div id="relations"><span class="muted">No query yet.</span></div>
+      </section>
+    </div>
+  </main>
 
-<script>
-const form = document.getElementById('query-form');
-const timeline = document.getElementById('timeline');
-const relations = document.getElementById('relations');
+  <script>
+    // REV-062-F02: the dashboard renders API data from ingest/provider/store, which
+    // is NOT trusted. Every dynamic value must be escaped before it reaches
+    // innerHTML — an injected `<img src=x onerror=...>` as an event_type, a
+    // missing-input name, or a relation value would otherwise become executable
+    // DOM in an auth-admin UI. `esc` HTML-escapes the five characters that can
+    // break out of an element or attribute.
+    function esc(v) {
+      return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
 
-function confidenceClass(c) {
-  const map = { exact: 'exact', reconstructed: 'reconstructed', estimated: 'estimated', insufficient: 'insufficient' };
-  return map[c] || 'estimated';
-}
+    const form = document.getElementById('query-form');
+    const timeline = document.getElementById('timeline');
+    const relations = document.getElementById('relations');
 
-// A relation's independent category (REV-023 §7). Categories are independent:
-// a `reused_social_link` is NOT a copycat; a `suspected_copycat` is.
-function relationCategory(rel) {
-  const r = (rel || '').toLowerCase();
-  if (r === 'cross_chain_deployment') return 'cross_chain';
-  if (r === 'official_ca_announcement') return 'official';
-  if (r === 'suspected_copycat') return 'copycat';
-  if (/^same_(social_account|deployer|authority|fee_payer|funder)$/.test(r)
-      || r === 'funded_by_known_deployer' || r === 'derivative_of'
-      || r === 'reused_social_link') {
-    if (r === 'same_social_account' || r === 'reused_social_link') return 'social';
-    return 'deployer';
-  }
-  return 'other';
-}
+    function confidenceClass(c) {
+      const map = { exact: 'exact', reconstructed: 'reconstructed', estimated: 'estimated', insufficient: 'insufficient' };
+      return map[c] || 'estimated';
+    }
 
-function relationBadge(r) {
-  const cat = relationCategory(r);
-  const isOfficial = cat === 'official';
-  const isCopycat = cat === 'copycat';
-  const cls = isOfficial ? 'official' : (isCopycat ? 'copycat' : 'estimated');
-  return `<span class="badge ${cls}">${r}</span>`;
-}
+    // A relation's independent category (REV-023 §7). Categories are independent:
+    // a `reused_social_link` is NOT a copycat; a `suspected_copycat` is.
+    function relationCategory(rel) {
+      const r = (rel || '').toLowerCase();
+      if (r === 'cross_chain_deployment') return 'cross_chain';
+      if (r === 'official_ca_announcement') return 'official';
+      if (r === 'suspected_copycat') return 'copycat';
+      if (/^same_(social_account|deployer|authority|fee_payer|funder)$/.test(r)
+        || r === 'funded_by_known_deployer' || r === 'derivative_of'
+        || r === 'reused_social_link') {
+        if (r === 'same_social_account' || r === 'reused_social_link') return 'social';
+        return 'deployer';
+      }
+      return 'other';
+    }
 
-function categoriesOf(rel) {
-  // An event/relation may belong to several independent categories.
-  const cat = relationCategory(rel);
-  return cat === 'other' ? [] : [cat];
-}
+    function relationBadge(r) {
+      const cat = relationCategory(r);
+      const isOfficial = cat === 'official';
+      const isCopycat = cat === 'copycat';
+      const cls = isOfficial ? 'official' : (isCopycat ? 'copycat' : 'estimated');
+      return `<span class="badge ${esc(cls)}">${esc(r)}</span>`;
+    }
 
-async function render() {
-  const chain = document.getElementById('chain').value.trim();
-  const mint = document.getElementById('mint').value.trim();
-  const window = document.getElementById('window').value;
-  if (!mint) { timeline.innerHTML = '<span class="muted">Enter a contract address.</span>'; relations.innerHTML = ''; return; }
+    function categoriesOf(rel) {
+      // An event/relation may belong to several independent categories.
+      const cat = relationCategory(rel);
+      return cat === 'other' ? [] : [cat];
+    }
 
-  const filterState = {};
-  document.querySelectorAll('[data-filter]').forEach(cb => filterState[cb.dataset.filter] = cb.checked);
-  const active = Object.keys(filterState).filter(k => filterState[k]);
+    async function render() {
+      const chain = document.getElementById('chain').value.trim();
+      const mint = document.getElementById('mint').value.trim();
+      const window = document.getElementById('window').value;
+      if (!mint) { timeline.innerHTML = '<span class="muted">Enter a contract address.</span>'; relations.innerHTML = ''; return; }
 
-  function passesFilters(cats) {
-    if (active.length === 0) return true; // no category filter selected -> show all
-    return cats.some(c => active.includes(c));
-  }
+      const filterState = {};
+      document.querySelectorAll('[data-filter]').forEach(cb => filterState[cb.dataset.filter] = cb.checked);
+      const active = Object.keys(filterState).filter(k => filterState[k]);
 
-  const [recentResp, relResp] = await Promise.all([
-    fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`),
-    fetch(`/api/tokens/${chain}/${mint}/relations`),
-  ]);
+      function passesFilters(cats) {
+        if (active.length === 0) return true; // no category filter selected -> show all
+        return cats.some(c => active.includes(c));
+      }
 
-  // Distinct capability/error states (REV-023 §7): never collapse a failure to
-  // "no data".
-  function renderState(resp) {
-    if (resp.ok) return null;
-    if (resp.status === 401 || resp.status === 403) return 'auth failure';
-    if (resp.status >= 500) return 'DB/API failure';
-    return 'capability unavailable';
-  }
+      // Distinct capability/error states (REV-023 §7): never collapse a failure to
+      // "no data".
+      function renderState(resp) {
+        if (resp.ok) return null;
+        if (resp.status === 401 || resp.status === 403) return 'auth failure';
+        if (resp.status >= 500) return 'DB/API failure';
+        return 'capability unavailable';
+      }
 
-  if (renderState(recentResp) || renderState(relResp)) {
-    const state = renderState(recentResp) || renderState(relResp);
-    timeline.innerHTML = `<span class="muted">${state}.</span>`;
-    relations.innerHTML = `<span class="muted">${state}.</span>`;
-    return;
-  }
+      function showState(msg) {
+        timeline.innerHTML = `<span class="muted">${msg}</span>`;
+        relations.innerHTML = `<span class="muted">${msg}</span>`;
+      }
 
-  const recent = await recentResp.json();
-  const rel = await relResp.json();
+      // REV-027-F09: fetch/network/JSON exceptions were uncaught, so a dropped
+      // connection or a malformed body left both panels showing stale content
+      // with the error only in the console. Every failure mode now surfaces as
+      // an explicit state.
+      let recent, rel;
+      try {
+        const [recentResp, relResp] = await Promise.all([
+          fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`),
+          fetch(`/api/tokens/${chain}/${mint}/relations`),
+        ]);
 
-  const recentShown = recent.filter(e => passesFilters(categoriesOf(e.relation)));
-  timeline.innerHTML = recentShown.length
-    ? recentShown.map(e => `
-      <div class="event" data-kinds="${categoriesOf(e.relation).join(' ')}">
-        <div>${relationBadge(e.relation || 'unknown')}<span class="muted">${e.event_type}</span></div>
-        <div>occurred ${e.occurred_at} · observed ${e.observed_at}</div>
-        <div class="muted">confidence: <span class="${confidenceClass(e.confidence_level)}">${e.confidence_level}</span>
-          · freshness ${e.freshness ? e.freshness.age_seconds + 's' : 'n/a'} · coverage ${e.coverage} · capability ${e.capability_status}</div>
-        <div class="muted">evidence: ${(e.evidence_refs||[]).join(', ') || 'none'}${e.dependency_group ? ' · group ' + e.dependency_group : ''}</div>
+        const state = renderState(recentResp) || renderState(relResp);
+        if (state) {
+          showState(`${state}.`);
+          return;
+        }
+
+        recent = await recentResp.json();
+        rel = await relResp.json();
+      } catch (err) {
+        const detail = err && err.message ? err.message : 'network or malformed response';
+        showState(`request failed: ${detail}`);
+        return;
+      }
+
+      if (!Array.isArray(recent) || !Array.isArray(rel)) {
+        showState('DB/API failure: unexpected response shape.');
+        return;
+      }
+
+      // A coverage disclosure carries NO relation, so it has no category and every
+      // relation-category filter would drop it — leaving the timeline showing
+      // "No recent events" for a token whose coverage is admittedly partial. That is
+      // the confusion this disclosure exists to prevent, so it is never filtered out:
+      // the category filters select among RELATIONS, and this row is not one.
+      // `isDisclosure` recognises FULL coverage too: `missing_inputs=[]` is a real
+      // disclosure of "nothing is missing", the improvement REV-058-F05 records
+      // explicitly rather than inferring from silence (REV-060-F02).
+      const isDisclosure = e => e.event_type === 'coverage_disclosure' && !e.relation;
+      const recentShown = recent.filter(e => isDisclosure(e) || passesFilters(categoriesOf(e.relation)));
+      function coverageNote(e) {
+        const missing = e.missing_inputs || [];
+        if (!missing.length) return '<div class="muted">coverage <strong>full</strong> — every authoritative input accounted for</div>';
+        return `<div class="muted">coverage <strong>partial</strong> · missing inputs: ${esc(missing.join(', '))} — absence of a relation here is NOT evidence of no reuse</div>`;
+      }
+
+      // The CURRENT coverage state is the one the SERVER marks as current, not one
+      // the UI ranks for itself.
+      //
+      // REV-060-F02: forming the union from every historical disclosure meant that on
+      // `window=all` a past degraded disclosure kept the UI saying "Coverage partial"
+      // while the newest state was full. A state has exactly one current value;
+      // history is the archive, not the answer.
+      //
+      // REV-062-F03: sorting by `occurred_at` alone is nondeterministic on a
+      // timestamp tie and `NaN`-prone on a malformed value, and the client cannot see
+      // the store's tie-breaker (`id DESC`) at all — so the UI could name a different
+      // current state than every server-side policy read. The API now ships
+      // `is_current_coverage`, decided by that canonical order, and this code just
+      // reads it. A timestamp is no longer part of the decision.
+      const currentDisclosure = recent.find(e => e.event_type === 'coverage_disclosure' && e.is_current_coverage);
+      const currentMissing = currentDisclosure ? (currentDisclosure.missing_inputs || []) : [];
+      const missingUnion = [...new Set(currentMissing)];
+
+      timeline.innerHTML = recentShown.length
+        ? recentShown.map(e => `
+      <div class="event" data-kinds="${esc(categoriesOf(e.relation).join(' '))}">
+        <div>${isDisclosure(e) ? '<span class="badge estimated">coverage limit</span>' : relationBadge(e.relation || 'unknown')}<span class="muted">${esc(e.event_type)}</span></div>
+        <div>occurred ${esc(e.occurred_at)} · observed ${esc(e.observed_at)}</div>
+        <div class="muted">confidence: <span class="${esc(confidenceClass(e.confidence_level))}">${esc(e.confidence_level)}</span>
+          · freshness ${e.freshness ? esc(e.freshness.age_seconds) + 's' : 'n/a'} · coverage ${esc(e.coverage)} · capability ${esc(e.capability_status)}</div>
+        ${coverageNote(e)}
+        <div class="muted">evidence: ${esc((e.evidence_refs || []).join(', ')) || 'none'}${e.dependency_group ? ' · group ' + esc(e.dependency_group) : ''}</div>
       </div>`).join('')
-    : '<span class="muted">No recent events.</span>';
+        : '<span class="muted">No recent events.</span>';
 
-  const relShown = rel.filter(c => passesFilters(categoriesOf(c.relation)));
-  relations.innerHTML = relShown.length
-    ? relShown.map(c => `
+      const relShown = rel.filter(c => passesFilters(categoriesOf(c.relation)));
+      relations.innerHTML = relShown.length
+        ? relShown.map(c => `
       <div class="relation">
-        <div>${relationBadge(c.relation)} → ${c.to_identity.kind}:${c.to_identity.value}</div>
-        <div class="muted">confidence <span class="${confidenceClass(c.confidence)}">${c.confidence}</span> · evidence ${(c.evidence_refs||[]).join(', ') || 'none'}</div>
+        <div>${relationBadge(c.relation)} → ${esc(c.to_identity.kind)}:${esc(c.to_identity.value)}</div>
+        <div class="muted">confidence <span class="${esc(confidenceClass(c.confidence))}">${esc(c.confidence)}</span> · evidence ${esc((c.evidence_refs || []).join(', ')) || 'none'}</div>
       </div>`).join('')
-    : '<span class="muted">No corroborated relations (same-symbol-only contracts stay unrelated).</span>';
-}
+        : (missingUnion.length
+          ? `<span class="muted">Coverage <strong>partial</strong>: ${esc(missingUnion.join(', '))} not available for this token, so deployer/authority/funder reuse was NOT evaluated. This is not a finding of "no reuse".</span>`
+          : '<span class="muted">No corroborated relations (same-symbol-only contracts stay unrelated).</span>');
+    }
 
-form.addEventListener('submit', e => { e.preventDefault(); render(); });
-document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', render));
-// Initial load (page renders on open, not only on submit).
-render();
-</script>
+    form.addEventListener('submit', e => { e.preventDefault(); render(); });
+    document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', render));
+    // Initial load (page renders on open, not only on submit).
+    render();
+  </script>
 </body>
+
 </html>

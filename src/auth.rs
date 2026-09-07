@@ -42,27 +42,172 @@ fn token_hash(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Resolve the workspace a new session should be bound to.
+///
+/// Migration 1020 added `admin_sessions.workspace_id`, and the Recent API derives
+/// the workspace from it (never a hardcoded literal). But `create_session` never
+/// populated the column, so every normal login produced a session with a NULL
+/// binding and the Recent endpoints returned 401 forever (REV-027-F04 /
+/// REV-028-F09).
+///
+/// Binding rule (single-tenant admin panel), enforced in this order:
+///   1. exactly one active workspace  -> bind to it;
+///   2. several active workspaces, one slugged `default` -> bind to `default`;
+///   3. otherwise (several actives, no `default`) -> `None`, session stays
+///      unbound and workspace-scoped APIs reject it with 401.
+///
+/// Case 3 is the point: REV-028 documented this rule but implemented
+/// `ORDER BY ... LIMIT 1`, which always picked the first active workspace and so
+/// silently bound the session to an arbitrary tenant (REV-029/REV-025-F04). The
+/// selection is now explicit — an ambiguous tenant is never guessed.
+/// The selection rule as a PURE function, so it is testable without PostgreSQL
+/// (the previous version hid the rule inside SQL, which is exactly why the
+/// implementation could drift from its own doc comment unnoticed).
+///
+/// `default_id` — id of an active workspace slugged `default`, when present.
+/// `active_ids` — ids of active workspaces, capped at 2 by the caller (only
+/// "none / one / more than one" matters).
+fn select_workspace(default_id: Option<i64>, active_ids: &[i64]) -> Option<i64> {
+    if let Some(id) = default_id {
+        return Some(id);
+    }
+    match active_ids {
+        [only] => Some(*only),
+        _ => None, // zero, or ambiguous with no `default` -> never guess
+    }
+}
+
+async fn workspace_for_new_session(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Option<i64>> {
+    // REV-045-F02 (swept beyond the reported site): a swallowed error here was
+    // fail-CLOSED in effect — the session ends up unbound, which denies rather than
+    // grants. But it was also SILENT, so a permission or connectivity failure looked
+    // identical to "no default workspace exists".
+    //
+    // REV-062-F07: the function used to return `Option<i64>` and fold a query error
+    // into `None`, which misclassifies an operational failure as "no workspace" —
+    // the session is unbound and the operator sees a 401 with no cause. It now
+    // returns `Result` so `create_session` propagates a DB error as a real failure
+    // (login returns 500) instead of silently binding an unbound session.
+    //
+    // REV-067-F07: takes a CONNECTION, not a pool, so the whole successful-login
+    // sequence can run inside ONE transaction; a pool-only signature is what forced
+    // three separately committed writes.
+    let default_id: Option<i64> =
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT id FROM workspaces WHERE status = 'active' AND slug = 'default'",
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|(id,)| id);
+
+    // Fetch two rows so "more than one" is detectable.
+    let active_ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
+        "SELECT id FROM workspaces WHERE status = 'active' ORDER BY id ASC LIMIT 2",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .map(|(id,)| id)
+    .collect();
+
+    let selected = select_workspace(default_id, &active_ids);
+    if selected.is_none() && active_ids.len() > 1 {
+        tracing::warn!(
+            active_workspaces = active_ids.len(),
+            "ambiguous workspace selection and no `default` workspace; session left unbound (fail-closed)"
+        );
+    }
+    Ok(selected)
+}
+
 /// Create a session; returns the raw token (send to client once).
+///
+/// The session is bound to a workspace at creation time so downstream
+/// workspace-scoped APIs can authorize without a literal (REV-028-F09).
 pub async fn create_session(pool: &PgPool, ip: Option<&str>, user_agent: Option<&str>) -> Result<String> {
+    let mut tx = pool.begin().await?;
+    let token = create_session_in(&mut tx, ip, user_agent).await?;
+    tx.commit().await?;
+    Ok(token)
+}
+
+/// Everything a SUCCESSFUL login writes, in ONE transaction.
+///
+/// REV-067-F07: `record_attempt(true)`, `clear_attempts`, and `create_session` used
+/// to be three separately committed statements. A failure in the second or third
+/// returned 500 with no cookie — correct as a response — while the writes that had
+/// already committed stayed. The observable result is a store whose audit trail and
+/// failure counter describe a login that, as far as the client is concerned, never
+/// happened. Either all three land or none do.
+///
+/// The rate-limit READ stays outside: it decides whether to attempt the login at
+/// all, and holding a transaction open across it would serialize every login attempt
+/// on one row for no correctness gain.
+pub async fn establish_session(
+    pool: &PgPool,
+    key: &str,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<String> {
+    let mut tx = pool.begin().await?;
+    record_attempt_in(&mut tx, key, true, ip, user_agent).await?;
+    clear_attempts_in(&mut tx, key).await?;
+    let token = create_session_in(&mut tx, ip, user_agent).await?;
+    tx.commit().await?;
+    Ok(token)
+}
+
+async fn create_session_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<String> {
     let token = new_session_token();
     let hash = token_hash(&token);
     let expires_at = Utc::now() + Duration::hours(SESSION_TTL_HOURS);
+    // REV-062-F07: a workspace-lookup DB error now propagates (the login fails with
+    // 500) rather than being folded into an unbound session, which misclassified an
+    // operational failure as "no workspace". An ambiguous/absent workspace is still
+    // NOT fatal — the legacy panel is workspace-agnostic — but a store failure is.
+    let workspace_id = workspace_for_new_session(&mut **tx).await?;
+    if workspace_id.is_none() {
+        // Not fatal for the legacy admin panel (which is workspace-agnostic), but
+        // workspace-scoped endpoints will fail closed with 401 until a workspace
+        // exists. Surface it instead of failing silently.
+        tracing::warn!(
+            "no active workspace to bind the session to; workspace-scoped APIs will reject this session"
+        );
+    }
     sqlx::query(
-        "INSERT INTO admin_sessions (token_hash, expires_at, ip, user_agent) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO admin_sessions (token_hash, expires_at, ip, user_agent, workspace_id) \
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(&hash)
     .bind(expires_at)
     .bind(ip)
     .bind(user_agent)
-    .execute(pool)
+    .bind(workspace_id)
+    .execute(&mut **tx)
     .await?;
     Ok(token)
 }
 
-/// Validate a session token; refreshes last_seen. Returns true when valid.
-pub async fn validate_session(pool: &PgPool, token: &str) -> bool {
+/// Validate a session token; refreshes last_seen. Returns `Ok(true)` when valid,
+/// `Ok(false)` when the session is invalid/expired (a normal, expected answer),
+/// and `Err(_)` when the database itself failed — a query error must NOT read as
+/// "this session is bad".
+///
+/// REV-060-F06: this used to return `bool` and turn any query error into `false`,
+/// so an outage, a missing table, or a permission denial before the policy lookup
+/// became a 401 as if the session were invalid. That masks a real failure as an
+/// authentication one, and an operator sees hundreds of 401s instead of a 500 that
+/// says the policy store is down. `None`/`false` is a client-side answer; `Err` is
+/// a server-side one, and only the former may be a 401.
+pub async fn validate_session(pool: &PgPool, token: &str) -> Result<bool> {
     if token.is_empty() {
-        return false;
+        return Ok(false);
     }
     let hash = token_hash(token);
     let result = sqlx::query(
@@ -70,20 +215,22 @@ pub async fn validate_session(pool: &PgPool, token: &str) -> bool {
     )
     .bind(&hash)
     .execute(pool)
-    .await;
-    match result {
-        Ok(r) => r.rows_affected() > 0,
-        Err(_) => false,
-    }
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
-
-/// Resolve the workspace bound to a valid session, or `None` when the session
-/// is invalid, expired, or carries no workspace binding (REV-025-F04). A
-/// workspace is derived from the authenticated session, never a hardcoded
-/// literal.
-pub async fn workspace_for_session(pool: &PgPool, token: &str) -> Option<i64> {
+/// Resolve the workspace bound to a valid session. Returns `Ok(Some(id))` when the
+/// session is valid and bound, `Ok(None)` when it is invalid, expired, or carries no
+/// workspace binding (REV-025-F04) — a normal, expected answer — and `Err(_)` when
+/// the database itself failed.
+///
+/// REV-060-F06: this used to return `Option<i64>` and `.ok().flatten()` a query error
+/// into `None`, so a DB failure before the policy lookup became a 401 exactly as if the
+/// session were invalid. `None` is a client-side answer (bad or unbound session); `Err`
+/// is a server-side one (the store is unreachable), and only the former may be a 401.
+/// A workspace is derived from the authenticated session, never a hardcoded literal.
+pub async fn workspace_for_session(pool: &PgPool, token: &str) -> Result<Option<i64>> {
     if token.is_empty() {
-        return None;
+        return Ok(None);
     }
     let hash = token_hash(token);
     let row: Option<(i64,)> = sqlx::query_as(
@@ -92,10 +239,8 @@ pub async fn workspace_for_session(pool: &PgPool, token: &str) -> Option<i64> {
     )
     .bind(&hash)
     .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
-    row.map(|(ws,)| ws)
+    .await?;
+    Ok(row.map(|(ws,)| ws))
 }
 /// Destroy a session (logout).
 pub async fn destroy_session(pool: &PgPool, token: &str) -> Result<()> {
@@ -149,6 +294,20 @@ pub async fn record_attempt(
     ip: Option<&str>,
     user_agent: Option<&str>,
 ) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    record_attempt_in(&mut tx, key, success, ip, user_agent).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `record_attempt` inside an existing transaction (REV-067-F07).
+async fn record_attempt_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+    success: bool,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO login_attempts (key, success, ip, user_agent) VALUES ($1, $2, $3, $4)",
     )
@@ -156,16 +315,27 @@ pub async fn record_attempt(
     .bind(success)
     .bind(ip)
     .bind(user_agent)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 /// Delete failed attempts for `key` (call on successful login).
 pub async fn clear_attempts(pool: &PgPool, key: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    clear_attempts_in(&mut tx, key).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `clear_attempts` inside an existing transaction (REV-067-F07).
+async fn clear_attempts_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    key: &str,
+) -> Result<()> {
     sqlx::query("DELETE FROM login_attempts WHERE key = $1 AND NOT success")
         .bind(key)
-        .execute(pool)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }
@@ -252,6 +422,21 @@ mod tests {
         assert!(session_cookie_value("tok").contains("HttpOnly"));
         assert!(clear_cookie_value().contains("Max-Age=0"));
     }
+    // REV-029/REV-025-F04: an ambiguous tenant must NEVER be guessed. REV-028
+    // documented this rule but implemented `ORDER BY ... LIMIT 1`, which always
+    // picked the first active workspace.
+    #[test]
+    fn ambiguous_workspace_selection_fails_closed() {
+        // Exactly one active workspace -> unambiguous, bind it.
+        assert_eq!(select_workspace(None, &[7]), Some(7));
+        // A `default` workspace always wins, even with several actives.
+        assert_eq!(select_workspace(Some(3), &[1, 2]), Some(3));
+        // Several actives and NO `default` -> unbound, never the first one.
+        assert_eq!(select_workspace(None, &[1, 2]), None);
+        // No workspace at all -> unbound.
+        assert_eq!(select_workspace(None, &[]), None);
+    }
+
     #[test]
     fn rate_limit_key_formats() {
         assert_eq!(rate_limit_key(Some("1.2.3.4")), "ip:1.2.3.4");

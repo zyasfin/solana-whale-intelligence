@@ -61,8 +61,9 @@ fn funding_event(
     }
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn funded_case_and_watch_alert(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let pool = pool;
     let recipient = format!("FreshRecipient{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let event = funding_event(
@@ -74,7 +75,7 @@ async fn funded_case_and_watch_alert(pool: PgPool) {
         Commitment::Confirmed,
         None,
     );
-    let case = ingest_funding_event(&pool, event, &config(), None).await.unwrap();
+    let case = ingest_funding_event(&pool, 1, event, &config(), None).await.unwrap();
     let case = case.expect("confirmed large funding creates a case");
     assert_eq!(case.stage, RadarStage::Funded);
     assert_eq!(case.chain, ChainKind::Solana);
@@ -82,7 +83,7 @@ async fn funded_case_and_watch_alert(pool: PgPool) {
     assert_eq!(case.confidence, 55);
 
     // funding_watch evidence recorded.
-    let decision = evaluate_radar_case(&pool, ChainKind::Solana, &recipient, Utc::now(), &config())
+    let decision = evaluate_radar_case(&pool, 1, ChainKind::Solana, &recipient, Utc::now(), &config())
         .await
         .unwrap();
     assert_eq!(decision.case_id, case.id);
@@ -91,8 +92,9 @@ async fn funded_case_and_watch_alert(pool: PgPool) {
     assert!(decision.alert.is_none(), "no preparation alert from one transfer");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn one_transfer_never_promotes(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("SingleTransfer{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let event = funding_event(
         "sig-pg-2",
@@ -103,15 +105,16 @@ async fn one_transfer_never_promotes(pool: PgPool) {
         Commitment::Confirmed,
         None,
     );
-    ingest_funding_event(&pool, event, &config(), None).await.unwrap();
-    let decision = evaluate_radar_case(&pool, ChainKind::Solana, &recipient, Utc::now(), &config())
+    ingest_funding_event(&pool, 1, event, &config(), None).await.unwrap();
+    let decision = evaluate_radar_case(&pool, 1, ChainKind::Solana, &recipient, Utc::now(), &config())
         .await
         .unwrap();
     assert_eq!(decision.stage, RadarStage::Funded, "one transfer alone never promotes");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn second_evidence_promotes_preparation_with_alert(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("PreparationWallet{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let first = funding_event(
         "sig-pg-3a",
@@ -122,7 +125,7 @@ async fn second_evidence_promotes_preparation_with_alert(pool: PgPool) {
         Commitment::Confirmed,
         None,
     );
-    let case = ingest_funding_event(&pool, first, &config(), None)
+    let case = ingest_funding_event(&pool, 1, first, &config(), None)
         .await
         .unwrap()
         .expect("case created");
@@ -138,7 +141,7 @@ async fn second_evidence_promotes_preparation_with_alert(pool: PgPool) {
     .await
     .unwrap();
 
-    let decision = evaluate_radar_case(&pool, ChainKind::Solana, &recipient, Utc::now(), &config())
+    let decision = evaluate_radar_case(&pool, 1, ChainKind::Solana, &recipient, Utc::now(), &config())
         .await
         .unwrap();
     assert_eq!(decision.stage, RadarStage::Preparation);
@@ -147,8 +150,9 @@ async fn second_evidence_promotes_preparation_with_alert(pool: PgPool) {
     assert!(alert.message.contains("possible project preparation"));
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn deployment_link_promotes_to_deployed(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("DeployWallet{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let first = funding_event(
         "sig-pg-4",
@@ -159,7 +163,7 @@ async fn deployment_link_promotes_to_deployed(pool: PgPool) {
         Commitment::Confirmed,
         None,
     );
-    let case = ingest_funding_event(&pool, first, &config(), None)
+    let case = ingest_funding_event(&pool, 1, first, &config(), None)
         .await
         .unwrap()
         .expect("case created");
@@ -167,14 +171,15 @@ async fn deployment_link_promotes_to_deployed(pool: PgPool) {
     link_deployment(&pool, case.id, "deploy-sig-1", "MintAddressDeployed", Utc::now())
         .await
         .unwrap();
-    let decision = evaluate_radar_case(&pool, ChainKind::Solana, &recipient, Utc::now(), &config())
+    let decision = evaluate_radar_case(&pool, 1, ChainKind::Solana, &recipient, Utc::now(), &config())
         .await
         .unwrap();
     assert_eq!(decision.stage, RadarStage::Deployed);
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn expired_window_dismisses_with_history_retained(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("ExpiryWallet{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let mut event = funding_event(
         "sig-pg-5",
@@ -187,12 +192,12 @@ async fn expired_window_dismisses_with_history_retained(pool: PgPool) {
     );
     // Backdate the first funding beyond the 7-day window.
     event.observed_at = Utc::now() - Duration::days(10);
-    let case = ingest_funding_event(&pool, event, &config(), None)
+    let case = ingest_funding_event(&pool, 1, event, &config(), None)
         .await
         .unwrap()
         .expect("case created");
 
-    let decision = evaluate_radar_case(&pool, ChainKind::Solana, &recipient, Utc::now(), &config())
+    let decision = evaluate_radar_case(&pool, 1, ChainKind::Solana, &recipient, Utc::now(), &config())
         .await
         .unwrap();
     assert_eq!(decision.stage, RadarStage::Dismissed);
@@ -207,8 +212,9 @@ async fn expired_window_dismisses_with_history_retained(pool: PgPool) {
     assert!(events >= 1, "radar event history retained after dismissal");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn processed_only_event_never_promotes(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("ProcessedWallet{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let event = funding_event(
         "sig-pg-6",
@@ -219,7 +225,7 @@ async fn processed_only_event_never_promotes(pool: PgPool) {
         Commitment::Processed,
         None,
     );
-    let case = ingest_funding_event(&pool, event, &config(), None).await.unwrap();
+    let case = ingest_funding_event(&pool, 1, event, &config(), None).await.unwrap();
     assert!(case.is_none(), "processed commitment cannot open a case");
 
     // Raw observation still stored for later confirmation.
@@ -232,8 +238,9 @@ async fn processed_only_event_never_promotes(pool: PgPool) {
     assert_eq!(stored, 1, "raw funding observation retained");
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = false)]
 async fn infrastructure_source_retained_but_no_alpha(pool: PgPool) {
+    crate::pg_test_support::migrate_scratch(&pool).await;
     let recipient = format!("InfraWallet{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
     let event = funding_event(
         "sig-pg-7",
@@ -244,7 +251,7 @@ async fn infrastructure_source_retained_but_no_alpha(pool: PgPool) {
         Commitment::Confirmed,
         Some(WalletLabelKind::Bridge),
     );
-    let case = ingest_funding_event(&pool, event, &config(), None)
+    let case = ingest_funding_event(&pool, 1, event, &config(), None)
         .await
         .unwrap()
         .expect("case created for infrastructure source");

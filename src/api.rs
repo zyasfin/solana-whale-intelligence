@@ -53,10 +53,20 @@ impl FromRequestParts<ApiState> for Workspace {
         let Some(token) = token else {
             return Err(StatusCode::UNAUTHORIZED);
         };
-        crate::auth::workspace_for_session(&state.pool, &token)
-            .await
-            .map(Workspace)
-            .ok_or(StatusCode::UNAUTHORIZED)
+        match crate::auth::workspace_for_session(&state.pool, &token).await {
+            Ok(Some(id)) => Ok(Workspace(id)),
+            // `None` is a genuine "bad/unbound session" -> 401.
+            Ok(None) => Err(StatusCode::UNAUTHORIZED),
+            // A DB failure is a server-side problem, not a bad session: it must not
+            // be reported as 401 (REV-060-F06).
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "workspace lookup failed; refusing to report a session as invalid"
+                );
+                Err(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        }
     }
 }
 
@@ -202,20 +212,25 @@ struct WalletQuery {
 
 async fn api_wallets(
     State(state): State<ApiState>,
+    Workspace(workspace_id): Workspace,
     Query(query): Query<WalletQuery>,
 ) -> Result<Json<Vec<WalletRow>>, StatusCode> {
-    let chain = query
-        .chain
-        .as_deref()
-        .and_then(ChainKind::parse)
-        .map(|c| c.as_str())
-        .unwrap_or("solana")
-        .to_string();
+    // REV-056-F04: an EXPLICIT invalid chain must be rejected, not silently replaced.
+    //
+    // The previous `.and_then(parse).unwrap_or("solana")` collapsed three different
+    // inputs into one answer: absent (default), valid alias (canonical), and INVALID
+    // (also Solana). So `?chain=bogus` returned Solana rows as if they were the
+    // requested chain's — data attributed to a chain the caller never asked for.
+    let chain = match query.chain.as_deref() {
+        None => crate::models::ChainKind::Solana,
+        Some(raw) => ChainKind::parse(raw).ok_or(StatusCode::BAD_REQUEST)?,
+    };
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let rows = sqlx::query_as::<_, (String, String, DateTime<Utc>, DateTime<Utc>, String)>(
         "SELECT chain, address, first_seen, last_seen, source FROM wallets WHERE chain = $1 ORDER BY last_seen DESC LIMIT $2",
     )
-    .bind(&chain)
+    // Canonical spelling, so `?chain=sol` is not a false-empty page.
+    .bind(chain.as_str())
     .bind(limit)
     .fetch_all(&state.pool)
     .await
@@ -223,10 +238,26 @@ async fn api_wallets(
 
     let mut out = Vec::with_capacity(rows.len());
     for (chain, address, first_seen, last_seen, source) in rows {
-        let disposition = crate::db::active_disposition(&state.pool, &chain, &address)
-            .await
-            .ok()
-            .flatten();
+        // REV-056-F01: the disposition comes from workspace-owned labels only.
+        //
+        // REV-058-F07: a FAILED lookup is not an absent label. `.ok().flatten()` turned
+        // a permission error, a schema mismatch, or a dropped connection into
+        // `disposition: null` inside a 200 response — so a `skip` safety classification
+        // silently disappeared and the wallet looked unclassified. The error is
+        // propagated: a client that cannot be told the policy must be told nothing at
+        // all, never the opposite of the truth.
+        let disposition =
+            crate::db::active_disposition(&state.pool, workspace_id, &chain, &address)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        address = %crate::models::short_addr(&address),
+                        error = %e,
+                        "active-disposition lookup failed; refusing to report the wallet \
+                         as unclassified"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
         out.push(WalletRow {
             chain,
             address,
@@ -279,6 +310,16 @@ async fn api_wallet_scores(
 
 async fn api_wallet_labels(
     State(state): State<ApiState>,
+    // REV-058-F01 (HIGH): this handler had NO `Workspace` extractor, so it was both
+    // unauthenticated and unscoped. The reviewer read workspace A's private label with
+    // no session at all, and again from a workspace B session.
+    //
+    // REV-057 bound the four ADMIN label routes and I concluded the boundary was
+    // closed. It was not: the read API serves the same table through its own handler,
+    // and I never enumerated the consumers — I fixed the ones the finding named. The
+    // extractor is the authentication too: `Workspace::from_request_parts` rejects a
+    // missing or unbound session with 401.
+    Workspace(workspace_id): Workspace,
     Path((chain, address)): Path<(String, String)>,
 ) -> Result<Json<Vec<LabelRow>>, StatusCode> {
     let Some(chain) = ChainKind::parse(&chain) else {
@@ -286,13 +327,19 @@ async fn api_wallet_labels(
     };
     let rows = sqlx::query_as::<_, (String, String, bool, i32, bool)>(
         r#"
-        SELECT kind, disposition, manual, confidence, revoked_at IS NULL AS active
+        SELECT kind, disposition, manual, confidence,
+               -- REV-058-F02 (same class): `active` must mean what every POLICY query
+               -- means by it. Computing it as `revoked_at IS NULL` reported an EXPIRED
+               -- label as active, so the UI showed a wallet as blocked while
+               -- `active_disposition`/`trace_wallet` had already stopped honouring it.
+               (revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())) AS active
           FROM wallet_labels
-         WHERE chain = $1 AND address = $2
+         WHERE workspace_id = $1 AND chain = $2 AND address = $3
          ORDER BY created_at DESC
          LIMIT 200
         "#,
     )
+    .bind(workspace_id)
     .bind(chain.as_str())
     .bind(&address)
     .fetch_all(&state.pool)
@@ -384,14 +431,20 @@ async fn api_token_recent(
     Query(query): Query<RecentQuery>,
 ) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::RecentEvent>>, StatusCode> {
     // Canonical chain parsing: an invalid chain returns 400 (REV-023 §1).
-    if crate::models::ChainKind::parse(&chain).is_none() {
+    //
+    // REV-053-F03: the parse result must BUILD the key. The first version validated
+    // `chain` and then interpolated the RAW path segment, so an accepted alias queried
+    // a storage key that is never written: `/solana/<mint>` returned the row and
+    // `/sol/<mint>` returned `[]` with status 200. A false-empty answer is worse than
+    // a rejection, because a caller reads it as "no events".
+    let Some(chain) = crate::models::ChainKind::parse(&chain) else {
         return Err(StatusCode::BAD_REQUEST);
-    }
+    };
     let window = query.window.as_deref().unwrap_or("24h");
     if !matches!(window, "1h" | "24h" | "7d" | "30d" | "all") {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let token_identity = format!("{chain}:{mint}");
+    let token_identity = format!("{}:{}", chain.as_str(), mint);
     let events = solana_whale_intelligence::sf::recent_store::fetch_recent_timeline(
         &state.pool,
         workspace_id,
@@ -408,10 +461,11 @@ async fn api_token_relations(
     Workspace(workspace_id): Workspace,
     Path((chain, mint)): Path<(String, String)>,
 ) -> Result<Json<Vec<solana_whale_intelligence::sf::recent::CandidateRelation>>, StatusCode> {
-    if crate::models::ChainKind::parse(&chain).is_none() {
+    // REV-053-F03: canonical key, same reason as `api_token_recent`.
+    let Some(chain) = crate::models::ChainKind::parse(&chain) else {
         return Err(StatusCode::BAD_REQUEST);
-    }
-    let token_identity = format!("{chain}:{mint}");
+    };
+    let token_identity = format!("{}:{}", chain.as_str(), mint);
     let relations = solana_whale_intelligence::sf::recent_store::fetch_relations(
         &state.pool,
         workspace_id,
@@ -511,8 +565,13 @@ async fn api_radar_case(
     })))
 }
 
+/// REV-072-F06 (HIGH): signals are workspace-owned, and the workspace comes from the
+/// authenticated session. Acceptance depends on workspace-scoped policy, so this
+/// endpoint used to publish one tenant's policy outcome to every other tenant — and
+/// it could not filter, because ownership was never stored (migration 1032 stores it).
 async fn api_signals(
     State(state): State<ApiState>,
+    Workspace(workspace_id): Workspace,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<SignalRow>>, StatusCode> {
     let kind = query.get("kind").cloned();
@@ -525,11 +584,13 @@ async fn api_signals(
         r#"
         SELECT id, chain, mint, signal_kind, score, status, created_at
           FROM signals
-         WHERE ($1::text IS NULL OR signal_kind = $1)
+         WHERE workspace_id = $1
+           AND ($2::text IS NULL OR signal_kind = $2)
          ORDER BY created_at DESC
-         LIMIT $2
+         LIMIT $3
         "#,
     )
+    .bind(workspace_id)
     .bind(kind)
     .bind(limit)
     .fetch_all(&state.pool)
@@ -550,8 +611,11 @@ async fn api_signals(
     Ok(Json(out))
 }
 
+/// REV-072-F06: a rejection code is a policy answer and belongs to the tenant whose
+/// policy produced it.
 async fn api_signal_rejections(
     State(state): State<ApiState>,
+    Workspace(workspace_id): Workspace,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<RejectionRow>>, StatusCode> {
     let limit = query
@@ -563,11 +627,13 @@ async fn api_signal_rejections(
         r#"
         SELECT chain, mint, signal_kind, rejection_code, evaluated_at
           FROM signal_evaluations
-         WHERE status = 'rejected' AND rejection_code IS NOT NULL
+         WHERE workspace_id = $1
+           AND status = 'rejected' AND rejection_code IS NOT NULL
          ORDER BY evaluated_at DESC
-         LIMIT $1
+         LIMIT $2
         "#,
     )
+    .bind(workspace_id)
     .bind(limit)
     .fetch_all(&state.pool)
     .await
@@ -659,5 +725,70 @@ mod tests {
         assert_eq!(ChainKind::parse("sol"), Some(ChainKind::Solana));
         assert_eq!(ChainKind::parse("robinhood"), Some(ChainKind::Robinhood));
         assert_eq!(ChainKind::parse("bogus"), None);
+    }
+
+    // REV-062-F02: the dashboard rendered API values (event_type, timestamps,
+    // missing_inputs, evidence refs, dependency group, relation target/kind) into
+    // `innerHTML` through template strings with no escaping, so a store/provider
+    // value like `<img src=x onerror=...>` became executable DOM in an
+    // authenticated admin UI. A real-browser probe against this file confirmed the
+    // pre-fix renderer fired an injected handler 11 times and the fixed one 0.
+    //
+    // This guard is the STRUCTURAL half of that proof: it fails if any dynamic
+    // interpolation in a template literal is reintroduced unescaped. It is not a
+    // substitute for the DOM probe — it is what keeps the fix from silently
+    // regressing in a build with no browser available.
+    #[test]
+    fn dashboard_never_interpolates_unescaped_api_values_into_html() {
+        // Every field a hostile ingest/provider value can reach. Each must appear
+        // ONLY inside an `esc(...)` call when interpolated into markup.
+        let dynamic_fields = [
+            "e.event_type",
+            "e.occurred_at",
+            "e.observed_at",
+            "e.confidence_level",
+            "e.coverage",
+            "e.capability_status",
+            "e.dependency_group",
+            "c.to_identity.kind",
+            "c.to_identity.value",
+            "c.confidence",
+        ];
+        for field in dynamic_fields {
+            let bare = format!("${{{field}}}");
+            assert!(
+                !DASHBOARD_HTML.contains(&bare),
+                "`{bare}` is interpolated into innerHTML without escaping; a \
+                 provider/store value containing HTML would become executable DOM \
+                 (REV-062-F02). Wrap it in `esc(...)`."
+            );
+        }
+
+        // The joined collections must be escaped too: a single hostile ref inside
+        // the list is enough.
+        for bare in [
+            "${missing.join(', ')}",
+            "${(e.evidence_refs || []).join(', ')}",
+            "${(c.evidence_refs || []).join(', ')}",
+            "${missingUnion.join(', ')}",
+        ] {
+            assert!(
+                !DASHBOARD_HTML.contains(bare),
+                "`{bare}` reaches innerHTML unescaped (REV-062-F02)"
+            );
+        }
+
+        // And the escape helper itself must still exist and cover the characters
+        // that break out of an element or an attribute.
+        assert!(
+            DASHBOARD_HTML.contains("function esc("),
+            "the dashboard escape helper is gone; every dynamic value would be raw HTML"
+        );
+        for entity in ["&amp;", "&lt;", "&gt;", "&quot;", "&#39;"] {
+            assert!(
+                DASHBOARD_HTML.contains(entity),
+                "`esc` must map to {entity}; an incomplete escape still allows breakout"
+            );
+        }
     }
 }

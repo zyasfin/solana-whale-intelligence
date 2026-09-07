@@ -452,6 +452,14 @@ pub struct ServerConfig {
 pub struct AppConfig {
     #[serde(default = "default_runtime_profile")]
     pub runtime_profile: RuntimeProfile,
+    /// Workspace this process operates in (REV-046-A4).
+    ///
+    /// The job context for worker runs: bound once at startup and validated, so no
+    /// provider payload or request body can steer which tenant resolved
+    /// intelligence lands in. Defaults to the `default` workspace created by
+    /// migration 1019.
+    #[serde(default = "default_workspace_id")]
+    pub workspace_id: i64,
     #[serde(default)]
     pub chains: ChainsConfig,
     #[serde(default)]
@@ -480,10 +488,16 @@ fn default_runtime_profile() -> RuntimeProfile {
     RuntimeProfile::Low
 }
 
+/// The `default` workspace seeded by migration 1019.
+fn default_workspace_id() -> i64 {
+    1
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             runtime_profile: default_runtime_profile(),
+            workspace_id: default_workspace_id(),
             chains: ChainsConfig::default(),
             helius: HeliusConfig::default(),
             gmgn: GmgnConfig::default(),
@@ -503,6 +517,16 @@ impl Default for AppConfig {
 #[derive(Clone, Debug, Default)]
 pub struct EnvConfig {
     pub database_url: Option<String>,
+    /// Credentials used ONLY to apply migrations (DDL + role creation).
+    ///
+    /// REV-035-#1: `DATABASE_URL` is documented as the least-privilege runtime
+    /// role, but every startup path — including `Command::Run` — called
+    /// `db::migrate()` on that same pool, so the documented credential made the
+    /// service fail to start with `permission denied for schema public`. Migration
+    /// is a privileged, occasional operation and now carries its own credential.
+    /// When unset, `db migrate` falls back to `DATABASE_URL` so a single-role
+    /// development setup keeps working.
+    pub migration_database_url: Option<String>,
     pub helius_keys: Vec<String>,
     pub gmgn_api_key: Option<String>,
     pub tg_api_id: Option<i64>,
@@ -529,6 +553,9 @@ impl EnvConfig {
         let parse_i64 = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<i64>().ok());
         Self {
             database_url: std::env::var("DATABASE_URL").ok().filter(|v| !v.trim().is_empty()),
+            migration_database_url: std::env::var("MIGRATION_DATABASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             helius_keys,
             gmgn_api_key: std::env::var("GMGN_API_KEY").ok().filter(|v| !v.trim().is_empty()),
             tg_api_id: parse_i64("TG_API_ID"),
