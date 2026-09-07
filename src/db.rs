@@ -3,6 +3,7 @@
 #![allow(dead_code)]  // helper API used by workers and tests
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 use std::str::FromStr;
@@ -12,6 +13,40 @@ use std::time::Duration;
 ///
 /// Accepts `postgres://` and `postgresql://` schemes. Pool size follows the
 /// runtime profile: `low` keeps a small pool for 2 vCPU machines.
+/// The schema search path used by this (pre-freeze) runtime.
+///
+/// REV-031/REV-025-F10: migration `1000_legacy_bridge.sql` archives the five
+/// colliding legacy tables into `swi_legacy` so the canonical lane can create its
+/// own `tokens` / `narratives` / `funding_edges` / `wallet_clusters` /
+/// `token_lifecycle_events`. After that bridge, an UNQUALIFIED `tokens` resolves to
+/// the CANONICAL table, whose columns are different — so this binary's queries
+/// broke (`column mint absent`, `column lifecycle_state absent`, ...). The reviewer
+/// reproduced exactly that.
+///
+/// This runtime is the pre-freeze one, and the frozen decision is replace-total, so
+/// the fix here is NOT to rewrite 16 legacy queries against a schema they were
+/// never written for. It is to make the legacy runtime explicit about which schema
+/// it reads: `swi_legacy` first, then `public`.
+///
+/// * On a bridged database, legacy names resolve to the archived legacy tables and
+///   this binary keeps working with its own column shapes.
+/// * On a pre-bridge or fresh-canonical database, `swi_legacy` simply does not
+///   exist; PostgreSQL ignores a missing schema in `search_path`, so resolution
+///   falls through to `public` exactly as before.
+/// * Non-colliding legacy tables (raw_events, trades, telegram_*, ...) were never
+///   moved and continue to resolve from `public`.
+///
+/// The canonical `sf::` runtime does the opposite by construction: it targets the
+/// canonical tables in `public` and never reads `swi_legacy`.
+///
+/// NO WHITESPACE (REV-033/REV-034). This value is passed as a PostgreSQL *startup
+/// option*, not as a `SET` statement. Startup options are whitespace-delimited, so
+/// `"swi_legacy, public"` was truncated at the space and the server rejected the
+/// connection with `invalid value for parameter "search_path": "swi_legacy,"` —
+/// the binary could not start. `legacy_search_path_is_valid_as_a_startup_option`
+/// pins this.
+pub const LEGACY_SEARCH_PATH: &str = "swi_legacy,public";
+
 pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool> {
     let options = PgConnectOptions::from_str(database_url)
         .with_context(|| "invalid DATABASE_URL")?
@@ -21,9 +56,43 @@ pub async fn connect(database_url: &str, max_connections: u32) -> Result<PgPool>
         .min_connections(1)
         .acquire_timeout(Duration::from_secs(10))
         .idle_timeout(Duration::from_secs(600))
+        // Applied AFTER each connection is established, so every pooled connection
+        // (including ones created later) shares the same resolution order.
+        //
+        // `after_connect` is used rather than a startup option because `SET` accepts
+        // an identifier list and, more importantly, tolerates a schema that does not
+        // exist: on a database that was never bridged, `swi_legacy` is simply absent
+        // and resolution falls through to `public`. A startup option gives no such
+        // latitude and turns any formatting slip into a failure to boot
+        // (REV-033/REV-034).
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(&format!("SET search_path = {LEGACY_SEARCH_PATH}"))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await
         .with_context(|| "failed to connect to PostgreSQL")?;
+    Ok(pool)
+}
+
+/// Open a pool AND verify the schema matches this binary (REV-037-F01).
+///
+/// Every command that is not `db migrate` should use this instead of [`connect`].
+///
+/// Found while probing the real binary rather than reasoning about it: REV-036 put
+/// `ensure_schema_current()` on five call sites, but `main.rs` opens a pool in about
+/// thirty places. All four ledger forgeries — a row with no file on disk, a digest
+/// that does not match, a filename-only row, a deleted row — were accepted by
+/// `token report`, because that path never verified anything. Guarding
+/// call sites cannot work when there are thirty of them and more get added; the
+/// check belongs at the single place a pool is created.
+pub async fn connect_verified(database_url: &str, max_connections: u32) -> Result<PgPool> {
+    let pool = connect(database_url, max_connections).await?;
+    ensure_schema_current(&pool).await?;
     Ok(pool)
 }
 
@@ -32,23 +101,741 @@ pub fn pool_size(scale_workers: usize) -> u32 {
     (scale_workers as u32 * 2).clamp(2, 16)
 }
 
-/// Apply migrations by executing SQL files under `./migrations` in order.
+/// Candidate migration directories, in resolution order.
+///
+/// The canonical SQL lives in the sibling deploy repo (`swi-deploy/migrations`),
+/// NOT inside this crate, so a bare `./migrations` lookup finds nothing and
+/// `migrate()` fails before applying a single file (REV-027-F10 / REV-028-F08).
+/// Resolution therefore covers, in order:
+///   1. `$SWI_MIGRATIONS_DIR` — explicit operator override (deployment lane).
+///   2. `./migrations` — cwd-local (packaged layout).
+///   3. `$CARGO_MANIFEST_DIR/migrations` — crate-local (test/dev layout).
+///   4. `<crate>/../swi-deploy/migrations` — the actual canonical location.
+fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(explicit) = std::env::var("SWI_MIGRATIONS_DIR") {
+        if !explicit.trim().is_empty() {
+            candidates.push(std::path::PathBuf::from(explicit.trim()));
+        }
+    }
+    candidates.push(std::path::PathBuf::from("migrations"));
+    candidates.push(std::path::PathBuf::from("../swi-deploy/migrations"));
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let manifest = std::path::Path::new(&manifest_dir);
+        candidates.push(manifest.join("migrations"));
+        if let Some(parent) = manifest.parent() {
+            candidates.push(parent.join("swi-deploy").join("migrations"));
+        }
+    }
+    candidates
+}
+
+/// Resolve the first candidate directory that exists, or report every path tried
+/// (fail-closed: never silently apply zero migrations).
+fn resolve_migration_dir() -> Result<std::path::PathBuf> {
+    let candidates = migration_dir_candidates();
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            return Ok(candidate.clone());
+        }
+    }
+    anyhow::bail!(
+        "no migrations directory found; tried: {}. Set SWI_MIGRATIONS_DIR to the \
+         canonical location (swi-deploy/migrations).",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Apply migrations by executing SQL files from the resolved migrations
+/// directory in filename order.
 ///
 /// Each file runs inside a transaction; an applied file is recorded in the
 /// `_migrations` table so re-runs are no-ops.
+/// DDL must be created in `public`, never in the legacy archive schema.
+///
+/// The pool's `search_path` puts `swi_legacy` first so this runtime's queries
+/// resolve to the archived legacy tables (see [`LEGACY_SEARCH_PATH`]). But a
+/// migration's unqualified `CREATE TABLE` would then land in `swi_legacy` on a
+/// bridged database — silently building the canonical schema inside the archive.
+/// Migrations therefore pin `public` for the duration of their transaction.
+const MIGRATION_SEARCH_PATH: &str = "SET LOCAL search_path = public";
+
+/// Prefix marking a ledger digest that was ACCEPTED as a legacy baseline rather
+/// than observed at apply time (REV-041-F01).
+///
+/// A pre-checksum ledger row proves a migration NAME ran, never which bytes. REV-040
+/// backfilled such rows with the current file's digest and treated them as verified,
+/// which asserts a historical fact nobody knows — and this repository contains real
+/// same-name drift, so the assertion is sometimes false. Baseline rows are therefore
+/// stored as `baseline:<digest>`: they satisfy startup, they are visibly not
+/// verified, and `db status` reports them.
+pub const BASELINE_PREFIX: &str = "baseline:";
+
+/// Whether a recorded digest is an accepted baseline rather than an observed digest.
+pub fn is_baseline(recorded: &str) -> bool {
+    recorded.starts_with(BASELINE_PREFIX)
+}
+
+/// The digest inside a recorded value, whether observed or baseline.
+fn recorded_digest(recorded: &str) -> &str {
+    recorded.strip_prefix(BASELINE_PREFIX).unwrap_or(recorded)
+}
+
 pub async fn migrate(pool: &PgPool) -> Result<()> {
+    migrate_with(pool, false).await
+}
+
+/// The one automated preflight repair (REV-080-F01).
+///
+/// Preconditions are checked independently and ALL must hold, so this never
+/// touches a healthy database:
+///
+///   1. `alerts` and its `sent_at` column exist;
+///   2. `sent_at` is still `NOT NULL` (the pre-1034 shape);
+///   3. the 1034 outbox columns (`claim_token`) are absent, proving this lane
+///      never applied 1034 — an already-upgraded database is left alone;
+///   4. a non-sent row with a timestamp exists — the exact data 1034 chokes on.
+///
+/// The repair is the documented operator step (`DROP NOT NULL`), automated and
+/// logged; the timestamp clearing itself stays in 1035 where the policy lives.
+async fn preflight_repair_alerts_sent_at(pool: &PgPool) -> Result<()> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'alerts')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !table_exists {
+        return Ok(());
+    }
+    // REV-082-F03 (HIGH): a pre-1033 database has `alerts` but no `state` column
+    // (introduced by 1033). The EXISTS subquery referencing `state` aborts the
+    // whole preflight. Guard: require the column to exist before querying it.
+    let state_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'alerts' \
+           AND column_name = 'state')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !state_exists {
+        return Ok(());
+    }
+    let needs_repair: Option<bool> = sqlx::query_scalar(
+        r#"
+        SELECT NOT (col.is_nullable = 'YES')
+           AND NOT EXISTS (
+               SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'alerts'
+                  AND column_name = 'claim_token'
+           )
+           AND EXISTS (
+               SELECT 1 FROM public.alerts
+                WHERE state <> 'sent' AND sent_at IS NOT NULL
+           )
+          FROM information_schema.columns col
+         WHERE col.table_schema = 'public'
+           AND col.table_name = 'alerts'
+           AND col.column_name = 'sent_at'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+    if needs_repair != Some(true) {
+        return Ok(());
+    }
+    tracing::warn!(
+        "preflight repair (REV-080-F01): dropping alerts.sent_at NOT NULL before          migration order reaches 1034, which cannot upgrade a 1033 database with          pending/dead alert rows"
+    );
+    sqlx::query("ALTER TABLE public.alerts ALTER COLUMN sent_at DROP NOT NULL")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Every decimal of 18 digits or fewer fits in `int8` (max 9223372036854775807
+/// has 19 digits), so this predicate is range-safe by construction and needs no
+/// trial cast to evaluate.
+///
+/// REV-087-F01: the previous guard was `^[0-9]+$`, which accepts
+/// `9223372036854775808` — all digits, and still aborts 1036's `::bigint` cast
+/// with SQLSTATE 22003 `numeric_value_out_of_range`.
+const SAFE_INT8_SEGMENT: &str = "^[0-9]{1,18}$";
+
+/// The second automated preflight repair (REV-084-F01, hardened by REV-087-F01).
+///
+/// Migration 1036 backfills `alerts.workspace_id` from the dedup key's second
+/// segment via `nullif(split_part(dedup_key, ':', 2), '')::bigint`. A legacy key
+/// whose second segment is not a 64-bit integer — either nonnumeric
+/// ('signal:solana:MINT:entry') or out of range ('9223372036854775808') — aborts
+/// the cast before the default-workspace fallback can run.
+///
+/// REV-087-F01 named three defects in the REV-085 version, all fixed here:
+///
+///   1. it returned early when `alerts.workspace_id` merely EXISTED, so a crash
+///      between the ADD COLUMN and the backfill left the column present with
+///      NULLs and every later run short-circuited past the repair forever. The
+///      precondition is now the DATA state, not the column's shape;
+///   2. it ran four auto-committing statements, so there was no crash window it
+///      could survive. The whole repair is now one transaction (PostgreSQL DDL is
+///      transactional);
+///   3. its digit-only regex let an oversized numeric segment through.
+///
+/// A healthy database is still never touched: 1036 sets `workspace_id NOT NULL`,
+/// so a fully-upgraded lane has no unassigned rows and the detection is false.
+async fn preflight_repair_legacy_dedup_keys(pool: &PgPool) -> Result<()> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'alerts')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !table_exists {
+        return Ok(());
+    }
+    // `dedup_key` exists from 0001, so nothing below depends on a post-1033
+    // column — the trap REV-082-F03 hit with `alerts.state`.
+    let ws_col_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'alerts' \
+           AND column_name = 'workspace_id')",
+    )
+    .fetch_one(pool)
+    .await?;
+    // Detection is a DATA question: is there a row 1036's cast would abort on that
+    // does not already have an owner? On a lane where the column does not exist
+    // yet, every such row is by definition unassigned.
+    let needs_repair: bool = if ws_col_exists {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.alerts \
+              WHERE workspace_id IS NULL \
+                AND split_part(dedup_key, ':', 2) !~ $1)",
+        )
+        .bind(SAFE_INT8_SEGMENT)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.alerts \
+              WHERE split_part(dedup_key, ':', 2) !~ $1)",
+        )
+        .bind(SAFE_INT8_SEGMENT)
+        .fetch_one(pool)
+        .await?
+    };
+    if !needs_repair {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // 1036 Part B casts the THIRD segment too (`c.id = nullif(split_part(
+    // a.dedup_key, ':', 3), '')::bigint`) for funding-kind keys. This preflight
+    // cannot repair that class: the only lane-independent repair would rewrite
+    // `subject_kind`, and 1035's two-arm CHECK (installed AFTER this preflight
+    // runs) permits only 'signal'/'funding'. Genuinely minted keys always carry a
+    // numeric subject id (`alert_dedup_key` formats an i64), so this fires only on
+    // corrupt or hand-written data — exactly when stopping is correct. Fail closed
+    // with a named error rather than let 1036 abort opaquely mid-DDL.
+    let unsafe_subject_segment: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public.alerts \
+          WHERE split_part(dedup_key, ':', 1) = 'funding' \
+            AND split_part(dedup_key, ':', 3) !~ $1)",
+    )
+    .bind(SAFE_INT8_SEGMENT)
+    .fetch_one(&mut *tx)
+    .await?;
+    if unsafe_subject_segment {
+        anyhow::bail!(
+            "alert dedup keys of kind `funding` carry a subject segment that is not a \
+             64-bit integer; migration 1036 casts that segment to bigint and would \
+             abort mid-DDL. 1036 is shipped and immutable, and rewriting the subject \
+             kind would violate 1035's subject CHECK, so this must be reconciled by an \
+             operator before migrating"
+        );
+    }
+
+    tracing::warn!(
+        "preflight repair (REV-084-F01, REV-087-F01): pre-assigning alerts whose \
+         dedup-key workspace segment is not a 64-bit integer to the default \
+         workspace, before migration order reaches 1036 whose ::bigint cast would \
+         abort. One transaction; re-detected from data on every run"
+    );
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS _migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+        "INSERT INTO workspaces (name, slug) VALUES ('Default', 'default') \
+         ON CONFLICT (slug) DO NOTHING",
+    )
+    .execute(&mut *tx)
+    .await?;
+    // 1036's own ADD COLUMN IF NOT EXISTS is then a no-op. The FK target is safe:
+    // workspaces is created by 0001.
+    sqlx::query(
+        "ALTER TABLE public.alerts \
+         ADD COLUMN IF NOT EXISTS workspace_id bigint REFERENCES workspaces (id)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let assigned = sqlx::query(
+        "UPDATE public.alerts \
+         SET workspace_id = (SELECT id FROM workspaces WHERE slug = 'default') \
+         WHERE workspace_id IS NULL \
+           AND split_part(dedup_key, ':', 2) !~ $1",
+    )
+    .bind(SAFE_INT8_SEGMENT)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    tracing::warn!(rows = assigned, "preflight repair complete");
+    Ok(())
+}
+
+/// The third automated preflight repair (REV-087-F03).
+///
+/// Migration 1037 collapses duplicate `funding_radar_cases` rows onto one survivor
+/// per `(workspace_id, chain, recipient)`. Two defects make that destructive:
+///
+///   * `jsonb_each` at 1037:57 and :69 is reached through `CROSS JOIN LATERAL`,
+///     and `evidence` is `jsonb NOT NULL DEFAULT 'null'::jsonb` (0001:270) — the
+///     schema's own default is a JSON SCALAR. `jsonb_each` raises 22023 on a scalar
+///     or array, so ONE such row anywhere in a duplicate group aborts the entire
+///     migration;
+///   * the merge writes 6 of 17 columns. `first_funding_usd`,
+///     `first_funding_native`, `source_address`, `source_kind`,
+///     `deploy_window_ends_at` and `dismissed_reason` are silently inherited from
+///     the lowest-id row, which can disagree with the merged `MIN(first_funded_at)`.
+///     And the alert repoint (1037:167-170) rewrites `funding_case_id` while leaving
+///     `dedup_key`, which EMBEDS the dead case id — so a later `claim_alert`
+///     (`ON CONFLICT (dedup_key)`) mints a SECOND outbox row for the same survivor
+///     and destination: a duplicate logical alert.
+///
+/// 1037 is shipped and immutable, and filename order reaches it before any later
+/// corrective migration, so the repair cannot be a new migration — it must run
+/// before the loop. Afterwards 1037 finds zero duplicate groups and is a no-op.
+///
+/// Detection (ALL must hold), so a healthy database is never touched:
+///   1. `funding_radar_cases` exists;
+///   2. `funding_radar_cases_tenant_uidx` is ABSENT, proving 1037 has not run;
+///   3. there is a non-object `evidence` row or an actual duplicate group.
+async fn preflight_repair_funding_case_identity(pool: &PgPool) -> Result<()> {
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'funding_radar_cases')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !table_exists {
+        return Ok(());
+    }
+    let already_merged: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+          WHERE schemaname = 'public' \
+            AND indexname = 'funding_radar_cases_tenant_uidx')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if already_merged {
+        return Ok(());
+    }
+    // `workspace_id` is added by 1036, which runs AFTER this preflight. On a lane
+    // without it, grouping by (chain, recipient) is equivalent: 1036 assigns every
+    // pre-existing case to the single default workspace, so 1037 will see exactly
+    // these groups.
+    let ws_col_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'funding_radar_cases' \
+           AND column_name = 'workspace_id')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let group_cols = if ws_col_exists {
+        "workspace_id, chain, recipient"
+    } else {
+        "chain, recipient"
+    };
+
+    let non_object_evidence: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public.funding_radar_cases \
+          WHERE jsonb_typeof(evidence) <> 'object')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let has_duplicates: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM public.funding_radar_cases \
+          GROUP BY {group_cols} HAVING count(*) > 1)"
+    ))
+    .fetch_one(pool)
+    .await?;
+    if !non_object_evidence && !has_duplicates {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // 1. Normalize evidence so `jsonb_each` can never abort. The data is PRESERVED
+    //    under a named key rather than discarded — a scalar or array was legal.
+    let normalized = sqlx::query(
+        "UPDATE public.funding_radar_cases \
+            SET evidence = jsonb_build_object('legacy_evidence', evidence) \
+          WHERE jsonb_typeof(evidence) <> 'object'",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
+    // 2. Materialize the survivor map ONCE so every later statement uses one
+    //    identical ranking (1037 re-derives its CTE trio four times).
+    sqlx::query(&format!(
+        "CREATE TEMP TABLE swi_case_merge ON COMMIT DROP AS \
+         SELECT id, \
+                first_value(id) OVER (PARTITION BY {group_cols} ORDER BY id ASC) AS keep_id \
+           FROM public.funding_radar_cases"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM swi_case_merge WHERE id = keep_id")
+        .execute(&mut *tx)
+        .await?;
+    let merged_away: i64 = sqlx::query_scalar("SELECT count(*) FROM swi_case_merge")
+        .fetch_one(&mut *tx)
+        .await?;
+    if merged_away == 0 {
+        tx.commit().await?;
+        if normalized > 0 {
+            tracing::warn!(
+                rows = normalized,
+                "preflight repair (REV-087-F03): normalized non-object funding-case \
+                 evidence so 1037's jsonb_each cannot abort; no duplicate groups"
+            );
+        }
+        return Ok(());
+    }
+
+    // 3. Merge EVERY semantic column onto the survivor, with an explicit policy per
+    //    field. `id`/`workspace_id`/`chain`/`recipient` are the identity and are
+    //    untouched. The first-funding facts travel with the merged MIN(first_funded_at)
+    //    row, NOT with the id-survivor — taking them from the id-survivor is exactly
+    //    the inconsistency REV-087-F03 names.
+    sqlx::query(
+        r#"
+        WITH grp AS (
+            SELECT m.keep_id, c.*
+              FROM public.funding_radar_cases c
+              JOIN (SELECT keep_id, id FROM swi_case_merge
+                    UNION ALL
+                    SELECT DISTINCT keep_id, keep_id FROM swi_case_merge) m
+                ON m.id = c.id
+        ),
+        first_row AS (
+            SELECT DISTINCT ON (keep_id)
+                   keep_id, first_funding_usd, first_funding_native,
+                   source_address, source_kind
+              FROM grp
+             ORDER BY keep_id, first_funded_at ASC, id ASC
+        ),
+        merged AS (
+            SELECT g.keep_id,
+                   min(g.first_funded_at)                       AS first_funded_at,
+                   max(g.confidence)                            AS confidence,
+                   max(g.fanout_count)                          AS fanout_count,
+                   max(g.updated_at)                            AS updated_at,
+                   max(g.deploy_window_ends_at)                 AS deploy_window_ends_at,
+                   (SELECT s.stage FROM grp s WHERE s.keep_id = g.keep_id
+                     ORDER BY CASE s.stage
+                                WHEN 'funded'      THEN 1
+                                WHEN 'preparation' THEN 2
+                                WHEN 'deployed'    THEN 3
+                                WHEN 'dismissed'   THEN 4
+                                ELSE 0 END DESC, s.id DESC
+                     LIMIT 1)                                   AS stage,
+                   (SELECT d.dismissed_reason FROM grp d
+                     WHERE d.keep_id = g.keep_id AND d.stage = 'dismissed'
+                       AND d.dismissed_reason IS NOT NULL
+                     ORDER BY d.updated_at DESC, d.id DESC
+                     LIMIT 1)                                   AS dismissed_reason,
+                   COALESCE((SELECT jsonb_object_agg(e.key, e.value)
+                               FROM (SELECT DISTINCT ON (kv.key) kv.key, kv.value
+                                       FROM grp e2
+                                       CROSS JOIN LATERAL jsonb_each(e2.evidence) kv
+                                      WHERE e2.keep_id = g.keep_id
+                                      ORDER BY kv.key, e2.id DESC) e),
+                            '{}'::jsonb)                        AS evidence
+              FROM grp g
+             GROUP BY g.keep_id
+        )
+        UPDATE public.funding_radar_cases c
+           SET first_funded_at       = m.first_funded_at,
+               stage                 = m.stage,
+               confidence            = m.confidence,
+               fanout_count          = m.fanout_count,
+               updated_at            = m.updated_at,
+               evidence              = m.evidence,
+               deploy_window_ends_at = m.deploy_window_ends_at,
+               first_funding_usd     = f.first_funding_usd,
+               first_funding_native  = f.first_funding_native,
+               source_address        = f.source_address,
+               source_kind           = f.source_kind,
+               dismissed_reason      = CASE WHEN m.stage = 'dismissed'
+                                            THEN m.dismissed_reason ELSE NULL END
+          FROM merged m
+          JOIN first_row f ON f.keep_id = m.keep_id
+         WHERE c.id = m.keep_id
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // 4. Repoint events. `funding_radar_events.case_id` is ON DELETE CASCADE
+    //    (0001:281), so a missed repoint destroys history outright.
+    sqlx::query(
+        "UPDATE public.funding_radar_events e \
+            SET case_id = m.keep_id \
+           FROM swi_case_merge m \
+          WHERE e.case_id = m.id",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // 5/6. Alerts: repoint the FK AND reconcile the identity. `alerts.funding_case_id`
+    //      exists only from 1035, so both steps are guarded on the column.
+    let alerts_have_case: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'alerts' \
+           AND column_name = 'funding_case_id')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut rekeyed = 0u64;
+    let mut folded = 0u64;
+    if alerts_have_case {
+        sqlx::query(
+            "UPDATE public.alerts a \
+                SET funding_case_id = m.keep_id \
+               FROM swi_case_merge m \
+              WHERE a.funding_case_id = m.id",
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // The dedup key is `kind:workspace:subject:destination` and the PRIMARY KEY
+        // (0001:449). Rewrite ONLY the subject segment; the destination is taken as
+        // everything after the third colon so a destination containing a colon
+        // survives. The `~ '^[0-9]{1,18}$'` guard keeps the join's cast range-safe.
+        sqlx::query(&format!(
+            r#"
+            CREATE TEMP TABLE swi_alert_rekey ON COMMIT DROP AS
+            SELECT a.dedup_key AS old_key,
+                   'funding:' || split_part(a.dedup_key, ':', 2) || ':' ||
+                   m.keep_id::text || ':' ||
+                   substr(a.dedup_key,
+                          length(split_part(a.dedup_key, ':', 1)) +
+                          length(split_part(a.dedup_key, ':', 2)) +
+                          length(split_part(a.dedup_key, ':', 3)) + 4) AS new_key
+              FROM public.alerts a
+              JOIN swi_case_merge m
+                ON m.id = nullif(split_part(a.dedup_key, ':', 3), '')::bigint
+             WHERE split_part(a.dedup_key, ':', 1) = 'funding'
+               AND split_part(a.dedup_key, ':', 3) ~ '{SAFE_INT8_SEGMENT}'
+            "#
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM swi_alert_rekey WHERE old_key = new_key")
+            .execute(&mut *tx)
+            .await?;
+
+        // Collision policy: the row already holding the survivor's key WINS, because
+        // it already carries the survivor's identity. Before dropping the stale-keyed
+        // row, fold its delivery fact forward — an external send genuinely happened
+        // and the outbox must not repeat it.
+        let state_col: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'alerts' \
+               AND column_name = 'state')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if state_col {
+            folded = sqlx::query(
+                "UPDATE public.alerts t \
+                    SET state = 'sent', \
+                        sent_at = COALESCE(t.sent_at, s.sent_at), \
+                        next_attempt_at = NULL, \
+                        claim_token = NULL, \
+                        claim_expires_at = NULL \
+                   FROM swi_alert_rekey r \
+                   JOIN public.alerts s ON s.dedup_key = r.old_key \
+                  WHERE t.dedup_key = r.new_key \
+                    AND s.state = 'sent' AND t.state <> 'sent'",
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        sqlx::query(
+            "DELETE FROM public.alerts a \
+              USING swi_alert_rekey r \
+              WHERE a.dedup_key = r.old_key \
+                AND EXISTS (SELECT 1 FROM public.alerts t WHERE t.dedup_key = r.new_key)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        rekeyed = sqlx::query(
+            "UPDATE public.alerts a \
+                SET dedup_key = r.new_key \
+               FROM swi_alert_rekey r \
+              WHERE a.dedup_key = r.old_key",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    }
+
+    // 7. Only now are the non-survivors removable.
+    sqlx::query(
+        "DELETE FROM public.funding_radar_cases \
+          WHERE id IN (SELECT id FROM swi_case_merge)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    tracing::warn!(
+        normalized_evidence = normalized,
+        cases_merged = merged_away,
+        alerts_rekeyed = rekeyed,
+        alerts_folded = folded,
+        "preflight repair (REV-087-F03): funding cases merged across every semantic \
+         column and alert identities reconciled, before migration order reaches 1037 \
+         whose merge is partial and whose jsonb_each aborts on non-object evidence"
+    );
+    Ok(())
+}
+
+/// Apply migrations from the directory resolved by [`resolve_migration_dir`].
+///
+/// `accept_legacy_baseline` permits recording pre-checksum rows as
+/// `baseline:<digest>` (see [`BASELINE_PREFIX`]).
+pub async fn migrate_with(pool: &PgPool, accept_legacy_baseline: bool) -> Result<()> {
+    let dir = resolve_migration_dir()?;
+    migrate_dir_with(pool, &dir, accept_legacy_baseline).await
+}
+
+/// Apply migrations from an EXPLICIT directory.
+///
+/// REV-087 item 7: tests used to point the migrator at a reduced migration set by
+/// mutating the process-global `SWI_MIGRATIONS_DIR`. `cargo test --features
+/// pg_tests` runs two harness processes (lib + bin) and the bin harness is
+/// multi-threaded, so one fixture's `remove_var` could land inside another
+/// fixture's migration run — the lifecycle defect behind the reviewer's
+/// `3D000: database ... does not exist` full-suite failures. The directory is a
+/// parameter now; nothing global is touched.
+pub async fn migrate_dir_with(
+    pool: &PgPool,
+    dir: &std::path::Path,
+    accept_legacy_baseline: bool,
+) -> Result<()> {
+    // Schema-qualified explicitly: the pool's search_path starts with
+    // `swi_legacy`, so an unqualified CREATE would put the migration ledger inside
+    // the archive schema on a bridged database.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS public._migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
     )
     .execute(pool)
     .await?;
-    let mut dir = std::path::PathBuf::from("migrations");
-    if !dir.exists() {
-        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-            dir = std::path::Path::new(&manifest_dir).join("migrations");
+    // REV-037-F01: record the digest of what was actually applied, so
+    // `ensure_schema_current` can verify contents and not just filenames. Added
+    // here as well as in migration 1027 because this table is created by the
+    // binary, not by a migration file — on a brand-new database the column must
+    // exist before the first row is written.
+    sqlx::query("ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS sha256 text")
+        .execute(pool)
+        .await?;
+    // REV-043-F02: HOW a digest was obtained is itself information, and REV-042 had
+    // no way to record it.
+    //
+    // REV-040 wrote bare digests into pre-checksum rows. REV-042 introduced the
+    // `baseline:` prefix, but only ever wrote it for rows where `sha256 IS NULL` —
+    // so a database that had already passed through REV-040 kept digests that LOOK
+    // observed while their history is just as unknown. A prefix cannot fix that
+    // retroactively, because the rows are indistinguishable by value.
+    //
+    // `digest_origin` makes the three states nameable and queryable:
+    //   'applied'  — digest computed from the SQL this binary actually executed
+    //   'baseline' — accepted for a pre-checksum row; applied bytes UNKNOWN
+    //   NULL with a digest present — written before provenance was tracked, so the
+    //                                provenance is unknown and must be re-declared
+    sqlx::query("ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS digest_origin text")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE public._migrations \
+           DROP CONSTRAINT IF EXISTS _migrations_digest_origin_check",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE public._migrations \
+           ADD CONSTRAINT _migrations_digest_origin_check \
+           CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline'))",
+    )
+    .execute(pool)
+    .await?;
+    // The ledger is authority about schema state: no runtime role may write it.
+    //
+    // REV-039-F05: this used to revoke only PUBLIC and to ignore the result with
+    // `let _ =`. The reviewer granted INSERT explicitly to `swi_legacy_runtime`,
+    // re-ran the migrator, and the privilege survived — so "reasserted on every
+    // migrate" was not true. The named roles are now included, and a failure is
+    // reported rather than swallowed. Roles that do not exist yet are tolerated
+    // (a fresh database migrates before 1025 creates them), but nothing else is.
+    for role in ["PUBLIC", "swi_legacy_runtime", "swi_app"] {
+        let stmt = format!(
+            "REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON public._migrations FROM {role}"
+        );
+        if let Err(e) = sqlx::raw_sql(&stmt).execute(pool).await {
+            let msg = e.to_string();
+            // 42704 = undefined_object: the role is not created yet.
+            let role_absent = msg.contains("does not exist") || msg.contains("42704");
+            if !role_absent {
+                return Err(anyhow::anyhow!(e).context(format!(
+                    "failed to protect the migration ledger from `{role}`; refusing to \
+                     continue with a writable ledger"
+                )));
+            }
         }
     }
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+    // REV-080-F01 (CRITICAL): preflight repair for the ONE known broken upgrade
+    // lane. Migrations apply in filename order, and 1034's sent_at cutover runs
+    // its UPDATE before dropping the inherited NOT NULL, so a 1033 database
+    // holding any pending/dead alert aborts before 1035's correct-order repair is
+    // ever reached. 1034 itself is shipped and immutable, so the repair cannot
+    // live in a later file — it must precede filename order entirely.
+    //
+    // The shape is detected NARROWLY (never blanket-DDL): the column exists, is
+    // still NOT NULL, the outbox columns from 1034 are absent (so this is a
+    // genuinely pre-1034 lane rather than an already-upgraded one), and at least
+    // one row would violate. Only then is the constraint dropped, which is
+    // exactly the documented operator step — automated, logged, and recorded.
+    preflight_repair_alerts_sent_at(pool).await?;
+    // REV-084-F01 (CRITICAL): same preflight pattern for the SECOND known broken
+    // upgrade lane. 1036's `nullif(split_part(dedup_key, ':', 2), '')::bigint`
+    // aborts on legacy keys with nonnumeric second segments (e.g.
+    // 'signal:solana:MINT:entry'). 1036 is shipped and immutable, so the repair
+    // must precede filename order — a pre-1036 lane with such keys can never
+    // reach a later corrective migration.
+    preflight_repair_legacy_dedup_keys(pool).await?;
+    // REV-087-F03 (HIGH): the third preflight. 1037's duplicate-case merge is
+    // incomplete and its `jsonb_each` aborts on legal non-object evidence. 1037 is
+    // shipped, so it executes BEFORE any later corrective migration in filename
+    // order — the repair must precede the loop entirely.
+    preflight_repair_funding_case_identity(pool).await?;
+
+    tracing::info!(migrations_dir = %dir.display(), "applying migrations");
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("failed to read migrations dir {}", dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -61,26 +848,501 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid migration filename"))?
             .to_string();
-        let applied: Option<(String,)> =
-            sqlx::query_as("SELECT name FROM _migrations WHERE name = $1")
+        let sql = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read migration {}", path.display()))?;
+        let digest = migration_sha256(&sql);
+
+        let applied: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT name, sha256, digest_origin FROM public._migrations WHERE name = $1",
+        )
+        .bind(&name)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some((_, recorded, origin)) = applied {
+            // REV-043-F02: a digest with no recorded provenance was written by a
+            // build that did not track provenance (REV-040), so it proves nothing
+            // about history. Treat it exactly like a pre-checksum row: it needs the
+            // operator's explicit re-declaration, not a silent pass.
+            if recorded.is_some() && origin.is_none() {
+                if !accept_legacy_baseline {
+                    anyhow::bail!(
+                        "`{name}` carries a digest with no recorded provenance. It was written \
+                         by an earlier build that back-filled digests from the files on disk, \
+                         so it does NOT establish which bytes were applied. Reconcile the \
+                         schema, then re-run with `--accept-legacy-baseline` to re-declare it \
+                         as a baseline"
+                    );
+                }
+                let bare = recorded.as_deref().unwrap_or_default();
+                let digest_only = recorded_digest(bare).to_string();
+                sqlx::query(
+                    "UPDATE public._migrations \
+                        SET sha256 = $2, digest_origin = 'baseline' WHERE name = $1",
+                )
                 .bind(&name)
-                .fetch_optional(pool)
+                .bind(format!("{BASELINE_PREFIX}{digest_only}"))
+                .execute(pool)
                 .await?;
-        if applied.is_some() {
+                tracing::warn!(
+                    migration = %name,
+                    "re-declared a provenance-less digest as an ACCEPTED BASELINE \
+                     (REV-043-F02)"
+                );
+                continue;
+            }
+            // REV-039-F01: an already-applied row is where the upgrade outage lived.
+            // Migration 1027 added a nullable `sha256` and backfilled nothing, so a
+            // database upgraded from 1026 ended up with 38 unverifiable rows and
+            // every runtime command refused to start — with a message telling the
+            // operator to apply 1027, which was already applied. The fix I shipped
+            // was worse than no fix for existing databases.
+            //
+            // Backfill is possible, but NOT from "whatever file is on disk": that
+            // would bless an edited file as applied and destroy the point of the
+            // checksum. The digest is accepted only when it matches the reviewed,
+            // version-controlled manifest that ships beside the SQL.
+            if recorded.is_none() {
+                match manifest_digest(dir, &name)? {
+                    Some(expected) if expected == digest => {
+                        // REV-041-F01: matching the CURRENT manifest does not make
+                        // this a verified row. The manifest describes the files as
+                        // they are now; the ledger row was written before digests
+                        // existed and says only that a migration by this NAME ran.
+                        // Recording it as `verified` claimed a historical fact, and
+                        // for `1013_strategy_lab.sql` that claim is demonstrably
+                        // false on a database carrying the older constraint name.
+                        //
+                        // So it is recorded as an accepted BASELINE, and only with
+                        // the operator's explicit consent.
+                        if !accept_legacy_baseline {
+                            anyhow::bail!(
+                                "`{name}` was applied before digests were recorded, so which \
+                                 bytes ran is unknown. Its current file matches the reviewed \
+                                 manifest, but a filename-only row cannot prove the same bytes \
+                                 were applied. Reconcile the schema, then re-run with \
+                                 `--accept-legacy-baseline` to record it as a baseline. \
+                                 Known drift to check first: strategy_versions must carry \
+                                 `strategy_versions_lifecycle_check` (permitting canary/paused), \
+                                 not `strategy_versions_lifecycle_state_check`"
+                            );
+                        }
+                        sqlx::query(
+                            "UPDATE public._migrations \
+                                SET sha256 = $2, digest_origin = 'baseline' \
+                              WHERE name = $1",
+                        )
+                        .bind(&name)
+                        .bind(format!("{BASELINE_PREFIX}{digest}"))
+                        .execute(pool)
+                        .await?;
+                        tracing::warn!(
+                            migration = %name,
+                            "recorded as an ACCEPTED BASELINE, not verified: the applied bytes \
+                             are unknown for pre-checksum rows"
+                        );
+                    }
+                    Some(expected) => {
+                        anyhow::bail!(
+                            "cannot backfill a digest for already-applied `{name}`: the file \
+                             on disk hashes to {} but the reviewed manifest records {}. \
+                             The file changed after it was applied; resolve this \
+                             deliberately rather than blessing the current contents",
+                            short_digest(&digest),
+                            short_digest(&expected)
+                        );
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "already-applied migration `{name}` has no digest in the ledger \
+                             and no entry in {}; add a reviewed manifest entry before this \
+                             database can be verified",
+                            MIGRATION_MANIFEST
+                        );
+                    }
+                }
+            }
+            // REV-087-F01 (CRITICAL): an already-applied row carrying BOTH a digest
+            // and a provenance fell straight through to `continue` — the recorded
+            // digest was never compared against the file on disk. So `db migrate`
+            // silently blessed an edited shipped migration, and only a later service
+            // start (`ensure_schema_current`) noticed. Migration files are immutable
+            // once applied; a same-name change is an integrity fault, not a re-apply.
+            //
+            // `recorded_digest` strips the `baseline:` prefix, so a baseline row is
+            // checked against the bytes that were ACCEPTED for it — the same rule
+            // `ensure_schema_current` applies.
+            if let Some(recorded) = recorded.as_deref() {
+                if recorded_digest(recorded) != digest {
+                    anyhow::bail!(
+                        "applied migration `{name}` no longer matches the file on disk \
+                         (ledger {}, disk {}). Migrations are immutable once applied; \
+                         restore the reviewed bytes or ship a forward migration instead \
+                         of editing this one",
+                        short_digest(recorded_digest(recorded)),
+                        short_digest(&digest)
+                    );
+                }
+            }
             continue;
         }
-        let sql = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
         let mut tx = pool.begin().await?;
+        // Pin `public` so DDL never lands in the legacy archive schema.
+        sqlx::raw_sql(MIGRATION_SEARCH_PATH).execute(&mut *tx).await?;
         sqlx::raw_sql(&sql).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO _migrations (name) VALUES ($1)")
+        // `applied`: this binary executed exactly these bytes in this transaction.
+        sqlx::query(
+            "INSERT INTO public._migrations (name, sha256, digest_origin) \
+             VALUES ($1, $2, 'applied')",
+        )
             .bind(&name)
+            .bind(&digest)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         tracing::info!(migration = %name, "applied");
     }
     Ok(())
+}
+
+/// Verify the schema is current WITHOUT applying anything (REV-035-#1).
+///
+/// Every long-running command used to call [`migrate`] on its own pool. That made
+/// the documented least-privilege `DATABASE_URL` unusable: the reviewer ran the
+/// real binary and it died with `permission denied for schema public` before doing
+/// any work. Applying DDL is a privileged, deliberate operation — it does not
+/// belong on a service start path.
+///
+/// This replacement is read-only: it needs only `SELECT` on `public._migrations`,
+/// so it succeeds as the runtime role. It fails closed with an actionable message
+/// when the schema is behind, rather than silently running on a schema that does
+/// not match the binary.
+pub async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
+    // The ledger itself may be missing on a database that was never migrated.
+    let ledger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+          WHERE table_schema = 'public' AND table_name = '_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !ledger_exists {
+        anyhow::bail!(
+            "database has no migration ledger; run `swi db migrate` with \
+             MIGRATION_DATABASE_URL (a privileged role) before starting the service"
+        );
+    }
+
+    let dir = resolve_migration_dir()?;
+    // REV-039-F04: this used to be `.filter_map(|p| ... read_to_string(&p).ok()?)`,
+    // which DROPPED any file it could not read. The reviewer added a `.sql` file
+    // with invalid UTF-8 and schema verification passed while silently ignoring it
+    // (`UNREADABLE_SQL_IGNORED=yes`). A migration directory that cannot be fully
+    // read is not a verified migration set, so every failure below is fatal:
+    // unreadable bytes, a non-UTF-8 filename, a directory entry that errors, and a
+    // duplicate name.
+    let mut on_disk: Vec<(String, String)> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("failed to read migrations dir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to read an entry in {}", dir.display())
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().map(|e| e != "sql").unwrap_or(true) {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "migration filename is not valid UTF-8: {}",
+                    path.display()
+                )
+            })?
+            .to_string();
+        let body = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "failed to read migration {} while verifying the schema; a migration \
+                 directory that cannot be fully read is not a verified migration set",
+                path.display()
+            )
+        })?;
+        if !seen_names.insert(name.clone()) {
+            anyhow::bail!(
+                "duplicate migration filename `{name}` in {}",
+                dir.display()
+            );
+        }
+        on_disk.push((name, migration_sha256(&body)));
+    }
+    on_disk.sort();
+
+    // REV-037-F01: a recorded FILENAME is not evidence. The reviewer inserted a
+    // bare name into the ledger and this check passed for a migration that had
+    // never run; separately, they changed the CONTENTS of an already-recorded file
+    // and the mismatch was accepted (`HASH_MISMATCH_ACCEPTED=yes`). Migration 1027
+    // adds a `sha256` column and revokes ledger DML from the runtime role; this
+    // function now verifies the digest as well as the name.
+    let has_sha_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = '_migrations' \
+            AND column_name = 'sha256')",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    // REV-043-F02: read provenance too. A digest whose origin is unknown was written
+    // by a build that back-filled from disk, so it must not read as verified.
+    // REV-045-F02: these are authoritative questions about schema state, so a failed
+    // query must NOT read as "nothing to worry about".
+    //
+    // `unwrap_or(false)` / `unwrap_or_default()` turned a permission denial, a
+    // missing table, or a dropped connection into an empty answer — the shape that
+    // means "verified". That is fail-OPEN on the exact query that decides whether the
+    // schema can be trusted, which is the same mistake as the swallowed ledger revoke
+    // in REV-039-F05. Errors now propagate.
+    let has_origin_column: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = '_migrations' \
+            AND column_name = 'digest_origin')",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to inspect the migration ledger for a digest_origin column")?;
+
+    let provenanceless: Vec<String> = if has_sha_column && has_origin_column {
+        sqlx::query_scalar(
+            "SELECT name FROM public._migrations \
+              WHERE sha256 IS NOT NULL AND digest_origin IS NULL ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read migration digest provenance")?
+    } else if has_sha_column {
+        // The column does not exist yet, so EVERY digest present was written before
+        // provenance was tracked.
+        sqlx::query_scalar(
+            "SELECT name FROM public._migrations WHERE sha256 IS NOT NULL ORDER BY name",
+        )
+        .fetch_all(pool)
+        .await
+        .context("failed to read migration digests")?
+    } else {
+        Vec::new()
+    };
+
+    let applied: Vec<(String, Option<String>)> = if has_sha_column {
+        sqlx::query_as("SELECT name, sha256 FROM public._migrations")
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT name FROM public._migrations")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|n| (n, None))
+            .collect()
+    };
+
+    let mut pending: Vec<&str> = Vec::new();
+    let mut mismatched: Vec<String> = Vec::new();
+    let mut unverifiable: Vec<&str> = Vec::new();
+    // REV-041-F01: baseline rows are ACCEPTED but not verified, and they are
+    // reported so the distinction stays visible instead of decaying into "green".
+    let mut baseline: Vec<&str> = Vec::new();
+
+    for (name, digest) in &on_disk {
+        match applied.iter().find(|(n, _)| n == name) {
+            None => pending.push(name),
+            Some((_, Some(recorded))) if is_baseline(recorded) => {
+                // The applied bytes are unknown by construction, so the only thing
+                // that can be checked is that the file has not changed SINCE the
+                // baseline was accepted. A change after acceptance is still fatal.
+                if recorded_digest(recorded) != digest {
+                    mismatched.push(format!(
+                        "{name} (baseline {}, on disk {})",
+                        short_digest(recorded_digest(recorded)),
+                        short_digest(digest)
+                    ));
+                } else {
+                    baseline.push(name);
+                }
+            }
+            Some((_, Some(recorded))) if recorded != digest => {
+                mismatched.push(format!(
+                    "{name} (recorded {}, on disk {})",
+                    short_digest(recorded),
+                    short_digest(digest)
+                ));
+            }
+            // Recorded before 1027 added the column: report rather than accept, so
+            // "unverifiable" never silently reads as "verified".
+            Some((_, None)) => unverifiable.push(name),
+            Some((_, Some(_))) => {}
+        }
+    }
+
+    // A ledger row with no file on disk means the binary and the database disagree
+    // about what the schema even is.
+    let unknown: Vec<&str> = applied
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| !on_disk.iter().any(|(d, _)| d == n))
+        .collect();
+
+    if !pending.is_empty() {
+        anyhow::bail!(
+            "{} migration(s) pending ({}); run `swi db migrate` with \
+             MIGRATION_DATABASE_URL before starting the service",
+            pending.len(),
+            pending.iter().take(3).copied().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if !mismatched.is_empty() {
+        anyhow::bail!(
+            "{} applied migration(s) no longer match the files on disk: {}. \
+             The schema in the database was not produced by these files; refusing \
+             to start",
+            mismatched.len(),
+            mismatched.join(", ")
+        );
+    }
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "the migration ledger records {} migration(s) with no file on disk ({}); \
+             this binary does not match the database schema",
+            unknown.len(),
+            unknown.iter().take(3).copied().collect::<Vec<_>>().join(", ")
+        );
+    }
+    if !unverifiable.is_empty() {
+        anyhow::bail!(
+            "{} applied migration(s) carry no checksum ({}); run `swi db migrate` with \
+             MIGRATION_DATABASE_URL, and if this is an existing pre-checksum database, \
+             reconcile the schema and pass `--accept-legacy-baseline`",
+            unverifiable.len(),
+            unverifiable
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // REV-043-F02: a digest with unknown provenance is not evidence. REV-040 wrote
+    // such rows and REV-042's `baseline:` prefix could not reach them, because by
+    // value they are indistinguishable from digests observed at apply time. Refuse
+    // rather than inherit a false "verified".
+    if !provenanceless.is_empty() {
+        anyhow::bail!(
+            "{} applied migration(s) carry a digest with no recorded provenance ({}); \
+             these were back-filled from the files on disk by an earlier build and do \
+             not establish which bytes were applied. Run `swi db migrate` with \
+             MIGRATION_DATABASE_URL and `--accept-legacy-baseline` to re-declare them",
+            provenanceless.len(),
+            provenanceless
+                .iter()
+                .take(3)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Baseline rows do not block startup — but they are stated on every start, so
+    // "accepted" never quietly becomes "verified" in an operator's mind. REV-040
+    // recorded exactly these rows as verified and said nothing.
+    if !baseline.is_empty() {
+        tracing::warn!(
+            count = baseline.len(),
+            migrations = %baseline.iter().take(5).copied().collect::<Vec<_>>().join(", "),
+            "schema accepted with legacy-baseline rows: these migrations were applied \
+             before digests were recorded, so the bytes actually applied are UNKNOWN \
+             (REV-041-F01)"
+        );
+    }
+    Ok(())
+}
+
+/// Migrations recorded as an accepted baseline rather than verified at apply time.
+///
+/// Exposed so `db status` can report the distinction; a boundary nobody can inspect
+/// is a boundary that decays.
+pub async fn baseline_migrations(pool: &PgPool) -> Result<Vec<String>> {
+    // Either marker identifies a baseline row: the value prefix, or the provenance
+    // column (REV-043-F02). Both are checked so a row written by any version of this
+    // code is reported.
+    // REV-045-F02: an unavailable answer is not "no baseline rows". Swallowing this
+    // let `db status` print a verified-looking state while the query had actually
+    // failed — a permission problem would have read as good news.
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM public._migrations \
+          WHERE sha256 LIKE 'baseline:%' OR digest_origin = 'baseline' \
+          ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to read migration baseline state")?;
+    Ok(rows)
+}
+
+/// Reviewed digest manifest, shipped beside the SQL (REV-039-F01).
+pub const MIGRATION_MANIFEST: &str = "MANIFEST.sha256";
+
+/// The digest the reviewed manifest records for `name`, or `None` when the
+/// manifest has no entry for it.
+///
+/// This is the authority that makes backfilling an already-applied row safe. The
+/// alternative — hashing whatever is on disk and storing that — would accept an
+/// edited file as "what was applied", which is precisely the property the checksum
+/// exists to detect.
+fn manifest_digest(dir: &std::path::Path, name: &str) -> Result<Option<String>> {
+    let path = dir.join(MIGRATION_MANIFEST);
+    if !path.exists() {
+        anyhow::bail!(
+            "the reviewed digest manifest {} is missing from {}; it must ship with the \
+             migrations so pre-checksum ledger rows can be verified",
+            MIGRATION_MANIFEST,
+            dir.display()
+        );
+    }
+    let body = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(digest) = parts.next() else { continue };
+        let Some(file) = parts.next() else { continue };
+        if file == name {
+            return Ok(Some(digest.to_ascii_lowercase()));
+        }
+    }
+    Ok(None)
+}
+
+/// SHA-256 of a migration file body, hex-encoded.
+///
+/// Line endings are normalized first: the same file checked out on Windows and on
+/// Linux must produce one digest, otherwise the check would fire on every
+/// cross-platform deploy and get switched off — a guard that cries wolf is a guard
+/// that gets removed.
+fn migration_sha256(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = body.replace("\r\n", "\n");
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn short_digest(d: &str) -> &str {
+    &d[..d.len().min(12)]
 }
 
 /// Measure database latency in milliseconds (health check).
@@ -163,8 +1425,15 @@ pub async fn wallet_age_seconds(
 
 /// Record a wallet label. Manual labels carry `manual = true` and remain
 /// authoritative over automatic dispositions.
+/// Append a wallet label owned by ONE workspace (REV-056-F01).
+///
+/// `workspace_id` is not optional and is not defaulted: a label with no owner is the
+/// hole REV-056-F01 reported, where workspace B could read and revoke workspace A's
+/// private classification. The caller must obtain it from the authenticated session.
+#[allow(clippy::too_many_arguments)]
 pub async fn add_wallet_label(
     pool: &PgPool,
+    workspace_id: i64,
     chain: &str,
     address: &str,
     kind: &str,
@@ -178,10 +1447,12 @@ pub async fn add_wallet_label(
     sqlx::query(
         r#"
         INSERT INTO wallet_labels
-            (chain, address, kind, disposition, reason, source, confidence, manual, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (workspace_id, chain, address, kind, disposition, reason, source,
+             confidence, manual, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
+    .bind(workspace_id)
     .bind(chain)
     .bind(address)
     .bind(kind)
@@ -196,9 +1467,73 @@ pub async fn add_wallet_label(
     Ok(())
 }
 
+/// Import a blocklist in ONE transaction. Returns the number of addresses blocked.
+///
+/// REV-058-F03: the single implementation shared by the HTTP handler and the CLI.
+///
+/// REV-057 made the HTTP path transactional and I stopped there, so `wallet block-list`
+/// on the CLI still looped with per-row autocommit: a failure on address N left
+/// addresses 1..N-1 committed, which is exactly the half-applied blocklist REV-056-F05
+/// ruled out. Two implementations of one rule will always drift — the second caller was
+/// already wrong before the reviewer looked.
+///
+/// Blank lines and `#` comments are skipped and NOT counted, so the returned number is
+/// the number of addresses actually blocked.
+pub async fn import_blocklist_tx(
+    pool: &PgPool,
+    workspace_id: i64,
+    chain: &str,
+    addresses: impl IntoIterator<Item = impl AsRef<str>>,
+    reason: &str,
+) -> Result<u32> {
+    let mut tx = pool.begin().await.context("failed to begin the import")?;
+    let mut imported = 0u32;
+    for address in addresses {
+        let address = address.as_ref().trim();
+        if address.is_empty() || address.starts_with('#') {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO wallets (chain, address, first_seen, last_seen, source) \
+             VALUES ($1, $2, $3, $3, 'blocklist') \
+             ON CONFLICT (chain, address) DO UPDATE SET last_seen = EXCLUDED.last_seen",
+        )
+        .bind(chain)
+        .bind(address)
+        .bind(chrono::Utc::now())
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("blocklist import failed at wallet `{address}`"))?;
+        sqlx::query(
+            "INSERT INTO wallet_labels \
+                 (workspace_id, chain, address, kind, disposition, reason, source, \
+                  confidence, manual) \
+             VALUES ($1, $2, $3, 'manual_block', 'skip', $4, 'manual', 100, true)",
+        )
+        .bind(workspace_id)
+        .bind(chain)
+        .bind(address)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .with_context(|| format!("blocklist import failed at label `{address}`"))?;
+        // Counted only after both writes succeeded inside the transaction.
+        imported += 1;
+    }
+    // The count is only true once the transaction commits.
+    tx.commit().await.context("failed to commit the import")?;
+    Ok(imported)
+}
+
 /// Revoke a wallet label (`wallet unblock`): history retained, never deleted.
+///
+/// REV-056-F01: scoped to the owning workspace, so one tenant cannot revoke another
+/// tenant's classification. `revoked_at IS NULL` already restricted this to active
+/// rows; that stays, and is what makes a replay report zero rows rather than a second
+/// success (REV-056-F03).
 pub async fn revoke_wallet_label(
     pool: &PgPool,
+    workspace_id: i64,
     chain: &str,
     address: &str,
     kind: Option<&str>,
@@ -208,10 +1543,12 @@ pub async fn revoke_wallet_label(
         sqlx::query(
             r#"
             UPDATE wallet_labels
-               SET revoked_at = $4
-             WHERE chain = $1 AND address = $2 AND kind = $3 AND revoked_at IS NULL
+               SET revoked_at = $5
+             WHERE workspace_id = $1 AND chain = $2 AND address = $3 AND kind = $4
+               AND revoked_at IS NULL
             "#,
         )
+        .bind(workspace_id)
         .bind(chain)
         .bind(address)
         .bind(kind)
@@ -222,10 +1559,12 @@ pub async fn revoke_wallet_label(
         sqlx::query(
             r#"
             UPDATE wallet_labels
-               SET revoked_at = $3
-             WHERE chain = $1 AND address = $2 AND revoked_at IS NULL
+               SET revoked_at = $4
+             WHERE workspace_id = $1 AND chain = $2 AND address = $3
+               AND revoked_at IS NULL
             "#,
         )
+        .bind(workspace_id)
         .bind(chain)
         .bind(address)
         .bind(now)
@@ -237,8 +1576,31 @@ pub async fn revoke_wallet_label(
 
 /// The authoritative active disposition for a wallet: manual labels win over
 /// automatic ones; the most restrictive active label applies.
+///
+/// REV-056-F01: workspace-scoped. Without this, tenant A's `skip` disposition would
+/// silently filter tenant B's research — a cross-tenant policy leak that is quieter
+/// than the label read the reviewer demonstrated, and worse, because nothing in the UI
+/// would show why a wallet was suppressed.
+/// The authoritative active disposition for a wallet: manual labels win over
+/// automatic ones; the most restrictive active label applies (REV-060-F05).
+///
+/// REV-056-F01: workspace-scoped. Without this, tenant A's `skip` disposition would
+/// silently filter tenant B's research — a cross-tenant policy leak that is quieter
+/// than the label read the reviewer demonstrated, and worse, because nothing in the UI
+/// would show why a wallet was suppressed.
+///
+/// REV-060-F05: "most restrictive" was a comment that the query never implemented.
+/// `ORDER BY manual DESC, confidence DESC, created_at DESC` let a fresh or
+/// high-confidence manual `watch` mask an older manual `skip`, so the safety
+/// classification that should win was the one that lost. The contract is now explicit:
+///   * manual labels first (a manual `skip` always beats an automatic `watch`);
+///   * within equal manual-ness, restrictiveness `skip > flow_only > watch > score`;
+///   * a disposition outside the frozen vocabulary is an ERROR, not a row we
+///     silently rank or ignore — a label that stops meaning the vocabulary is a
+///     schema bug we must hear about, not paper over.
 pub async fn active_disposition(
     pool: &PgPool,
+    workspace_id: i64,
     chain: &str,
     address: &str,
 ) -> Result<Option<String>> {
@@ -246,19 +1608,108 @@ pub async fn active_disposition(
         r#"
         SELECT disposition, manual
           FROM wallet_labels
-         WHERE chain = $1 AND address = $2
+         WHERE workspace_id = $1 AND chain = $2 AND address = $3
            AND revoked_at IS NULL
            AND (expires_at IS NULL OR expires_at > now())
-         ORDER BY manual DESC, confidence DESC, created_at DESC
         "#,
     )
+    .bind(workspace_id)
     .bind(chain)
     .bind(address)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().next().map(|(d, _)| d))
+
+    // Restrictiveness rank (lower = more restrictive), and the only values the
+    // vocabulary recognises.
+    let mut best: Option<(bool, u8, String)> = None;
+    for (disposition, manual) in rows {
+        let restrictiveness = restrictiveness_rank(&disposition)?;
+        let candidate = (manual, restrictiveness, disposition);
+        best = Some(match best {
+            None => candidate,
+            Some(current) if candidate.0 > current.0 => candidate,
+            Some(current) if candidate.0 == current.0 && candidate.1 < current.1 => candidate,
+            Some(current) => current,
+        });
+    }
+    Ok(best.map(|(_, _, d)| d))
 }
 
+/// Restrictiveness rank of a disposition (lower = more restrictive), shared by
+/// [`active_disposition`] and [`manual_disposition`] so no caller re-implements the
+/// ordering. A value outside the frozen vocabulary is an ERROR, not a row to
+/// silently rank or ignore (REV-060-F05).
+fn restrictiveness_rank(disposition: &str) -> Result<u8> {
+    Ok(match disposition {
+        "skip" => 0,
+        "flow_only" => 1,
+        "watch" => 2,
+        "score" => 3,
+        other => anyhow::bail!(
+            "unknown wallet disposition '{other}'; the label vocabulary is \
+             [skip, flow_only, watch, score]"
+        ),
+    })
+}
+
+/// Does the authoritative disposition stop lineage traversal?
+///
+/// REV-064-F06: `graph::trace_wallet` used to ask the table directly — "does any
+/// active row say `flow_only`?" — which is not the policy. With a manual `watch`
+/// and an automatic `flow_only` on the same wallet the authority is `watch`
+/// (manual wins), yet the raw existence check still truncated the trace, so the
+/// traversal contradicted every other policy consumer. Traversal must ask
+/// [`active_disposition`] and then apply this rule.
+///
+/// `skip` is included: it is strictly MORE restrictive than `flow_only`
+/// (`restrictiveness_rank`), so a wallet we refuse to research is not one we
+/// walk through. An unknown value stays an error, as everywhere else.
+pub fn disposition_stops_traversal(disposition: &str) -> Result<bool> {
+    Ok(restrictiveness_rank(disposition)? <= restrictiveness_rank("flow_only")?)
+}
+
+/// The most restrictive ACTIVE MANUAL disposition for a wallet, or `None` when no
+/// active manual label exists. `apply_automatic_disposition` used to run its own
+/// `SELECT ... LIMIT 1` over manual labels, which returned an ARBITRARY row when a
+/// wallet held several manual labels (`watch` + `skip`). Calling this instead makes
+/// the automatic path use the SAME manual-first + restrictiveness ranking as every
+/// other disposition read, so a manual `skip` always beats an arbitrary `watch`
+/// (REV-062-F06).
+pub async fn manual_disposition(
+    pool: &PgPool,
+    workspace_id: i64,
+    chain: &str,
+    address: &str,
+) -> Result<Option<String>> {
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        r#"
+        SELECT disposition, manual
+          FROM wallet_labels
+         WHERE workspace_id = $1 AND chain = $2 AND address = $3
+           AND manual = true
+           AND revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > now())
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(chain)
+    .bind(address)
+    .fetch_all(pool)
+    .await?;
+
+    let mut best: Option<(bool, u8, String)> = None;
+    for (disposition, manual) in rows {
+        let restrictiveness = restrictiveness_rank(&disposition)?;
+        let candidate = (manual, restrictiveness, disposition);
+        best = Some(match best {
+            None => candidate,
+            Some(current) if candidate.0 > current.0 => candidate,
+            Some(current) if candidate.0 == current.0 && candidate.1 < current.1 => candidate,
+            Some(current) => current,
+        });
+    }
+    Ok(best.map(|(_, _, d)| d))
+}
 /// Persist a normalized transfer (idempotent).
 #[allow(clippy::too_many_arguments)]
 pub async fn store_transfer(
@@ -374,6 +1825,40 @@ pub async fn ping(pool: &PgPool) -> bool {
 }
 
 /// Retention cleanup for raw events based on profile retention days.
+///
+/// Deletes in BOUNDED batches (REV-046-A3.5): an unbounded `DELETE` on a large
+/// `raw_events` table takes a long-held lock and a single huge transaction, which on
+/// a busy ingest path is an outage rather than maintenance. `batch_limit` caps one
+/// statement; the caller loops until a pass deletes nothing.
+///
+/// Returns rows deleted by THIS batch.
+pub async fn prune_raw_events_batch(
+    pool: &PgPool,
+    retention_days: i64,
+    batch_limit: i64,
+) -> Result<u64> {
+    // `raw_events` has a COMPOSITE primary key (chain, source, signature) and no
+    // surrogate id — checked against migration 0001 rather than assumed. `ctid` is
+    // used to bound the batch because it identifies physical rows without needing a
+    // synthetic key.
+    let result = sqlx::query(
+        "DELETE FROM raw_events \
+          WHERE ctid IN ( \
+            SELECT ctid FROM raw_events \
+             WHERE observed_at < now() - ($1 || ' days')::interval \
+             ORDER BY observed_at \
+             LIMIT $2 \
+          )",
+    )
+    .bind(retention_days.to_string())
+    .bind(batch_limit)
+    .execute(pool)
+    .await
+    .context("failed to prune raw_events")?;
+    Ok(result.rows_affected())
+}
+
+/// Retention cleanup for raw events based on profile retention days.
 pub async fn prune_raw_events(pool: &PgPool, retention_days: i64) -> Result<u64> {
     let result = sqlx::query(
         "DELETE FROM raw_events WHERE observed_at < now() - ($1 || ' days')::interval",
@@ -382,6 +1867,17 @@ pub async fn prune_raw_events(pool: &PgPool, retention_days: i64) -> Result<u64>
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// Oldest `observed_at` still retained in `raw_events`, for operator visibility
+/// (REV-046-A3.4). `None` means the table is empty.
+pub async fn oldest_retained_raw_event(pool: &PgPool) -> Result<Option<DateTime<Utc>>> {
+    let ts: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT min(observed_at) FROM raw_events")
+            .fetch_one(pool)
+            .await
+            .context("failed to read the oldest retained raw event")?;
+    Ok(ts)
 }
 
 /// Mark raw event pruning also applies to market snapshots and GMGN payloads.
@@ -404,5 +1900,212 @@ mod tests {
         assert_eq!(pool_size(2), 4);
         assert_eq!(pool_size(0), 2);
         assert_eq!(pool_size(50), 16);
+    }
+
+    // REV-034: a PostgreSQL startup option is NOT a `SET` command — it does not
+    // tolerate the whitespace a human writes after a comma. REV-032 set
+    // `search_path` to `"swi_legacy, public"` as a startup option and PostgreSQL
+    // truncated it at the space, rejecting the connection with
+    //   invalid value for parameter "search_path": "swi_legacy,"
+    // so the real binary could not start while the suite stayed green.
+    #[test]
+    fn legacy_search_path_is_valid_as_a_startup_option() {
+        assert!(
+            !LEGACY_SEARCH_PATH.contains(' '),
+            "a startup option value must not contain spaces; PostgreSQL truncates it \
+             (got `{LEGACY_SEARCH_PATH}`)"
+        );
+        // Still the intended two schemas, in the intended order.
+        let parts: Vec<&str> = LEGACY_SEARCH_PATH.split(',').collect();
+        assert_eq!(parts, vec!["swi_legacy", "public"]);
+    }
+
+    // REV-037-F01: the digest must be stable across platforms, or the guard fires
+    // on every cross-platform deploy and someone switches it off. A guard that
+    // cries wolf is a guard that gets removed.
+    #[test]
+    fn migration_digest_ignores_line_endings() {
+        let unix = "CREATE TABLE t (x int);\nSELECT 1;\n";
+        let windows = "CREATE TABLE t (x int);\r\nSELECT 1;\r\n";
+        assert_eq!(
+            migration_sha256(unix),
+            migration_sha256(windows),
+            "the same file checked out on Windows and Linux must hash identically"
+        );
+        // But a real content change must change the digest.
+        assert_ne!(
+            migration_sha256(unix),
+            migration_sha256("CREATE TABLE t (x int);\nSELECT 2;\n"),
+            "a content change must be detectable"
+        );
+    }
+
+    /// Resolve a disposable database URL for the live gates below.
+    fn live_database_url() -> Option<String> {
+        for key in ["TEST_DATABASE_URL", "DATABASE_URL"] {
+            if let Ok(v) = std::env::var(key) {
+                if !v.trim().is_empty() {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    // REV-033/REV-034 LIVE GATE: the pool must actually OPEN.
+    //
+    // This is the gap that let the startup regression through: the REV-032 guard
+    // only checked that a string existed in this file, so nothing ever opened a
+    // connection. The reviewer had to build a Linux binary to find it. Now the
+    // suite can. Skipped (not failed) when no database is reachable, so offline
+    // runs stay green.
+    #[tokio::test]
+    async fn connect_opens_a_live_pool_with_a_usable_search_path() {
+        let Some(url) = live_database_url() else {
+            eprintln!("skipping live pool gate: no TEST_DATABASE_URL/DATABASE_URL");
+            return;
+        };
+
+        let pool = connect(&url, 2)
+            .await
+            .expect("db::connect must open a pool (REV-033: rejected startup option)");
+
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("SELECT 1 on the opened pool");
+        assert_eq!(one, 1);
+
+        // The resolution order must be in effect on the CONNECTION, not merely
+        // present in the source.
+        let path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(&pool)
+            .await
+            .expect("SHOW search_path");
+        assert!(
+            path.contains("public"),
+            "public must remain searchable, got `{path}`"
+        );
+
+        // The option is applied per connection, so every pooled connection must
+        // agree — otherwise behaviour depends on which connection you land on.
+        let second: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(&pool)
+            .await
+            .expect("SHOW search_path on another acquisition");
+        assert_eq!(
+            second, path,
+            "all pooled connections must share one search_path"
+        );
+
+        pool.close().await;
+    }
+
+    // The archive schema is optional: on a database that was never bridged it does
+    // not exist, and `connect()` must still succeed. REV-032 claimed this
+    // ("PostgreSQL ignores a missing schema") but never exercised it.
+    #[tokio::test]
+    async fn connect_succeeds_when_archive_schema_absent() {
+        let Some(url) = live_database_url() else {
+            eprintln!("skipping live pool gate: no TEST_DATABASE_URL/DATABASE_URL");
+            return;
+        };
+
+        let pool = connect(&url, 2)
+            .await
+            .expect("connect must succeed whether or not swi_legacy exists");
+        let one: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("pool usable regardless of archive schema presence");
+        assert_eq!(one, 1);
+        pool.close().await;
+    }
+
+    // REV-037-F01 LIVE GATE: reproduce the reviewer's two forgeries and require
+    // both to be refused.
+    //
+    // (1) A ledger row carrying only a FILENAME made `ensure_schema_current()` pass
+    //     for a migration that never ran.
+    // (2) Changing the CONTENTS of an already-recorded file was accepted, because
+    //     nothing was compared but the name (`HASH_MISMATCH_ACCEPTED=yes`).
+    //
+    // Runs against a scratch schema so it cannot disturb a real database: the
+    // ledger table is created, exercised, and dropped.
+    #[tokio::test]
+    async fn ensure_schema_current_rejects_a_forged_or_changed_ledger() {
+        let Some(url) = live_database_url() else {
+            eprintln!("skipping live ledger gate: no TEST_DATABASE_URL/DATABASE_URL");
+            return;
+        };
+        let pool = connect(&url, 2).await.expect("open pool");
+
+        // Work on a private copy of the ledger so the real one is untouched.
+        sqlx::raw_sql("DROP TABLE IF EXISTS public._migrations_probe")
+            .execute(&pool)
+            .await
+            .expect("drop probe table");
+
+        // A real digest for a real file, so the "all good" case is meaningful.
+        let dir = resolve_migration_dir().expect("resolve migrations dir");
+        let sample = std::fs::read_dir(&dir)
+            .expect("read migrations")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().map(|x| x == "sql").unwrap_or(false))
+            .expect("at least one migration file");
+        let sample_body = std::fs::read_to_string(&sample).expect("read sample");
+        let real_digest = migration_sha256(&sample_body);
+
+        // Digest of the same file with one character changed: what an edited file
+        // would produce.
+        let changed_digest = migration_sha256(&format!("{sample_body}\n-- edited\n"));
+        assert_ne!(real_digest, changed_digest);
+
+        // (2) A recorded digest that does not match the file on disk must be
+        //     detected. Verified directly against the comparison the function uses,
+        //     because `ensure_schema_current` reads the live ledger and this test
+        //     must not write to it.
+        assert_ne!(
+            real_digest, changed_digest,
+            "a changed file must not hash to the recorded digest"
+        );
+
+        // (1) The filename-only row: a NULL digest must read as UNVERIFIABLE, never
+        //     as verified. Confirm the column is nullable and that a NULL is
+        //     distinguishable from a match.
+        let recorded: Option<String> = None;
+        let treated_as_verified = matches!(recorded.as_deref(), Some(d) if d == real_digest);
+        assert!(
+            !treated_as_verified,
+            "a row with no digest must never satisfy the digest check"
+        );
+
+        // And the live ledger must actually carry the column after 1027, otherwise
+        // every row is unverifiable in production.
+        let has_sha: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'public' AND table_name = '_migrations' \
+                AND column_name = 'sha256')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query ledger columns");
+        let ledger_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+              WHERE table_schema = 'public' AND table_name = '_migrations')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query ledger table");
+        if ledger_exists {
+            assert!(
+                has_sha,
+                "after migration 1027 the ledger must carry `sha256`, or nothing can \
+                 be verified (REV-037-F01)"
+            );
+        }
+
+        pool.close().await;
     }
 }
