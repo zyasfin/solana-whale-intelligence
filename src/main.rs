@@ -13,15 +13,76 @@ mod config;
 mod db;
 mod filter;
 mod funding_radar;
+/// Shared setup for live PostgreSQL tests (REV-053-F04).
+#[cfg(all(test, feature = "pg_tests"))]
+mod pg_test_support;
 #[cfg(all(test, feature = "pg_tests"))]
 mod funding_radar_pg_tests;
 #[cfg(all(test, feature = "pg_tests"))]
 mod recent_store_pg_tests;
+/// REV-051 C1/C3 launch-blocker tests against a live database.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev052_launch_blocker_pg_tests;
+/// REV-051 C2 two-session HTTP workspace isolation against the real router.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev052_workspace_http_pg_tests;
+/// REV-056 F01–F05 tenancy and false-success tests against a live database.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev057_tenancy_pg_tests;
+/// REV-058 F01–F07 scope, transition, concurrency, and error-propagation tests.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev059_scope_pg_tests;
+/// REV-053-F01/F02 writer-to-worker reachability on the production path.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev054_writer_reachability_pg_tests;
+/// REV-064-F04..F08 residual regressions against a live database.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev065_residual_pg_tests;
+/// REV-072-F06 cluster-canonicalization and signal-tenancy regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev073_signal_tenancy_pg_tests;
+/// REV-074-F01..F04 signal-runtime regressions against a live database.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev075_signal_runtime_pg_tests;
+/// REV-076-F02..F04 outbox fencing, eval claim, and queue authority regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev077_outbox_fencing_pg_tests;
+/// REV-078-F01..F06 outbox runtime/grants/subject regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev079_outbox_runtime_pg_tests;
+/// REV-080-F01..F07 upgrade/outbox regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev081_upgrade_outbox_pg_tests;
+/// REV-082-F01..F05 funding identity/outbox regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev083_funding_identity_pg_tests;
+/// REV-084-F03 funding case semantic-merge dedup regression.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev085_funding_merge_pg_tests;
+/// REV-084-F01 migration immutability + legacy dedup-key upgrade regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev085_migration_immutability_pg_tests;
+/// REV-084-F02/F04 outbox completion-observability and tenancy regressions.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev085_outbox_observability_pg_tests;
+/// REV-086-F01 migration digest-drift, range safety and preflight idempotency.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev087_migration_integrity_pg_tests;
+/// REV-086-F03 complete funding-case merge, JSON shapes, alert identity.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev087_funding_identity_pg_tests;
+/// REV-086-F02/F04/F06 drain observability, case ownership, fenced exit writer.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev087_alert_ownership_pg_tests;
+/// REV-086-F05 evaluator claim release and failure accounting.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev087_evaluator_lifecycle_pg_tests;
 mod gmgn;
 mod graph;
 mod health;
 mod helius;
 mod ingest;
+mod maintenance;
 mod models;
 mod narrative;
 mod queues;
@@ -113,9 +174,41 @@ enum Command {
 #[derive(Subcommand)]
 enum DbAction {
     /// Apply migrations
-    Migrate,
+    Migrate {
+        /// Accept the pre-checksum migration history of an EXISTING database as
+        /// the baseline (REV-041-F01).
+        ///
+        /// A filename-only ledger row records that a migration named X ran; it
+        /// cannot record WHICH BYTES ran. REV-040 backfilled such rows with the
+        /// digest of the current file and called them verified — that asserts a
+        /// historical fact nobody knows. This repository actually contains such
+        /// drift: `1013_strategy_lab.sql` once created
+        /// `strategy_versions_lifecycle_check` and once
+        /// `strategy_versions_lifecycle_state_check`, so a database carrying the
+        /// older name still rejects `canary`/`paused` while the ledger claims the
+        /// current file was applied.
+        ///
+        /// Those rows are therefore recorded as `baseline:<digest>` — accepted, but
+        /// explicitly NOT verified — and only when the operator passes this flag,
+        /// having reconciled the schema. Without it, migration stops and says what
+        /// to check.
+        #[arg(long)]
+        accept_legacy_baseline: bool,
+    },
     /// Hash a password for ADMIN_PASSWORD_HASH
     HashPassword,
+    /// Report migration ledger state, including rows accepted as a legacy baseline
+    /// rather than verified at apply time (REV-041-F01).
+    Status,
+    /// Run ONE retention maintenance cycle now and report what it did
+    /// (REV-050-F03).
+    ///
+    /// The scheduler owned by `run` uses a six-hour interval, so a real cycle was
+    /// not observable in any reasonable smoke window — only the startup log line
+    /// was. This executes the SAME `run_cycle_recording` the scheduler calls, then
+    /// prints the observable state, so a prune (and a forced failure) can be
+    /// verified against the actual binary. It does not start a loop.
+    RetentionRunOnce,
 }
 
 #[derive(Subcommand)]
@@ -319,11 +412,53 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Db { action } => match action {
-            DbAction::Migrate => {
+            DbAction::Migrate { accept_legacy_baseline } => {
+                // The ONLY command that applies migrations, and the only one that
+                // uses the privileged credential (REV-035-#1).
+                let database_url = require_migration_database_url(&settings)?;
+                let pool = db::connect(&database_url, 2).await?;
+                db::migrate_with(&pool, accept_legacy_baseline).await?;
+                println!("migrations applied");
+            }
+            DbAction::Status => {
+                // Read-only, so it runs as the least-privilege runtime role.
+                //
+                // REV-045-F01: this used to `println!` the failure and fall through,
+                // so `db status` exited 0 while reporting `schema NOT current`. Every
+                // caller that reads an exit code — systemd, CI, cron, a health probe,
+                // a deploy gate — would have read the failure as success. I added
+                // this command so the baseline boundary could be inspected, then made
+                // it unreadable to the machines that do the inspecting.
+                //
+                // The error is returned rather than `exit(1)`ed so normal Rust error
+                // handling sets the exit code and the original cause stays attached.
                 let database_url = require_database_url(&settings)?;
                 let pool = db::connect(&database_url, 2).await?;
-                db::migrate(&pool).await?;
-                println!("migrations applied");
+                let baseline = db::baseline_migrations(&pool)
+                    .await
+                    .context("schema status unavailable")?;
+                db::ensure_schema_current(&pool)
+                    .await
+                    .context("schema NOT current")?;
+                if baseline.is_empty() {
+                    println!("schema current; every applied migration is digest-verified");
+                } else {
+                    // Exit 0: a baseline is an accepted state, not a failure. It is
+                    // reported on stdout AND as a warning so automation can grep for
+                    // it without treating it as an outage.
+                    println!(
+                        "schema accepted, but {} migration(s) are an ACCEPTED BASELINE, \
+                         not verified:",
+                        baseline.len()
+                    );
+                    for name in &baseline {
+                        println!("  baseline (applied bytes unknown): {name}");
+                    }
+                    println!(
+                        "These ran before digests were recorded. A filename-only ledger \
+                         row cannot prove which bytes were applied."
+                    );
+                }
             }
             DbAction::HashPassword => {
                 use std::io::{self, Write};
@@ -337,12 +472,47 @@ async fn main() -> Result<()> {
                 println!("add to .env:");
                 println!("ADMIN_PASSWORD_HASH_B64={b64}");
             }
+            DbAction::RetentionRunOnce => {
+                // Least-privilege runtime role, exactly like the scheduler: the point
+                // is to exercise the production path, so a privileged credential here
+                // would prove nothing about what `run` can actually do.
+                let database_url = require_database_url(&settings)?;
+                let pool = db::connect_verified(&database_url, 2).await?;
+                let profile_days = settings.config.runtime_profile.raw_retention_days();
+                let override_days = match settings.config.runtime_profile {
+                    config::RuntimeProfile::Low => settings.config.retention.raw_events_days_low,
+                    config::RuntimeProfile::Scale => settings.config.retention.raw_events_days_scale,
+                };
+                let retention_days =
+                    maintenance::effective_retention_days(profile_days, override_days)
+                        .context("invalid raw-event retention configuration")?;
+                let state = maintenance::MaintenanceState::new();
+                let result =
+                    maintenance::run_cycle_recording(&pool, retention_days, &state).await;
+                // The state is printed for BOTH outcomes: a failed cycle must be
+                // inspectable (last_error + no last_success), which is the readback
+                // REV-050-F03 asks for.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "retention_days": retention_days,
+                        "rows_pruned_this_cycle": result.as_ref().ok().copied(),
+                        "rows_pruned_total": state.rows_pruned_total(),
+                        "last_success": state.last_success().map(|d| d.to_rfc3339()),
+                        "last_error": state.last_error(),
+                        "last_error_at": state.last_error_at().map(|d| d.to_rfc3339()),
+                        "oldest_retained": state.oldest_retained().map(|d| d.to_rfc3339()),
+                    }))?
+                );
+                // Non-zero exit on failure (REV-045-F01: a report that exits 0 while
+                // reporting a failure is unreadable to systemd, cron, and CI).
+                result.context("retention cycle failed")?;
+            }
         },
         Command::Token { action } => match action {
             TokenAction::Discover { once: _ } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
-                db::migrate(&pool).await?;
+                let pool = db::connect_verified(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
                 narrative::seed_narratives(&pool).await?;
                 let gmgn = gmgn::GmgnClient::new(
                     settings.config.gmgn.clone(),
@@ -351,13 +521,19 @@ async fn main() -> Result<()> {
                 if !gmgn.is_configured() {
                     bail!("GMGN_API_KEY missing; discovery disabled");
                 }
-                let discovered = workers::discover_tokens_once(&pool, &gmgn, models::ChainKind::Solana).await?;
+                    // One-shot discovery: the workspace still comes from configuration,
+                // never from the provider payload it is about to read.
+                let workspace = solana_whale_intelligence::sf::recent_pipeline::WorkspaceScope::from_job_context(
+                    settings.config.workspace_id,
+                )
+                .context("invalid workspace_id")?;
+                let discovered = workers::discover_tokens_once(&pool, &gmgn, models::ChainKind::Solana, workspace).await?;
                 println!("discovered {} token(s) from GMGN", discovered);
             }
             TokenAction::Report { mint, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
+                let pool = db::connect_verified(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
                 let report = narrative::explain_narrative(&pool, chain, &mint, Utc::now()).await?;
                 match report {
                     Some(report) => {
@@ -391,7 +567,7 @@ async fn main() -> Result<()> {
             TelegramAction::Channels { action } => match action {
                 ChannelsAction::List => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let rows: Vec<(String, String)> = sqlx::query_as(
                     "SELECT channel_key, status FROM telegram_channels ORDER BY channel_key",
                 )
@@ -406,7 +582,7 @@ async fn main() -> Result<()> {
             }
                 ChannelsAction::Add { username_or_id } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 sqlx::query(
                     r#"
                     INSERT INTO telegram_channels (channel_key, username, allowlisted, status)
@@ -423,7 +599,7 @@ async fn main() -> Result<()> {
             }
                 ChannelsAction::Remove { channel_key } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 sqlx::query(
                     "UPDATE telegram_channels SET allowlisted = false, status = 'disabled' WHERE channel_key = $1",
                 )
@@ -435,7 +611,7 @@ async fn main() -> Result<()> {
             }
             TelegramAction::Backfill { channel_key, from, to } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let from_time = chrono::DateTime::parse_from_rfc3339(&from)
                     .with_context(|| "invalid --from RFC3339")?
                     .with_timezone(&Utc);
@@ -457,7 +633,7 @@ async fn main() -> Result<()> {
             FundingAction::Radar { action } => match action {
                 RadarAction::List { stage, limit } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let rows: Vec<(i64, String, String, String, i32)> = sqlx::query_as(
                     r#"
                     SELECT id, chain, recipient, stage, confidence
@@ -477,7 +653,7 @@ async fn main() -> Result<()> {
             }
                 RadarAction::Inspect { case_id } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let events: Vec<(String, chrono::DateTime<Utc>, serde_json::Value)> = sqlx::query_as(
                     "SELECT event_kind, observed_at, evidence FROM funding_radar_events WHERE case_id = $1 ORDER BY observed_at",
                 )
@@ -492,9 +668,10 @@ async fn main() -> Result<()> {
                 RadarAction::Evaluate { recipient, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let decision = funding_radar::evaluate_radar_case(
                     &pool,
+                    config_workspace(&settings)?,
                     chain,
                     &recipient,
                     Utc::now(),
@@ -515,46 +692,59 @@ async fn main() -> Result<()> {
             WalletAction::Sync { address, chain, max_pages } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
-                db::migrate(&pool).await?;
+                let pool = db::connect_verified(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
                 let adapter = chains::SolanaAdapter::new();
                 let helius = helius::HeliusPool::new(settings.env.helius_keys.clone(), settings.config.helius.clone());
                 if helius.provider_count() == 0 {
                     bail!("no HELIUS_KEY_1 configured; set user-owned keys");
                 }
-                let outcome = ingest::sync_wallet(&pool, &helius, chain, &address, &adapter, max_pages).await?;
-                println!(
-                    "pages={} transfers_new={} trades_new={} completed={}",
-                    outcome.pages_fetched, outcome.transfers_new, outcome.trades_new, outcome.completed
-                );
+                // REV-067-F06: deep-sync is a policy decision, so the CLI passes its
+                // job-context workspace exactly like the label commands do.
+                let outcome = ingest::sync_wallet(&pool, config_workspace(&settings)?, &helius, chain, &address, &adapter, max_pages).await?;
+                if outcome.skipped_by_policy {
+                    println!("skipped: the wallet's active disposition forbids deep-sync");
+                } else {
+                    println!(
+                        "pages={} transfers_new={} trades_new={} completed={}",
+                        outcome.pages_fetched, outcome.transfers_new, outcome.trades_new, outcome.completed
+                    );
+                }
             }
             WalletAction::Score { address, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 // Recompute from current trade history (idempotent per as_of minute).
                 let as_of = chrono::DateTime::from_timestamp(
                     Utc::now().timestamp() - (Utc::now().timestamp() % 60),
                     0,
                 )
                 .unwrap_or_else(Utc::now);
+                // REV-067-F06: only a `score` wallet contributes alpha, so the CLI
+                // reads the same authority the worker does.
                 let result = workers::score_wallet(
                     &pool,
+                    config_workspace(&settings)?,
                     chain,
                     &address,
                     as_of,
                     &settings.config.scoring,
                 )
                 .await?;
-                println!(
-                    "skill={} copyability={} conviction={} provisional={}",
-                    result.skill, result.copyability, result.conviction, result.provisional
-                );
+                match result {
+                    Some(result) => println!(
+                        "skill={} copyability={} conviction={} provisional={}",
+                        result.skill, result.copyability, result.conviction, result.provisional
+                    ),
+                    None => println!(
+                        "not scored: the wallet's active disposition excludes it from alpha"
+                    ),
+                }
             }
             WalletAction::Leaderboard { chain, limit } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let rows: Vec<(String, i32, i32)> = sqlx::query_as(
                     r#"
                     SELECT DISTINCT ON (address) address, skill_score, conviction
@@ -575,10 +765,14 @@ async fn main() -> Result<()> {
             WalletAction::Block { address, chain, reason } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 db::upsert_wallet(&pool, chain.as_str(), &address, Utc::now(), "manual").await?;
                 db::add_wallet_label(
                     &pool,
+                    // REV-056-F01: the CLI's workspace is its job context, exactly
+                    // like the worker's (`WorkspaceScope::from_job_context`). A label
+                    // with no owner is the hole the finding is about.
+                    config_workspace(&settings)?,
                     chain.as_str(),
                     &address,
                     "manual_block",
@@ -595,10 +789,11 @@ async fn main() -> Result<()> {
             WalletAction::FlowOnly { address, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 db::upsert_wallet(&pool, chain.as_str(), &address, Utc::now(), "manual").await?;
                 db::add_wallet_label(
                     &pool,
+                    config_workspace(&settings)?,
                     chain.as_str(),
                     &address,
                     "manual_flow_only",
@@ -615,10 +810,11 @@ async fn main() -> Result<()> {
             WalletAction::Watch { address, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 db::upsert_wallet(&pool, chain.as_str(), &address, Utc::now(), "manual").await?;
                 db::add_wallet_label(
                     &pool,
+                    config_workspace(&settings)?,
                     chain.as_str(),
                     &address,
                     "manual_watch",
@@ -635,28 +831,39 @@ async fn main() -> Result<()> {
             WalletAction::Unblock { address, chain, kind } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
-                let revoked = db::revoke_wallet_label(&pool, chain.as_str(), &address, kind.as_deref(), Utc::now()).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
+                let revoked = db::revoke_wallet_label(&pool, config_workspace(&settings)?, chain.as_str(), &address, kind.as_deref(), Utc::now()).await?;
                 println!("revoked {revoked} labels for {}", models::short_addr(&address));
             }
             WalletAction::Labels { address, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
-                let rows: Vec<(String, String, bool, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+                let pool = db::connect_verified(&database_url, 2).await?;
+                let rows: Vec<(String, String, bool, Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
                     r#"
-                    SELECT kind, disposition, manual, revoked_at
+                    SELECT kind, disposition, manual, revoked_at, expires_at
                       FROM wallet_labels
-                     WHERE chain = $1 AND address = $2
+                     WHERE workspace_id = $1 AND chain = $2 AND address = $3
                      ORDER BY created_at DESC
                     "#,
                 )
+                .bind(config_workspace(&settings)?)
                 .bind(chain.as_str())
                 .bind(&address)
                 .fetch_all(&pool)
                 .await?;
-                for (kind, disposition, manual, revoked) in rows {
-                    let status = revoked.map(|_| "revoked").unwrap_or("active");
+                let now = Utc::now();
+                for (kind, disposition, manual, revoked, expires) in rows {
+                    // REV-058-F02 (same class): an expired label is reported as
+                    // `expired`, not `active`. Printing `active` for a label the policy
+                    // queries already ignore tells an operator the opposite of the truth.
+                    let status = if revoked.is_some() {
+                        "revoked"
+                    } else if expires.map(|e| e <= now).unwrap_or(false) {
+                        "expired"
+                    } else {
+                        "active"
+                    };
                     let source = if manual { "manual" } else { "auto" };
                     println!("{kind} disposition={disposition} source={source} status={status}");
                 }
@@ -665,37 +872,29 @@ async fn main() -> Result<()> {
                 let chain = parse_chain(&chain)?;
                 let content = std::fs::read_to_string(&path).with_context(|| format!("failed to read {path}"))?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
-                let mut imported = 0u32;
-                for line in content.lines() {
-                    let address = line.trim();
-                    if address.is_empty() || address.starts_with('#') {
-                        continue;
-                    }
-                    db::upsert_wallet(&pool, chain.as_str(), address, Utc::now(), "blocklist").await?;
-                    db::add_wallet_label(
-                        &pool,
-                        chain.as_str(),
-                        address,
-                        "manual_block",
-                        "skip",
-                        "imported blocklist",
-                        "manual",
-                        100,
-                        true,
-                        None,
-                    )
-                    .await?;
-                    imported += 1;
-                }
+                let pool = db::connect_verified(&database_url, 2).await?;
+                // REV-058-F03: the SAME transactional import the HTTP handler uses. The
+                // previous loop autocommitted per row, so a failure midway through a
+                // file left the earlier addresses blocked and the later ones not — a
+                // half-applied blocklist, which REV-056-F05 ruled out for the HTTP path
+                // and I neglected to apply here.
+                let imported = db::import_blocklist_tx(
+                    &pool,
+                    config_workspace(&settings)?,
+                    chain.as_str(),
+                    content.lines(),
+                    "imported blocklist",
+                )
+                .await?;
                 println!("imported {imported} blocked wallets");
             }
         },
         Command::Trace { address, chain, depth } => {
             let chain = parse_chain(&chain)?;
             let database_url = require_database_url(&settings)?;
-            let pool = db::connect(&database_url, 2).await?;
-            let steps = graph::trace_wallet(&pool, chain, &address, depth).await?;
+            let pool = db::connect_verified(&database_url, 2).await?;
+            // REV-058-F02: the trace policy is workspace-scoped.
+            let steps = graph::trace_wallet(&pool, config_workspace(&settings)?, chain, &address, depth).await?;
             if steps.is_empty() {
                 println!("no funding edges for {}", models::short_addr(&address));
             }
@@ -717,15 +916,22 @@ async fn main() -> Result<()> {
                 None => Utc::now(),
             };
             let database_url = require_database_url(&settings)?;
-            let pool = db::connect(&database_url, 2).await?;
+            let pool = db::connect_verified(&database_url, 2).await?;
+            // REV-072-F06: evaluations are workspace-owned; a replay report that
+            // counts every tenant's rows describes a database, not this deployment.
+            let workspace_id = config_workspace(&settings)?;
             let accepted: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM signal_evaluations WHERE status = 'accepted'",
+                "SELECT COUNT(*) FROM signal_evaluations \
+                  WHERE workspace_id = $1 AND status = 'accepted'",
             )
+            .bind(workspace_id)
             .fetch_one(&pool)
             .await?;
             let rejected: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM signal_evaluations WHERE status = 'rejected'",
+                "SELECT COUNT(*) FROM signal_evaluations \
+                  WHERE workspace_id = $1 AND status = 'rejected'",
             )
+            .bind(workspace_id)
             .fetch_one(&pool)
             .await?;
             println!("replay at {}", evaluation_time.to_rfc3339());
@@ -734,16 +940,19 @@ async fn main() -> Result<()> {
         Command::Signal { action } => match action {
             SignalAction::Rejected { limit } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
+                // REV-072-F06: the tenant this deployment is configured for.
+                let workspace_id = config_workspace(&settings)?;
                 let rows: Vec<(String, String, Option<String>, chrono::DateTime<Utc>)> = sqlx::query_as(
                     r#"
                     SELECT chain, mint, rejection_code, evaluated_at
                       FROM signal_evaluations
-                     WHERE status = 'rejected'
+                     WHERE workspace_id = $1 AND status = 'rejected'
                      ORDER BY evaluated_at DESC
-                     LIMIT $1
+                     LIMIT $2
                     "#,
                 )
+                .bind(workspace_id)
                 .bind(limit)
                 .fetch_all(&pool)
                 .await?;
@@ -754,16 +963,87 @@ async fn main() -> Result<()> {
             SignalAction::Evaluate { mint, chain } => {
                 let chain = parse_chain(&chain)?;
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
-                let result = workers::evaluate_token_signals(
+                let pool = db::connect_verified(&database_url, 2).await?;
+                let workspace_id = config_workspace(&settings)?;
+
+                // REV-084-F05 (MEDIUM): check the durable queue pause state
+                // before acquiring a claim — the worker loop checks it, and the
+                // CLI must respect the same authority.
+                {
+                    let paused: Option<bool> = sqlx::query_scalar(
+                        "SELECT paused FROM queue_state WHERE queue = $1",
+                    )
+                    .bind(crate::queues::QUEUE_SIGNAL_EVAL)
+                    .fetch_optional(&pool)
+                    .await?;
+                    if paused == Some(true) {
+                        println!("signal evaluation queue is paused; refusing to evaluate {mint}");
+                        std::process::exit(1);
+                    }
+                }
+
+                let claimant = format!("cli-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+                let claimed: Option<i64> = sqlx::query_scalar(
+                    r#"
+                    INSERT INTO signal_eval_claims (workspace_id, chain, mint, claimed_by, expires_at)
+                    VALUES ($1, $2, $3, $4, now() + interval '10 minutes')
+                    ON CONFLICT (workspace_id, chain, mint) DO UPDATE
+                        SET claimed_by = $4, claimed_at = now(), expires_at = now() + interval '10 minutes'
+                        WHERE signal_eval_claims.expires_at <= now()
+                    RETURNING workspace_id
+                    "#,
+                )
+                .bind(workspace_id)
+                .bind(chain.as_str())
+                .bind(&mint)
+                .bind(&claimant)
+                .fetch_optional(&pool)
+                .await?;
+                if claimed.is_none() {
+                    eprintln!("another worker holds the evaluation claim for {mint}");
+                    std::process::exit(1);
+                }
+                let result = workers::evaluate_token_signals_fenced(
                     &pool,
+                    workspace_id,
                     chain,
                     &mint,
                     Utc::now(),
                     &settings.config.signals,
+                    &claimant,
                 )
-                .await?;
-                match result {
+                .await;
+                // Release fenced by the claim token. On evaluator failure the
+                // claim row may already be gone (fenced release inside the
+                // transaction), so a zero-row delete is not an error.
+                let release = sqlx::query(
+                    "DELETE FROM signal_eval_claims \
+                     WHERE workspace_id = $1 AND chain = $2 AND mint = $3 AND claimed_by = $4",
+                )
+                .bind(workspace_id)
+                .bind(chain.as_str())
+                .bind(&mint)
+                .bind(&claimant)
+                .execute(&pool)
+                .await;
+                // REV-087-F05 (MEDIUM): the comment said "combined", but `result?`
+                // short-circuited BEFORE `release?` was ever evaluated, so whenever
+                // the evaluator failed the release's own error was silently dropped.
+                // Both outcomes are now preserved and observable.
+                let eval_result = match (result, release) {
+                    (Err(eval_err), Err(release_err)) => {
+                        return Err(eval_err.context(format!(
+                            "the evaluation claim release also failed: {release_err}"
+                        )));
+                    }
+                    (Err(eval_err), Ok(_)) => return Err(eval_err),
+                    (Ok(_), Err(release_err)) => {
+                        return Err(anyhow::Error::new(release_err)
+                            .context("evaluation succeeded but its claim release failed"));
+                    }
+                    (Ok(value), Ok(_)) => value,
+                };
+                match eval_result {
                     Some(id) => println!("signal id {id} created for {mint}"),
                     None => println!("no signal for {mint} (rejection recorded)"),
                 }
@@ -772,8 +1052,7 @@ async fn main() -> Result<()> {
         Command::Watch { action } => match action {
             WatchAction::ServeWebhook { bind } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
-                db::migrate(&pool).await?;
+                let pool = db::connect_verified(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
                 let bind = bind
                     .or_else(|| settings.config.server.webhook_bind.clone())
                     .unwrap_or_else(|| "127.0.0.1:8787".to_string());
@@ -790,7 +1069,7 @@ async fn main() -> Result<()> {
             }
             WatchAction::ServeApi { bind } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let bind = bind
                     .or_else(|| settings.config.server.webhook_bind.clone())
                     .unwrap_or_else(|| "127.0.0.1:8788".to_string());
@@ -806,8 +1085,7 @@ async fn main() -> Result<()> {
             }
             WatchAction::ServeAdmin { bind } => {
                 let database_url = require_database_url(&settings)?;
-                let pool = db::connect(&database_url, 2).await?;
-                db::migrate(&pool).await?;
+                let pool = db::connect_verified(&database_url, 2).await?;
                 let bind = bind
                     .or_else(|| settings.config.server.webhook_bind.clone())
                     .unwrap_or_else(|| "127.0.0.1:8789".to_string());
@@ -835,9 +1113,61 @@ async fn main() -> Result<()> {
         },
         Command::Run => {
             let database_url = require_database_url(&settings)?;
-            let pool = db::connect(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
-            db::migrate(&pool).await?;
+            let pool = db::connect_verified(&database_url, db::pool_size(settings.config.runtime_profile.provider_workers())).await?;
             narrative::seed_narratives(&pool).await?;
+
+            // REV-046-A3: the retention maintenance task, owned by `Run` and only by
+            // `Run`. `prune_raw_events`/`prune_market_snapshots` and
+            // `raw_retention_days()` existed for several phases with no caller, so
+            // disposable payloads grew without bound and nothing reported it.
+            //
+            // Retention is validated before the task starts: an invalid value fails
+            // startup rather than being clamped, because silently pruning to a
+            // different horizon than configured is how data disappears unexpectedly.
+            let profile_days = settings.config.runtime_profile.raw_retention_days();
+            let override_days = match settings.config.runtime_profile {
+                config::RuntimeProfile::Low => settings.config.retention.raw_events_days_low,
+                config::RuntimeProfile::Scale => settings.config.retention.raw_events_days_scale,
+            };
+            let retention_days =
+                maintenance::effective_retention_days(profile_days, override_days)
+                    .context("invalid raw-event retention configuration")?;
+            let maintenance_state = maintenance::spawn(
+                pool.clone(),
+                retention_days,
+                Duration::from_secs(6 * 60 * 60),
+            );
+
+            // A state nobody reads is not observability. A periodic reporter logs the
+            // maintenance view so `Run` surfaces staleness even when nobody polls
+            // `health` — the failure mode being guarded is a task that dies quietly.
+            {
+                let ms = maintenance_state.clone();
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+                    loop {
+                        tick.tick().await;
+                        let stale = ms.is_stale(Utc::now());
+                        if stale || ms.last_error().is_some() {
+                            tracing::warn!(
+                                stale,
+                                last_error = ?ms.last_error(),
+                                last_error_at = ?ms.last_error_at(),
+                                last_success = ?ms.last_success(),
+                                rows_pruned_total = ms.rows_pruned_total(),
+                                "retention maintenance DEGRADED"
+                            );
+                        } else {
+                            tracing::debug!(
+                                rows_pruned_total = ms.rows_pruned_total(),
+                                oldest_retained = ?ms.oldest_retained(),
+                                next_run = ?ms.next_run(),
+                                "retention maintenance healthy"
+                            );
+                        }
+                    }
+                });
+            }
 
             let gmgn = if settings.env.gmgn_api_key.is_some() {
                 Some(gmgn::GmgnClient::new(settings.config.gmgn.clone(), settings.env.gmgn_api_key.clone()))
@@ -846,7 +1176,18 @@ async fn main() -> Result<()> {
                 None
             };
 
-            let ctx = std::sync::Arc::new(workers::WorkerContext::new(pool, &settings));
+            // REV-046-A4: the workspace is bound ONCE here, from the job context, and
+            // validated. Workers receive it through `WorkerContext`; nothing derives
+            // it from a provider payload or a request body.
+            let workspace = solana_whale_intelligence::sf::recent_pipeline::WorkspaceScope::from_job_context(
+                settings.config.workspace_id,
+            )
+            .context("invalid workspace_id for the worker job context")?;
+            let ctx = std::sync::Arc::new(workers::WorkerContext::new(
+                pool,
+                &settings,
+                workspace,
+            ));
 
             // Optional Robinhood funding poller over the Helius multi-chain
             // EVM endpoint (requires HELIUS_KEY_1; disabled without it).
@@ -944,7 +1285,7 @@ async fn main() -> Result<()> {
         },
         Command::Health => {
             let database_url = require_database_url(&settings)?;
-            let pool = db::connect(&database_url, 2).await?;
+            let pool = db::connect_verified(&database_url, 2).await?;
             let robinhood_configured = !settings.env.helius_keys.is_empty()
                 && !settings.config.chains.robinhood.chain_id.is_empty();
             let chain_health = health::chain_health(
@@ -965,12 +1306,16 @@ async fn main() -> Result<()> {
             } else {
                 None
             };
+            // `health` is a one-shot command: it runs no maintenance task of its
+            // own, so it reports `not_running_in_this_process` rather than implying
+            // the pruner is fine. The live view belongs to `Run`, which owns the task.
             let report = health::report(
                 &pool,
                 chain_health,
                 helius.provider_count(),
                 gmgn.is_configured(),
                 bucket_tokens,
+                None,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -986,6 +1331,46 @@ fn require_database_url(settings: &Settings) -> Result<String> {
         .clone()
         .filter(|url| !url.trim().is_empty())
         .context("DATABASE_URL not set; copy .env.example to .env and configure it")
+}
+
+/// The workspace a CLI command operates in (REV-056-F01).
+///
+/// Labels are workspace-owned, and the CLI's owner is its configured job context —
+/// the same value `Command::Run` binds through
+/// `WorkspaceScope::from_job_context`. Validated here so an invalid configuration
+/// fails the command instead of writing an unowned or mis-owned row.
+fn config_workspace(settings: &Settings) -> Result<i64> {
+    let id = settings.config.workspace_id;
+    if id <= 0 {
+        bail!("workspace_id must be positive; configured {id}");
+    }
+    Ok(id)
+}
+
+/// Credentials for applying migrations (REV-035-#1).
+///
+/// Prefers `MIGRATION_DATABASE_URL` — the privileged role that may run DDL and
+/// create roles. Falls back to `DATABASE_URL` so a single-role development setup
+/// still works; only `swi db migrate` ever calls this, so the fallback cannot put
+/// privileged credentials on a service start path.
+fn require_migration_database_url(settings: &Settings) -> Result<String> {
+    if let Some(url) = settings
+        .env
+        .migration_database_url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+    {
+        return Ok(url);
+    }
+    settings
+        .env
+        .database_url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+        .context(
+            "neither MIGRATION_DATABASE_URL nor DATABASE_URL is set; migrations need a \
+             role that may run DDL",
+        )
 }
 
 fn parse_chain(value: &str) -> Result<models::ChainKind> {
