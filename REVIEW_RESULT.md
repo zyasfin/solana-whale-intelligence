@@ -104,6 +104,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-090 | 2026-09-08 | correction after late independent dissent on REV-089 F01 | CHANGES REQUIRED / PARTIAL | F02â€“F06 accepted; F01 int8/control-flow/provenance gaps open |
 | REV-091 | 2026-09-08 | implementation of REV-090-F01 only (exact positive-int8 segment validation, independent funding-subject check before the repair decision, authenticated content-addressed predecessor replay, resolver comment corrected to packaged-canonical order) | READY FOR REVIEW | 369/369 + 490/490 (487 + 3 new); 4/4 Rust 1.89 gates 0 warning; unique serial disposable DB, 52\|52\|0, baseline 0; all three sub-issues RED→GREEN incl. valid 19-digit owner preserved and named refusal before any DDL |
 | REV-092 | 2026-09-08 | corrective for the independent review of REV-091 (leading-zero normalization before length/range so padded ids are judged by value, all-zero rejected as non-positive, strict manifest bijection parser, convergence test on the packaged bundle with ledger/schema/constraint/cutover snapshot around an exact-no-op second pass, stale resolver error text) | READY FOR REVIEW | 369/369 + 494/494 (490 + 4 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, resolver readback `migrations`; 7 focused tests each `running 1 test`; 6 RED→GREEN incl. padded owner preserved and lax parser rejected; `fmt --check` fails PRE-EXISTING (84/84 files unformatted at base, unchanged by this round) |
+| REV-094 | 2026-09-08 | corrective for REV-093-F01 (segment validation delegates to PostgreSQL's own bigint parser via a guarded `pg_input_is_valid` CASE instead of a fourth hand-written regex; `+`-signed and whitespace-padded ids are valid again, `+0`/`-1`/overflow/junk still refused, invalid input proven never to reach the cast) | READY FOR REVIEW | 369/369 + 497/497 (494 + 3 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, FK 1, cleanup verified 0 left; 10 focused tests each `running 1 test`; 4 RED→GREEN at cf58b43 reproducing the reviewer's `left: 1 / right: 1000000000000000000` |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14732,6 +14733,121 @@ a_corrupt_funding_subject_segment_is_refused_before_any_ddl
 - Rentang penuh sampai `9223372036854775807` dijamin oleh predikat, bukan dienumerasi oleh test; test menutup batas-batasnya (`1`, `i64::MAX`, `i64::MAX + 1`, bentuk padded masing-masing).
 - Provenance tetap content-addressed terhadap riwayat git repositori INI; object database yang dipalsukan seluruhnya tidak terdeteksi.
 - Dua rekomendasi REV-090 masih terbuka dan di luar scope corrective ini: regression dual-error CLI untuk F05, dan regression cabang penolakan F06 sebelum wiring produksi.
+- Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+
+---
+
+## REV-094 — Implementasi corrective atas REV-093-F01
+
+**Tanggal:** 2026-09-08
+**Mode:** implementation; Rust 1.89.0; PostgreSQL 17.11 (localhost, disposable `swi_r94_full_185722`)
+**Base:** `cf58b43`
+**Scope:** HANYA REV-093-F01. Tidak ada shipped migration SQL yang diedit; tidak ada file smoke-test terpisah; tidak ada REV historis yang ditulis ulang.
+
+### Ringkasan
+
+Reviewer benar, dan ini kegagalan KEEMPAT pada kelas yang sama: guard menebak domain input `bigint` PostgreSQL dengan regex tulisan tangan, dan setiap versi salah di tempat baru. Bukti reviewer tereproduksi persis pada `cf58b43` — `+1000000000000000000|1000000000000000000|false`, lalu `preflight repair complete rows=1`, lalu pemilik sah mendarat di `default`.
+
+Pelajarannya bukan "perbaiki regexnya sekali lagi". Domainnya adalah apa pun yang diterima fungsi input `bigint` PostgreSQL, jadi guard berhenti mengaproksimasi dan mulai BERTANYA kepada parser itu sendiri.
+
+### Per-item
+
+#### REV-093-F01 — CLOSED — validasi mengikuti PostgreSQL, bukan menirunya
+
+**Root cause:** predikat berjangkar pada `^[0-9]+$`. PostgreSQL menerima tanda `+` di depan dan whitespace di sekeliling; regex tidak. Maka `+1000000000000000000` dinilai tidak valid, preflight memperlakukannya sebagai kunci legacy rusak, dan memindahkan barisnya ke default workspace — kerusakan tenancy yang sama persis dengan REV-090-F01 dan REV-092, hanya dengan pemicu berbeda.
+
+Riwayat kelas ini, karena polanya yang penting:
+
+| Versi | Salahnya |
+|---|---|
+| `^[0-9]+$` | menerima `9223372036854775808`, cast abort 22003 |
+| `^[0-9]{1,18}$` (REV-087) | menolak SEMUA int8 valid ≥ `1000000000000000000` |
+| + normalisasi nol (REV-092) | masih menolak `+1`, ` 1 ` |
+
+**Fix:** guarded cast yang memakai parser PostgreSQL sebagai otoritas:
+
+```sql
+CASE WHEN pg_input_is_valid(expr, 'bigint')
+     THEN (expr)::bigint > 0
+     ELSE false END
+```
+
+`pg_input_is_valid` (PostgreSQL 16+; host ini 17.11, terverifikasi ada di `pg_proc`) menjawab persis pertanyaan yang benar tanpa pernah raise. Positivity tetap syarat terpisah: setiap id yang dijaga adalah identity/`bigserial` mulai dari 1, jadi `+0` dan `-1` adalah input `bigint` yang SAH tetapi ditolak di sini atas dasar tanda, bukan atas dasar gagal parse.
+
+**Input invalid tidak pernah mencapai cast.** `CASE` mengevaluasi `WHEN` sebelum `THEN`, dan itu DIBUKTIKAN atas table scan campuran (valid + junk + overflow + kosong), bukan diasumsikan dari bentuk sintaks. Bentuk `pg_input_is_valid(x) AND x::bigint > 0` sengaja TIDAK dipakai: itu membebaskan planner meng-hoist cast dan mematikan seluruh migration pada baris sampah pertama.
+
+**Ketiga callsite memakai helper yang sama**, tidak ada predikat yang diduplikasi: `src/db.rs:375` (workspace segment), `:376` (funding subject segment), `:696` (join rekey identitas alert).
+
+**Lokasi:** `src/db.rs:271-312`
+
+### Regression (live PostgreSQL)
+
+Tabel boundary dijalankan lewat database sungguhan memakai predikat yang dibangun produksi. Setiap nilai di-cross-check DUA ARAH terhadap `::bigint` PostgreSQL: yang disebut AMAN wajib cast sukses dan positif; yang disebut TIDAK AMAN wajib gagal cast ATAU menghasilkan nilai non-positif. Arah kedua inilah yang menangkap regresi "guard lebih ketat daripada PostgreSQL" — persis bug REV-093-F01.
+
+Seluruh kasus wajib hijau: `+1000000000000000000` valid; `"  +00000000000000000001  "` valid; `+9223372036854775807` valid; `+0` dan `-1` invalid; `9223372036854775808` invalid; junk/empty invalid. Ditambah `-9223372036854775808`, `+9223372036854775808`, ` 42 `, `1.5`, `+ 1`, `++1`, whitespace-only, dan seluruh kasus REV-092 yang tetap dipertahankan.
+
+Tiga test lane-level memakai migrator sungguhan:
+
+- `a_plus_signed_workspace_segment_keeps_its_owner` — segmen bertanda `+` tidak dipindah ke default; prekondisi menegaskan PostgreSQL memang memparsingnya ke workspace nyata, jadi test tidak bisa lulus karena alasan salah;
+- `a_plus_signed_funding_subject_is_not_refused` — subject bertanda `+` DAN ber-whitespace tidak memicu penolakan bernama;
+- `invalid_segments_never_reach_the_bigint_cast` — enam segmen campuran dalam satu tabel, predikat dievaluasi sebagai proyeksi dan sebagai filter `WHERE`, keduanya tanpa raise.
+
+**Lokasi:** `src/rev087_migration_integrity_pg_tests.rs:865-940` (tabel boundary), `:1150-1400` (tiga test lane)
+
+### Gates
+
+```text
+Rust                                                            1.89.0
+PostgreSQL                                                      17.11 (localhost)
+cargo +1.89.0 check --locked --all-targets                      PASS (0 warnings)
+cargo +1.89.0 check --locked --features pg_tests --all-targets  PASS (0 warnings)
+cargo +1.89.0 test --locked                                     PASS 369/369
+cargo +1.89.0 test --locked --features pg_tests -- --test-threads=1   PASS 497/497
+disposable DB                                                   swi_r94_full_185722
+db migrate / db status                                          rc 0 / schema current; digest-verified
+fingerprint (total|applied|baseline)                            52|52|0
+alerts_funding_case_workspace_fk                                1
+cleanup terverifikasi                                           0 DB tersisa dari round ini
+```
+
+Focused, masing-masing `running 1 test`, sepuluh-duanya PASS:
+
+```text
+padded_and_boundary_int8_segments_are_classified_by_value
+a_plus_signed_workspace_segment_keeps_its_owner
+a_plus_signed_funding_subject_is_not_refused
+invalid_segments_never_reach_the_bigint_cast
+a_zero_padded_workspace_segment_keeps_its_owner
+a_zero_padded_funding_subject_is_not_refused
+a_valid_nineteen_digit_workspace_segment_keeps_its_owner
+a_corrupt_funding_subject_segment_is_refused_before_any_ddl
+the_manifest_parser_rejects_every_malformed_shape
+an_authenticated_predecessor_bundle_converges_to_current
+```
+
+### RED→GREEN
+
+Helper `cf58b43` dipulihkan verbatim, keempat test dijalankan, lalu source dikembalikan.
+
+| Test | RED pada `cf58b43` | GREEN setelah fix |
+|---|---|---|
+| `padded_and_boundary_int8_segments_are_classified_by_value` | FAILED 1 | PASS 1 |
+| `a_plus_signed_workspace_segment_keeps_its_owner` | FAILED 1 — `left: 1`, `right: 1000000000000000000` (persis bukti reviewer) | PASS 1 |
+| `a_plus_signed_funding_subject_is_not_refused` | FAILED 1 | PASS 1 |
+| `invalid_segments_never_reach_the_bigint_cast` | FAILED 1 | PASS 1 |
+
+### Yang TIDAK saya klaim
+
+- Tidak ada self-approval: verdict **READY FOR REVIEW**.
+- **`pg_input_is_valid` memerlukan PostgreSQL 16+.** Host ini 17.11 dan reviewer sebelumnya memakai 18.6, jadi lane yang ada aman — tetapi ini menaikkan floor versi efektif untuk migrator. Database di bawah 16 akan gagal pada preflight dengan `function pg_input_is_valid does not exist`, bukan diam-diam salah. Saya TIDAK menambahkan fallback berbasis regex: fallback semacam itu akan menghidupkan kembali kelas bug yang justru ditutup di sini. Bila 15 atau lebih rendah harus didukung, itu keputusan pemilik repo dan butuh lane terpisah.
+- **Cleanup mengungkap kebocoran yang sudah ada:** `drop_scratch` hanya berjalan di jalur sukses, jadi setiap RED probe meninggalkan scratch DB. Dua belas DB `swi_r87_*`/`swi_r90_*` dari round-round sebelumnya masih ada dan sudah saya drop; nol tersisa. Perbaikan strukturalnya (guard RAII atau drop di `Drop`) TIDAK saya kerjakan karena di luar scope REV-093-F01.
+- Rentang penuh sampai `9223372036854775807` dijamin oleh delegasi ke parser PostgreSQL, bukan dienumerasi test; test menutup batas dan bentuk-bentuk sekitarnya.
+- `cargo +1.89.0 fmt --check` masih gagal, pra-ada sejak sebelum REV-092 (84/84 file belum pernah di-rustfmt). Tidak diminta pada round ini dan tidak saya ubah.
+- Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI (F05) dan regression cabang penolakan F06 sebelum wiring produksi.
 - Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

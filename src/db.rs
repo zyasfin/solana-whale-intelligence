@@ -268,49 +268,46 @@ async fn preflight_repair_alerts_sent_at(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// An EXACT positive-`int8` test for one dedup-key segment, as a SQL predicate.
+/// A POSITIVE-`bigint` test for one dedup-key segment, as a SQL predicate.
 ///
-/// History of this guard, because each step fixed the previous one's blind spot:
+/// Four rounds of this guard were hand-written approximations of PostgreSQL's own
+/// input parser, and each one was wrong in a new place:
 ///
-///   * `^[0-9]+$` (pre-REV-087) accepted `9223372036854775808` and let 1036's
-///     `::bigint` cast abort with SQLSTATE 22003;
-///   * `^[0-9]{1,18}$` (REV-087-F01) was SUFFICIENT but not EXACT: every valid
-///     `int8` from `1000000000000000000` to `9223372036854775807` has 19 digits and
-///     was classified unsafe, so REV-090-F01 found real workspace owners being
+///   * `^[0-9]+$` (pre-REV-087) accepted `9223372036854775808`, so 1036's cast
+///     aborted with SQLSTATE 22003;
+///   * `^[0-9]{1,18}$` (REV-087-F01) rejected every valid `int8` from
+///     `1000000000000000000` up, so REV-090-F01 caught real workspace owners being
 ///     reassigned to the default workspace — worse than the abort it avoided;
-///   * length-on-the-raw-string (REV-091) still measured the WRITTEN form, not the
-///     value. REV-092: `01000000000000000000` is twenty characters but denotes
-///     `1000000000000000000`, which `::bigint` accepts happily. Judging it by its
-///     padding rejected a valid owner for the same reason as before, one layer down.
+///   * REV-092 normalized leading zeros, because `01000000000000000000` is twenty
+///     characters but denotes a value the cast accepts;
+///   * REV-093-F01: it still rejected `+1000000000000000000` and any segment with
+///     surrounding whitespace, both of which `::bigint` accepts. Same failure mode
+///     again — a valid owner swept to the default workspace.
 ///
-/// So the digits are normalized BEFORE any length or range test: strip leading
-/// zeros, then measure what is left. PostgreSQL's own `::bigint` ignores padding,
-/// and this predicate must agree with the cast it is protecting or it is not a
-/// guard, just a second opinion.
+/// The lesson is that the domain is not describable by a regex anyone keeps getting
+/// right: it is whatever PostgreSQL's `bigint` input function accepts. So stop
+/// approximating it and ASK the parser. `pg_input_is_valid` (PostgreSQL 16+)
+/// answers exactly that question without raising, and only when it answers yes does
+/// the cast run.
 ///
-/// The value must also be POSITIVE. `0`, `00`, and any all-zero run normalize to
-/// empty and are rejected: every id this guards (`workspaces.id`,
-/// `funding_radar_cases.id`) is a `bigserial`/identity starting at 1, so zero is
-/// never a real owner or subject — treating it as valid would let a malformed key
-/// resolve to a row that cannot exist.
+/// Ordering matters and is guaranteed here: `CASE` evaluates its `WHEN` before the
+/// corresponding `THEN`, so an invalid segment never reaches `::bigint`. That is
+/// verified against a live mixed-input table scan, not assumed — a bare
+/// `pg_input_is_valid(x) AND x::bigint > 0` would leave the planner free to hoist
+/// the cast and abort the whole migration on the first junk row.
 ///
-/// Overflow stays fail-closed: 20+ significant digits, or exactly 19 above
-/// `i64::MAX`, are unsafe. For an all-digit string of EQUAL length lexicographic
-/// order IS numeric order, so the bound is a plain string comparison — no trial
-/// cast, nothing that can itself raise 22003 while deciding whether 22003 is
-/// possible.
+/// Positivity is still required: every id this guards (`workspaces.id`,
+/// `funding_radar_cases.id`) is an identity/`bigserial` starting at 1, so `0` and
+/// negatives can never name a real row. `+0` and `-1` are valid `bigint` input and
+/// are rejected here on that ground, not on a parse failure.
 ///
 /// `expr` is inlined, so it MUST be a literal SQL expression this module controls,
 /// never user input. It is evaluated more than once, so it must also be pure.
 fn safe_int8_predicate(expr: &str) -> String {
-    // `ltrim(x, '0')` leaves '' for an all-zero run, which fails the `<> ''` test
-    // and is therefore rejected as non-positive.
-    let digits = format!("ltrim({expr}, '0')");
     format!(
-        "({expr} ~ '^[0-9]+$' AND {digits} <> '' \
-          AND (length({digits}) <= 18 \
-               OR (length({digits}) = 19 AND {digits} <= '{max}')))",
-        max = i64::MAX
+        "(CASE WHEN pg_input_is_valid({expr}, 'bigint') \
+               THEN ({expr})::bigint > 0 \
+               ELSE false END)"
     )
 }
 

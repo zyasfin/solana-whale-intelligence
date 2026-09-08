@@ -864,21 +864,39 @@ async fn padded_and_boundary_int8_segments_are_classified_by_value() {
 
     // Drive the exact SQL predicate the preflight uses, through the database, so
     // this cannot drift from production behaviour.
+    //
+    // REV-093-F01 added the signed and whitespace-padded rows: PostgreSQL's bigint
+    // input function accepts a leading `+` and surrounding whitespace, and four
+    // successive hand-written regexes each failed to model some corner of that
+    // domain. The predicate now asks the parser instead of approximating it, so the
+    // table below is a statement about PostgreSQL's domain, not about a regex.
     let cases: &[(&str, bool, &str)] = &[
         ("01000000000000000000", true, "padded 19-digit value = 1000000000000000000"),
         ("00000000000000000001", true, "padded 1"),
         ("1", true, "minimum positive"),
         ("9223372036854775807", true, "i64::MAX exactly"),
         ("0000000009223372036854775807", true, "padded i64::MAX"),
+        ("+1000000000000000000", true, "explicit plus sign (REV-093-F01)"),
+        ("  +00000000000000000001  ", true, "plus sign, padding, surrounding whitespace"),
+        ("+9223372036854775807", true, "signed i64::MAX"),
+        (" 42 ", true, "surrounding whitespace alone"),
+        ("+0", false, "signed zero is still not a positive id"),
+        ("-1", false, "negative is not a positive id"),
+        ("-9223372036854775808", false, "i64::MIN is not a positive id"),
         ("0", false, "zero is not a positive id"),
         ("00", false, "all-zero run is not a positive id"),
         ("0000000000000000000000", false, "long all-zero run is not a positive id"),
         ("9223372036854775808", false, "i64::MAX + 1 overflows"),
+        ("+9223372036854775808", false, "signed overflow still overflows"),
         ("09223372036854775808", false, "padded overflow still overflows"),
         ("99999999999999999999", false, "20 significant digits overflow"),
         ("solana", false, "nonnumeric"),
         ("", false, "empty"),
+        ("   ", false, "whitespace only"),
         ("12x4", false, "mixed"),
+        ("1.5", false, "not an integer"),
+        ("+ 1", false, "sign detached from digits"),
+        ("++1", false, "double sign"),
     ];
 
     for (value, expect_safe, why) in cases {
@@ -895,17 +913,29 @@ async fn padded_and_boundary_int8_segments_are_classified_by_value() {
             "segment {value:?} ({why}) classified wrong: expected safe={expect_safe}"
         );
 
-        // Cross-check against PostgreSQL itself: whenever we call a value SAFE, the
-        // cast the guard protects must actually succeed, and vice versa for the
-        // numeric-overflow class. This is what makes the guard agree with the cast
-        // rather than merely with itself.
+        // Cross-check against PostgreSQL itself, in BOTH directions. This is what
+        // makes the guard agree with the cast it protects rather than merely with
+        // itself: SAFE must mean the cast succeeds and yields a positive id, and
+        // UNSAFE must mean the cast would either fail or yield a non-positive id.
+        let cast: Result<i64, _> = sqlx::query_scalar("SELECT ($1)::bigint")
+            .bind(value)
+            .fetch_one(&pool)
+            .await;
         if *expect_safe {
-            let cast: i64 = sqlx::query_scalar("SELECT ($1)::bigint")
-                .bind(value)
-                .fetch_one(&pool)
-                .await
-                .unwrap_or_else(|e| panic!("value {value:?} judged safe but ::bigint failed: {e}"));
+            let cast = cast.unwrap_or_else(|e| {
+                panic!("value {value:?} judged safe but ::bigint failed: {e}")
+            });
             assert!(cast > 0, "a safe segment must denote a positive id, got {cast}");
+        } else {
+            match cast {
+                Err(_) => {} // unparseable: correctly refused before the cast
+                Ok(v) => assert!(
+                    v <= 0,
+                    "value {value:?} ({why}) was judged UNSAFE, but it casts cleanly to \
+                     the positive id {v} — the guard is stricter than PostgreSQL and \
+                     would sweep a real owner to the default workspace"
+                ),
+            }
         }
     }
 
@@ -1140,4 +1170,213 @@ fn the_manifest_parser_rejects_every_malformed_shape() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F01 / REV-094 — signed segments are PostgreSQL-valid and must be
+// treated as such by the lane, not just by the predicate
+// ---------------------------------------------------------------------------
+
+/// A `+`-signed workspace segment denotes a real owner, so the preflight must not
+/// sweep it into the default workspace.
+///
+/// This is the reviewer's exact evidence: `+1000000000000000000` parsed by
+/// PostgreSQL as `1000000000000000000`, judged `false` by the guard, and the run
+/// reported `preflight repair complete rows=1` with the row landing in `default`
+/// instead of its real owner.
+#[tokio::test]
+async fn a_plus_signed_workspace_segment_keeps_its_owner() {
+    let (pool, admin, scratch, dir) = scratch_before("plusws", "1036_").await;
+
+    const WS19: i64 = 1_000_000_000_000_000_000;
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, slug) OVERRIDING SYSTEM VALUE VALUES ($1, 'w', $2)",
+    )
+    .bind(WS19)
+    .bind(tag("r94plusws"))
+    .execute(&pool)
+    .await
+    .expect("19-digit workspace");
+    let sid: i64 = sqlx::query_scalar(
+        "INSERT INTO signals (workspace_id, chain, mint, signal_kind, created_at, score, status) \
+         VALUES ($1, 'solana', 'R94PLUSMINT', 'entry', now(), 80, 'active') RETURNING id",
+    )
+    .bind(WS19)
+    .fetch_one(&pool)
+    .await
+    .expect("signal");
+
+    // The key carries the SIGNED spelling of a real workspace id.
+    let key = format!("signal:+{WS19}:{sid}:chat-a");
+    sqlx::query(
+        "INSERT INTO alerts (dedup_key, subject_kind, signal_id, destination, state, \
+                             attempt_count, next_attempt_at) \
+         VALUES ($1, 'signal', $2, 'chat-a', 'pending', 1, now())",
+    )
+    .bind(&key)
+    .bind(sid)
+    .execute(&pool)
+    .await
+    .expect("seed signed-workspace alert");
+
+    // Precondition: PostgreSQL itself accepts this segment and resolves it to the
+    // real workspace. Without this the assertion below could pass for the wrong
+    // reason (e.g. if the segment were simply unparseable everywhere).
+    let parsed: i64 = sqlx::query_scalar(
+        "SELECT (split_part(dedup_key, ':', 2))::bigint FROM public.alerts WHERE dedup_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("PostgreSQL must accept the signed segment");
+    assert_eq!(parsed, WS19, "the signed segment must denote the real workspace id");
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a signed but valid workspace segment must not abort the lane");
+
+    let owner: i64 = sqlx::query_scalar("SELECT workspace_id FROM public.alerts WHERE dedup_key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("read back owner");
+    let default_ws: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE slug = 'default'")
+            .fetch_optional(&pool)
+            .await
+            .expect("default workspace probe");
+    assert_eq!(
+        owner, WS19,
+        "a `+`-signed but valid workspace must keep its owner (REV-093-F01)"
+    );
+    assert!(
+        default_ws != Some(owner),
+        "the signed row must NOT have been reassigned to the default workspace"
+    );
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// A `+`-signed funding SUBJECT segment is valid bigint input, so the preflight's
+/// named refusal must not fire on it. The refusal is reserved for segments that
+/// genuinely cannot cast.
+#[tokio::test]
+async fn a_plus_signed_funding_subject_is_not_refused() {
+    let (pool, admin, scratch, dir) = scratch_before("plussubj", "1036_").await;
+
+    let ws: i64 =
+        sqlx::query_scalar("INSERT INTO workspaces (name, slug) VALUES ('w', $1) RETURNING id")
+            .bind(tag("r94plussub"))
+            .fetch_one(&pool)
+            .await
+            .expect("workspace");
+    let sid: i64 = sqlx::query_scalar(
+        "INSERT INTO signals (workspace_id, chain, mint, signal_kind, created_at, score, status) \
+         VALUES ($1, 'solana', 'R94PLUSSUBMINT', 'entry', now(), 80, 'active') RETURNING id",
+    )
+    .bind(ws)
+    .fetch_one(&pool)
+    .await
+    .expect("signal");
+
+    // funding-kind key whose SUBJECT segment is signed AND whitespace-padded.
+    let key = format!("funding:{ws}: +{sid} :chat-a");
+    sqlx::query(
+        "INSERT INTO alerts (dedup_key, subject_kind, signal_id, destination, state, \
+                             attempt_count, next_attempt_at) \
+         VALUES ($1, 'signal', $2, 'chat-a', 'pending', 1, now())",
+    )
+    .bind(&key)
+    .bind(sid)
+    .execute(&pool)
+    .await
+    .expect("seed signed-subject alert");
+
+    let parsed: i64 = sqlx::query_scalar(
+        "SELECT (split_part(dedup_key, ':', 3))::bigint FROM public.alerts WHERE dedup_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("PostgreSQL must accept the signed subject segment");
+    assert_eq!(parsed, sid, "the signed subject must denote the real id");
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a signed but valid funding subject must NOT be refused (REV-093-F01)");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.alerts WHERE dedup_key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("row survives");
+    assert_eq!(rows, 1, "the row must survive the lane untouched");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// Invalid input must never reach the cast, even inside a single scan that mixes
+/// valid and invalid segments.
+///
+/// A bare `pg_input_is_valid(x, 'bigint') AND x::bigint > 0` reads as safe but
+/// leaves the planner free to hoist the cast, which aborts the entire migration on
+/// the first junk row. The `CASE` form pins the evaluation order; this proves it
+/// against real rows rather than trusting the shape.
+#[tokio::test]
+async fn invalid_segments_never_reach_the_bigint_cast() {
+    let (pool, admin, scratch, dir) = scratch_before("nocast", "1036_").await;
+
+    let ws: i64 =
+        sqlx::query_scalar("INSERT INTO workspaces (name, slug) VALUES ('w', $1) RETURNING id")
+            .bind(tag("r94nocast"))
+            .fetch_one(&pool)
+            .await
+            .expect("workspace");
+    // One valid signed row and several that would abort a hoisted cast, all in the
+    // same table so any single scan sees the mix.
+    for (idx, seg) in ["+1", "solana", "9223372036854775808", "", "-1", "1.5"]
+        .iter()
+        .enumerate()
+    {
+        let sid: i64 = sqlx::query_scalar(
+            "INSERT INTO signals (workspace_id, chain, mint, signal_kind, created_at, score, status) \
+             VALUES ($1, 'solana', $2, 'entry', now(), 80, 'active') RETURNING id",
+        )
+        .bind(ws)
+        .bind(format!("R94NOCAST{idx}"))
+        .fetch_one(&pool)
+        .await
+        .expect("signal");
+        sqlx::query(
+            "INSERT INTO alerts (dedup_key, subject_kind, signal_id, destination, state, \
+                                 attempt_count, next_attempt_at) \
+             VALUES ($1, 'signal', $2, 'chat-a', 'pending', 1, now())",
+        )
+        .bind(format!("signal:{seg}:{sid}:chat-a"))
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .expect("seed mixed segment");
+    }
+
+    // The predicate must evaluate over every row without raising, both projected
+    // and as a WHERE filter — the two shapes the preflight actually uses.
+    let predicate = crate::db::safe_int8_predicate_for_tests("split_part(dedup_key, ':', 2)");
+    let safe_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM public.alerts WHERE {predicate}"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("the guard must not raise on invalid input in a WHERE filter");
+    assert_eq!(safe_count, 1, "exactly the `+1` row is a valid positive id");
+
+    let unsafe_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM public.alerts WHERE NOT {predicate}"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("the negated guard must not raise either");
+    assert_eq!(unsafe_count, 5, "the other five segments are refused, not cast");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
 }
