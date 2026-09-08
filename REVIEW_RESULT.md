@@ -102,6 +102,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-088 | 2026-09-08 | implementation of REV-086/REV-087 F01–F06 (migrator digest-drift rejection, transactional range-safe preflight, complete funding-case merge + alert identity reconciliation via preflight, migration 1040 composite alert/case ownership + claim-time validation, evaluator claim release and error accounting, fenced exit writer, explicit migration-dir test lane) | READY FOR REVIEW | 369/369 + 487/487; 4/4 Rust 1.89 gates 0 warning; migration 1040 applied, manifest 52/52, fingerprint 52\|52\|0 on a unique disposable DB asserted present before and after; F01(x3)/F02/F03/F04(x3)/F05/F06 RED→GREEN; also fixed an unreported infinite loop that hung the full pg lane for 80 minutes |
 | REV-089 | 2026-09-08 | independent verification of REV-088 + versioned migration artifact | APPROVED / REV-088 F01â€“F06 ACCEPTED | full PG 487/487; fresh packaged migration 52/52; focused adversarial probes PASS |
 | REV-090 | 2026-09-08 | correction after late independent dissent on REV-089 F01 | CHANGES REQUIRED / PARTIAL | F02â€“F06 accepted; F01 int8/control-flow/provenance gaps open |
+| REV-091 | 2026-09-08 | implementation of REV-090-F01 only (exact positive-int8 segment validation, independent funding-subject check before the repair decision, authenticated content-addressed predecessor replay, resolver comment corrected to packaged-canonical order) | READY FOR REVIEW | 369/369 + 490/490 (487 + 3 new); 4/4 Rust 1.89 gates 0 warning; unique serial disposable DB, 52\|52\|0, baseline 0; all three sub-issues RED→GREEN incl. valid 19-digit owner preserved and named refusal before any DDL |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14531,3 +14532,87 @@ CLEANUP_RC|0
 - Full unique-DB PG gate remains PASS 487/487; green tests did not cover the two F01 counterexamples above.
 
 **Final:** REV-088/REV-089 are **PARTIAL / CHANGES REQUIRED** until REV-090-F01 is fixed and independently re-reviewed.
+
+
+---
+
+## REV-091 — Implementasi REV-090-F01
+
+**Tanggal:** 2026-09-08
+**Mode:** implementation; Rust 1.89.0; PostgreSQL 17.11 (localhost, disposable `swi_r91_full_075034`)
+**Acuan:** REV-090-F01 (OPEN / HIGH) — tiga sub-masalah + satu item LOW dokumentasi resolver
+**Scope:** HANYA REV-090-F01. F02–F06 tetap ACCEPTED per REV-089/REV-090; tidak ada bagian REV-088/089/090 yang ditulis ulang.
+
+### Ringkasan
+
+Reviewer benar pada ketiganya, dan sub-masalah pertama lebih buruk daripada bug yang digantikannya: guard `^[0-9]{1,18}$` menolak setiap `int8` valid 19 digit, sehingga preflight memindahkan pemilik workspace yang SAH ke default workspace. Itu korupsi tenancy, bukan sekadar false negative.
+
+### Per-sub-masalah
+
+#### 1 — CLOSED — validasi positive-int8 sekarang EXACT, bukan sekadar cukup
+
+**Root cause:** `^[0-9]{1,18}$` memilih panjang sebagai proksi jangkauan. Batas `int8` adalah `9223372036854775807` (19 digit), jadi seluruh rentang `1000000000000000000..=9223372036854775807` diklasifikasikan tidak aman. Baris dengan pemilik nyata di rentang itu di-reassign ke default workspace.
+
+**Fix:** `safe_int8_predicate(expr)` membangun predikat SQL yang tepat: digit saja, DAN (panjang ≤ 18 ATAU panjang = 19 dengan perbandingan string terhadap `i64::MAX`). Untuk string all-digit dengan panjang SAMA, urutan leksikografis identik dengan urutan numerik — jadi batas 19 digit adalah perbandingan string biasa, tanpa trial cast yang justru bisa memicu 22003 sendiri. `expr` di-inline sehingga wajib berupa literal SQL milik modul ini, tidak pernah input pengguna.
+
+**Lokasi:** `src/db.rs:260-283` (helper), `:336-337`, `:412-416`, `:657` (callsite rekey ikut memakai predikat exact)
+
+#### 2 — CLOSED — subject segment diperiksa independen, SEBELUM `if !needs_repair`
+
+**Root cause:** pemeriksaan subject berada setelah early return `needs_repair`. Dengan workspace segment yang sehat, `needs_repair` bernilai false, fungsi kembali lebih awal, dan baris dengan subject korup lolos dari penolakan bernama lalu menabrak cast mentah 1036.
+
+**Fix:** pemeriksaan subject kini berjalan LEBIH DULU, independen dari keputusan repair, pada `pool` sebelum transaksi mana pun dibuka — jadi penolakan terjadi sebelum DDL apa pun tersentuh.
+
+**Lokasi:** `src/db.rs:339-367`
+
+#### 3 — CLOSED — predecessor artifact terautentikasi, bukan salinan working tree
+
+**Root cause:** `scratch_before` menyalin file saat ini, sehingga lane "historis" secara konstruksi adalah byte hari ini dan tidak membuktikan provenance apa pun.
+
+**Fix:** `predecessor_bundle()` membaca bundle dari object database git pada commit tetap `a60647dac892afad18b03671bea0638b695c0cdf` via `git cat-file`. Object id git adalah sha1 atas byte tersimpan, jadi ini content-addressed. Setiap blob SQL diverifikasi ulang terhadap digest yang tercatat di MANIFEST commit yang SAMA, memakai `db::migration_sha256_for_tests` sehingga normalisasi identik dengan produksi (bukan reimplementasi yang hanya setuju dengan dirinya sendiri). Bila commit tidak terjangkau, fixture PANIC dengan pesan eksplisit — tidak pernah diam-diam lulus.
+
+**Lokasi:** `src/rev087_migration_integrity_pg_tests.rs:89-163`; `src/db.rs:1382-1390`
+
+#### 4 — CLOSED — komentar resolver (LOW)
+
+**Root cause:** komentar masih menyatakan canonical SQL berada di sibling deploy repo dan mendaftar empat kandidat, sedangkan kode memiliki lima dan mendahulukan `./migrations`.
+
+**Fix:** komentar menyatakan packaged `migrations/` sebagai canonical artifact, sibling sebagai fallback legacy, dan mendaftar kelima kandidat dalam urutan yang persis sama dengan kode.
+
+**Lokasi:** `src/db.rs:104-121`
+
+### Gates
+
+```text
+Rust                                                            1.89.0
+PostgreSQL                                                      17.11 (localhost)
+cargo +1.89.0 check --locked --all-targets                      PASS (0 warnings)
+cargo +1.89.0 check --locked --features pg_tests --all-targets  PASS (0 warnings)
+cargo +1.89.0 test --locked                                     PASS 369/369
+cargo +1.89.0 test --locked --features pg_tests -- --test-threads=1   PASS 490/490
+disposable DB (unique, serial)                                  swi_r91_full_075034
+db status                                                       schema current; digest-verified
+_migrations | applied | baseline                                52 | 52 | 0
+alerts_funding_case_workspace_fk                                1
+```
+
+### RED→GREEN probes
+
+Tiap probe dijalankan dengan fix DILEPAS lebih dulu; source dipulihkan setelahnya.
+
+| Sub-masalah | Probe | RED | GREEN |
+|---|---|---|---|
+| 1 int8 exact | guard dikembalikan ke `^[0-9]{1,18}$` | FAILED — `left: 1` (default workspace) vs `right: 1000000000000000000`: pemilik sah dipindahkan | PASS |
+| 2 control flow | blok subject dipindah kembali ke setelah `if !needs_repair` | FAILED — `value "9223372036854775808" is out of range for type bigint`, yaitu cast mentah 1036, bukan penolakan bernama | PASS |
+| 3 predecessor | `PREDECESSOR_COMMIT` diarahkan ke commit tidak terjangkau | FAILED — fixture panic eksplisit, tidak lulus diam-diam | PASS |
+
+### Yang TIDAK saya klaim
+
+- Tidak ada self-approval: verdict **READY FOR REVIEW**.
+- Hanya REV-090-F01 yang dikerjakan. Dua rekomendasi REV-090 yang TIDAK saya kerjakan karena di luar instruksi: regression dual-error CLI untuk F05, dan regression cabang penolakan F06 sebelum wiring produksi. Keduanya masih terbuka.
+- Provenance yang dibuktikan bersifat content-addressed terhadap riwayat git repositori INI. Bila object database dipalsukan seluruhnya, fixture tidak dapat mendeteksinya; jaminan yang lebih kuat memerlukan signed tag atau artifact eksternal.
+- Predecessor commit `a60647d` adalah commit packaging pertama; tidak ada riwayat migration yang lebih awal di git karena sebelumnya file berada di luar repo. Jadi ini predecessor terautentikasi paling awal yang tersedia, bukan asal-usul historis penuh.
+- `1000000000000000000` dipakai sebagai nilai batas 19 digit; rentang penuh sampai `9223372036854775807` dijamin oleh predikat, bukan dienumerasi oleh test.
+- Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

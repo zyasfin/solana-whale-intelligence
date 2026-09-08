@@ -103,14 +103,22 @@ pub fn pool_size(scale_workers: usize) -> u32 {
 
 /// Candidate migration directories, in resolution order.
 ///
-/// The canonical SQL lives in the sibling deploy repo (`swi-deploy/migrations`),
-/// NOT inside this crate, so a bare `./migrations` lookup finds nothing and
-/// `migrate()` fails before applying a single file (REV-027-F10 / REV-028-F08).
-/// Resolution therefore covers, in order:
+/// REV-090 (LOW): the canonical SQL now ships INSIDE this crate at `migrations/`,
+/// versioned alongside the source that applies it. The sibling deploy path is a
+/// legacy fallback for checkouts that predate that packaging, not the canonical
+/// location — the previous comment said the opposite, and listed the candidates in
+/// an order the code does not use.
+///
+/// The order below matches the code exactly:
 ///   1. `$SWI_MIGRATIONS_DIR` — explicit operator override (deployment lane).
-///   2. `./migrations` — cwd-local (packaged layout).
-///   3. `$CARGO_MANIFEST_DIR/migrations` — crate-local (test/dev layout).
-///   4. `<crate>/../swi-deploy/migrations` — the actual canonical location.
+///   2. `./migrations` — cwd-local packaged bundle; CANONICAL for a normal run.
+///   3. `../swi-deploy/migrations` — legacy sibling checkout (cwd-relative).
+///   4. `$CARGO_MANIFEST_DIR/migrations` — packaged bundle, crate-relative
+///      (test/dev, where cwd may differ from the crate root).
+///   5. `<crate>/../swi-deploy/migrations` — legacy sibling, crate-relative.
+///
+/// Resolution is fail-closed: if none exists, `migrate()` reports every path tried
+/// rather than applying zero files (REV-027-F10 / REV-028-F08).
 fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(explicit) = std::env::var("SWI_MIGRATIONS_DIR") {
@@ -257,14 +265,30 @@ async fn preflight_repair_alerts_sent_at(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Every decimal of 18 digits or fewer fits in `int8` (max 9223372036854775807
-/// has 19 digits), so this predicate is range-safe by construction and needs no
-/// trial cast to evaluate.
+/// An EXACT positive-`int8` test for one dedup-key segment, as a SQL predicate.
 ///
-/// REV-087-F01: the previous guard was `^[0-9]+$`, which accepts
-/// `9223372036854775808` — all digits, and still aborts 1036's `::bigint` cast
-/// with SQLSTATE 22003 `numeric_value_out_of_range`.
-const SAFE_INT8_SEGMENT: &str = "^[0-9]{1,18}$";
+/// REV-087-F01 replaced `^[0-9]+$` with `^[0-9]{1,18}$` because the former accepts
+/// `9223372036854775808` and still aborts 1036's `::bigint` cast with SQLSTATE
+/// 22003. But length-18 is SUFFICIENT, not EXACT: REV-090-F01 showed that every
+/// valid `int8` from `1000000000000000000` to `9223372036854775807` has 19 digits
+/// and was therefore classified unsafe. A legitimate workspace owner in that range
+/// was reassigned to the default workspace — tenancy corruption, and strictly worse
+/// than the abort it was avoiding.
+///
+/// The predicate is exact instead: digits only, and either at most 18 of them, or
+/// exactly 19 that do not exceed `i64::MAX`. For an all-digit string of EQUAL
+/// length, lexicographic ordering is numeric ordering, so the 19-digit bound is a
+/// plain string comparison — no trial cast, nothing that can itself raise 22003.
+///
+/// `expr` is inlined, so it MUST be a literal SQL expression this module controls,
+/// never user input.
+fn safe_int8_predicate(expr: &str) -> String {
+    format!(
+        "({expr} ~ '^[0-9]+$' AND (length({expr}) <= 18 \
+          OR (length({expr}) = 19 AND {expr} <= '{max}')))",
+        max = i64::MAX
+    )
+}
 
 /// The second automated preflight repair (REV-084-F01, hardened by REV-087-F01).
 ///
@@ -284,6 +308,17 @@ const SAFE_INT8_SEGMENT: &str = "^[0-9]{1,18}$";
 ///      could survive. The whole repair is now one transaction (PostgreSQL DDL is
 ///      transactional);
 ///   3. its digit-only regex let an oversized numeric segment through.
+///
+/// REV-090-F01 named two more, fixed here:
+///
+///   4. the length-18 guard rejected valid 19-digit `int8` workspaces, so a real
+///      owner in `1000000000000000000..=9223372036854775807` was reassigned to the
+///      default workspace. Validation is now EXACT (see [`safe_int8_predicate`]);
+///   5. the funding SUBJECT segment was only inspected after `if !needs_repair`
+///      returned, so a row with a sound workspace segment and a corrupt subject
+///      segment slipped past the named refusal and hit 1036's raw cast. The subject
+///      check is now independent and runs FIRST, before any repair decision and
+///      before any DDL.
 ///
 /// A healthy database is still never touched: 1036 sets `workspace_id NOT NULL`,
 /// so a fully-upgraded lane has no unassigned rows and the detection is false.
@@ -306,48 +341,28 @@ async fn preflight_repair_legacy_dedup_keys(pool: &PgPool) -> Result<()> {
     )
     .fetch_one(pool)
     .await?;
-    // Detection is a DATA question: is there a row 1036's cast would abort on that
-    // does not already have an owner? On a lane where the column does not exist
-    // yet, every such row is by definition unassigned.
-    let needs_repair: bool = if ws_col_exists {
-        sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM public.alerts \
-              WHERE workspace_id IS NULL \
-                AND split_part(dedup_key, ':', 2) !~ $1)",
-        )
-        .bind(SAFE_INT8_SEGMENT)
-        .fetch_one(pool)
-        .await?
-    } else {
-        sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM public.alerts \
-              WHERE split_part(dedup_key, ':', 2) !~ $1)",
-        )
-        .bind(SAFE_INT8_SEGMENT)
-        .fetch_one(pool)
-        .await?
-    };
-    if !needs_repair {
-        return Ok(());
-    }
+    let ws_segment_ok = safe_int8_predicate("split_part(dedup_key, ':', 2)");
+    let subject_segment_ok = safe_int8_predicate("split_part(dedup_key, ':', 3)");
 
-    let mut tx = pool.begin().await?;
-
-    // 1036 Part B casts the THIRD segment too (`c.id = nullif(split_part(
-    // a.dedup_key, ':', 3), '')::bigint`) for funding-kind keys. This preflight
-    // cannot repair that class: the only lane-independent repair would rewrite
-    // `subject_kind`, and 1035's two-arm CHECK (installed AFTER this preflight
-    // runs) permits only 'signal'/'funding'. Genuinely minted keys always carry a
-    // numeric subject id (`alert_dedup_key` formats an i64), so this fires only on
-    // corrupt or hand-written data — exactly when stopping is correct. Fail closed
-    // with a named error rather than let 1036 abort opaquely mid-DDL.
-    let unsafe_subject_segment: bool = sqlx::query_scalar(
+    // REV-090-F01: the subject segment is checked FIRST and INDEPENDENTLY of the
+    // workspace-segment repair decision. It used to sit after `if !needs_repair`
+    // returned, so a row with a sound workspace segment and a corrupt subject
+    // segment bypassed this named refusal entirely and later hit 1036's raw cast.
+    //
+    // 1036 Part B casts the THIRD segment (`c.id = nullif(split_part(a.dedup_key,
+    // ':', 3), '')::bigint`) for funding-kind keys. This preflight cannot repair
+    // that class: the only lane-independent repair would rewrite `subject_kind`,
+    // and 1035's two-arm CHECK (installed AFTER this preflight runs) permits only
+    // 'signal'/'funding'. Genuinely minted keys always carry a numeric subject id
+    // (`alert_dedup_key` formats an i64), so this fires only on corrupt or
+    // hand-written data — exactly when stopping is correct. Fail closed with a
+    // named error, before ANY DDL, rather than let 1036 abort opaquely mid-cutover.
+    let unsafe_subject_segment: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS (SELECT 1 FROM public.alerts \
           WHERE split_part(dedup_key, ':', 1) = 'funding' \
-            AND split_part(dedup_key, ':', 3) !~ $1)",
-    )
-    .bind(SAFE_INT8_SEGMENT)
-    .fetch_one(&mut *tx)
+            AND NOT {subject_segment_ok})"
+    ))
+    .fetch_one(pool)
     .await?;
     if unsafe_subject_segment {
         anyhow::bail!(
@@ -359,11 +374,34 @@ async fn preflight_repair_legacy_dedup_keys(pool: &PgPool) -> Result<()> {
         );
     }
 
+    // Detection is a DATA question: is there a row 1036's cast would abort on that
+    // does not already have an owner? On a lane where the column does not exist
+    // yet, every such row is by definition unassigned.
+    let needs_repair: bool = if ws_col_exists {
+        sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM public.alerts \
+              WHERE workspace_id IS NULL AND NOT {ws_segment_ok})"
+        ))
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM public.alerts WHERE NOT {ws_segment_ok})"
+        ))
+        .fetch_one(pool)
+        .await?
+    };
+    if !needs_repair {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
     tracing::warn!(
-        "preflight repair (REV-084-F01, REV-087-F01): pre-assigning alerts whose \
-         dedup-key workspace segment is not a 64-bit integer to the default \
-         workspace, before migration order reaches 1036 whose ::bigint cast would \
-         abort. One transaction; re-detected from data on every run"
+        "preflight repair (REV-084-F01, REV-087-F01, REV-090-F01): pre-assigning \
+         alerts whose dedup-key workspace segment is not a positive 64-bit integer \
+         to the default workspace, before migration order reaches 1036 whose \
+         ::bigint cast would abort. One transaction; re-detected from data on every \
+         run; valid 19-digit workspaces are preserved, never reassigned"
     );
     sqlx::query(
         "INSERT INTO workspaces (name, slug) VALUES ('Default', 'default') \
@@ -379,13 +417,11 @@ async fn preflight_repair_legacy_dedup_keys(pool: &PgPool) -> Result<()> {
     )
     .execute(&mut *tx)
     .await?;
-    let assigned = sqlx::query(
+    let assigned = sqlx::query(&format!(
         "UPDATE public.alerts \
          SET workspace_id = (SELECT id FROM workspaces WHERE slug = 'default') \
-         WHERE workspace_id IS NULL \
-           AND split_part(dedup_key, ':', 2) !~ $1",
-    )
-    .bind(SAFE_INT8_SEGMENT)
+         WHERE workspace_id IS NULL AND NOT {ws_segment_ok}"
+    ))
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -624,7 +660,9 @@ async fn preflight_repair_funding_case_identity(pool: &PgPool) -> Result<()> {
         // The dedup key is `kind:workspace:subject:destination` and the PRIMARY KEY
         // (0001:449). Rewrite ONLY the subject segment; the destination is taken as
         // everything after the third colon so a destination containing a colon
-        // survives. The `~ '^[0-9]{1,18}$'` guard keeps the join's cast range-safe.
+        // survives. The exact positive-int8 guard (REV-090-F01) keeps the join's
+        // cast range-safe without excluding valid 19-digit ids.
+        let subject_ok = safe_int8_predicate("split_part(a.dedup_key, ':', 3)");
         sqlx::query(&format!(
             r#"
             CREATE TEMP TABLE swi_alert_rekey ON COMMIT DROP AS
@@ -639,7 +677,7 @@ async fn preflight_repair_funding_case_identity(pool: &PgPool) -> Result<()> {
               JOIN swi_case_merge m
                 ON m.id = nullif(split_part(a.dedup_key, ':', 3), '')::bigint
              WHERE split_part(a.dedup_key, ':', 1) = 'funding'
-               AND split_part(a.dedup_key, ':', 3) ~ '{SAFE_INT8_SEGMENT}'
+               AND {subject_ok}
             "#
         ))
         .execute(&mut *tx)
@@ -1339,6 +1377,16 @@ fn migration_sha256(body: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Test-only accessor for [`migration_sha256`].
+///
+/// The predecessor-bundle fixture (REV-090-F01) must authenticate historical blobs
+/// with the SAME normalization the migrator uses; reimplementing it in the test
+/// would prove the test agrees with itself, not with production.
+#[cfg(test)]
+pub fn migration_sha256_for_tests(body: &str) -> String {
+    migration_sha256(body)
 }
 
 fn short_digest(d: &str) -> &str {
