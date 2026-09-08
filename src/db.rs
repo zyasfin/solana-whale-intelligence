@@ -112,8 +112,8 @@ pub fn pool_size(scale_workers: usize) -> u32 {
 /// The order below matches the code exactly:
 ///   1. `$SWI_MIGRATIONS_DIR` — explicit operator override (deployment lane).
 ///   2. `./migrations` — cwd-local packaged bundle; CANONICAL for a normal run.
-///   3. `$CARGO_MANIFEST_DIR/migrations` — the SAME packaged bundle, crate-relative,
-///      for runs whose cwd is not the crate root (tests, tooling).
+///   3. `<crate>/migrations` — the SAME packaged bundle, crate-relative (compile-time
+///      `CARGO_MANIFEST_DIR`), for runs whose cwd is not the crate root.
 ///   4. `../swi-deploy/migrations` — legacy sibling checkout, cwd-relative.
 ///   5. `<crate>/../swi-deploy/migrations` — legacy sibling, crate-relative.
 ///
@@ -123,9 +123,19 @@ pub fn pool_size(scale_workers: usize) -> u32 {
 /// ordering let a stale copy silently beat the reviewed one. Both packaged spellings
 /// now precede every legacy fallback.
 ///
+/// REV-097-F04: the crate-relative spellings are resolved from `env!` (COMPILE time),
+/// not `std::env::var` (RUN time). `CARGO_MANIFEST_DIR` is only set in the
+/// environment while cargo is driving the process, so the runtime lookup silently
+/// dropped candidates 3 and 5 from every real invocation of the shipped binary —
+/// exactly the lane where the packaged bundle is supposed to beat the legacy sibling.
+/// Running `swi db migrate` from any directory without `./migrations` therefore
+/// applied `../swi-deploy/migrations`, the unversioned copy. A compile-time constant
+/// is the same path under cargo and stable everywhere else.
+///
 /// Resolution is fail-closed: if none exists, `migrate()` reports every path tried
 /// rather than applying zero files (REV-027-F10 / REV-028-F08).
 fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
+    const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
     let mut candidates = Vec::new();
     if let Ok(explicit) = std::env::var("SWI_MIGRATIONS_DIR") {
         if !explicit.trim().is_empty() {
@@ -133,21 +143,17 @@ fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
         }
     }
     candidates.push(std::path::PathBuf::from("migrations"));
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        candidates.push(std::path::Path::new(&manifest_dir).join("migrations"));
-    }
+    candidates.push(std::path::Path::new(CRATE_DIR).join("migrations"));
     candidates.push(std::path::PathBuf::from("../swi-deploy/migrations"));
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        if let Some(parent) = std::path::Path::new(&manifest_dir).parent() {
-            candidates.push(parent.join("swi-deploy").join("migrations"));
-        }
+    if let Some(parent) = std::path::Path::new(CRATE_DIR).parent() {
+        candidates.push(parent.join("swi-deploy").join("migrations"));
     }
     candidates
 }
 
 /// Test-only accessor for [`migration_dir_candidates`] (REV-093-F05), so the
 /// precedence regression exercises the production resolver rather than a copy.
-#[cfg(test)]
+#[cfg(all(test, feature = "pg_tests"))]
 pub fn migration_dir_candidates_for_tests() -> Vec<std::path::PathBuf> {
     migration_dir_candidates()
 }
@@ -807,6 +813,86 @@ pub async fn migrate_with(pool: &PgPool, accept_legacy_baseline: bool) -> Result
     migrate_dir_with(pool, &dir, accept_legacy_baseline).await
 }
 
+/// Owns the connection that holds the migration advisory lock for the whole run.
+///
+/// REV-097-F03: the lock must outlive every statement in the run, so it cannot be
+/// tied to a transaction, and it must NOT be taken on a pooled connection: a
+/// session-level `pg_advisory_lock` stays held when the connection goes back to the
+/// pool, so the next migrator waits on a lock nobody will ever release. The
+/// connection is therefore DETACHED from the pool and owned here; dropping it closes
+/// the socket and PostgreSQL releases the session's advisory locks with the backend.
+/// Drop cannot `.await`, which is exactly why release is expressed as "close the
+/// session" rather than an explicit `pg_advisory_unlock` round-trip.
+struct MigrationLock {
+    key: i64,
+    conn: Option<sqlx::PgConnection>,
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        drop(self.conn.take());
+        tracing::debug!(key = self.key, "released migration advisory lock");
+    }
+}
+
+/// Whether the ledger's provenance CHECK admits EXACTLY `{NULL, 'applied', 'baseline'}`.
+///
+/// REV-096-F03: the previous test was `def.contains("applied") && def.contains("baseline")`,
+/// which a forged predicate passes trivially — `digest_origin IN ('applied','baseline','forged')`
+/// contains both words and admits a third value, and `true OR digest_origin IN (...)`
+/// admits everything. Substring matching cannot answer a question about a SET.
+///
+/// So the set is measured, not read: each candidate value is evaluated against the
+/// constraint's own expression via `pg_get_expr`, and the accepted set must equal the
+/// defined one exactly. `forged` and `APPLIED` are probed specifically because they are
+/// what a widened or case-folded predicate would let through.
+async fn digest_origin_check_admits_exactly(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    conname: &str,
+) -> Result<bool> {
+    let expr: String = sqlx::query_scalar(
+        "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint \
+          WHERE conname = $1 AND conrelid = 'public._migrations'::regclass",
+    )
+    .bind(conname)
+    .fetch_one(&mut **tx)
+    .await?;
+    // Evaluate the real predicate against each probe value by substituting the column
+    // reference. The expression is the SERVER's own rendering of the constraint.
+    let probes: [(Option<&str>, bool); 6] = [
+        (None, true),
+        (Some("applied"), true),
+        (Some("baseline"), true),
+        (Some("forged"), false),
+        (Some(""), false),
+        (Some("APPLIED"), false),
+    ];
+    for (value, want) in probes {
+        let literal = match value {
+            None => "NULL::text".to_string(),
+            Some(v) => format!("{}::text", quote_sql_literal(v)),
+        };
+        let rendered = expr.replace("digest_origin", &literal);
+        // A CHECK passes when the predicate is TRUE or NULL (unknown).
+        let admitted: bool =
+            sqlx::query_scalar(&format!("SELECT COALESCE(({rendered}), true)"))
+                .fetch_one(&mut **tx)
+                .await
+                .with_context(|| {
+                    format!("failed to evaluate the ledger CHECK against probe {value:?}")
+                })?;
+        if admitted != want {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Single-quote a string for inline SQL. Only used on the fixed probe values above.
+fn quote_sql_literal(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "''"))
+}
+
 /// Apply migrations from an EXPLICIT directory.
 ///
 /// REV-087 item 7: tests used to point the migrator at a reduced migration set by
@@ -821,6 +907,37 @@ pub async fn migrate_dir_with(
     dir: &std::path::Path,
     accept_legacy_baseline: bool,
 ) -> Result<()> {
+    // REV-097-F03: the advisory lock is taken FIRST, before a single statement of
+    // this run touches the database. Taking it later left the ledger bootstrap DDL
+    // (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`) outside the
+    // critical section, and two migrators starting on an empty database raced there:
+    // `IF NOT EXISTS` is checked before the catalog insert, so the loser aborted with
+    // `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
+    //
+    // A session advisory lock is the right instrument: held by the CONNECTION rather
+    // than a transaction, so it spans every statement of the run, and it does not
+    // block ordinary readers of the ledger the way a table lock would.
+    //
+    // Stable, arbitrary key derived from the purpose. Any other migrator on this
+    // database computes the same value and therefore waits.
+    const MIGRATION_LOCK_KEY: i64 = 0x5357_495F_4D49_4752u64 as i64; // "SWI_MIGR"
+    // One dedicated connection owns the lock for the whole run, DETACHED from the
+    // pool so the pool can never hand a still-locked session to someone else and so
+    // the lock is released when this connection is dropped.
+    let mut lock_conn = pool
+        .acquire()
+        .await
+        .context("failed to acquire a connection for the migration advisory lock")?
+        .detach();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_LOCK_KEY)
+        .execute(&mut lock_conn)
+        .await
+        .context("failed to take the migration advisory lock")?;
+    // Everything from here to the end of the run is exclusive. `MigrationLock`
+    // releases on drop, including on the error paths below.
+    let _migration_lock = MigrationLock { key: MIGRATION_LOCK_KEY, conn: Some(lock_conn) };
+
     // Schema-qualified explicitly: the pool's search_path starts with
     // `swi_legacy`, so an unqualified CREATE would put the migration ledger inside
     // the archive schema on a bridged database.
@@ -869,17 +986,17 @@ pub async fn migrate_dir_with(
     // WRONG -> fail closed: silently replacing a ledger CHECK that someone
     // deliberately altered would destroy the evidence of that alteration.
     //
-    // The whole decision runs inside one transaction holding an ACCESS EXCLUSIVE
-    // lock on the ledger, so a concurrent migrator waits and then observes the
-    // finished state instead of racing it.
+    // REV-096-F03 / REV-097-F03: the whole MIGRATION RUN — this decision and the
+    // filename-order loop below — is serialized by the advisory lock taken at the top
+    // of this function. The pre-REV-096 version took an ACCESS EXCLUSIVE lock in a
+    // transaction that committed before the loop started, so two migrators still
+    // raced over the migrations themselves and only the constraint step was protected.
     const DIGEST_ORIGIN_CHECK: &str = "_migrations_digest_origin_check";
     const DIGEST_ORIGIN_EXPR: &str =
         "CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline'))";
+
     {
         let mut tx = pool.begin().await?;
-        sqlx::raw_sql("LOCK TABLE public._migrations IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut *tx)
-            .await?;
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = $1 \
                AND conrelid = 'public._migrations'::regclass",
@@ -897,23 +1014,19 @@ pub async fn migrate_dir_with(
                 .await?;
             }
             Some(def) => {
-                // Verify against the SERVER's normalized rendering, so a difference
-                // in our own spacing or quoting never reads as drift. The check is
-                // semantic: the constraint must admit exactly the two provenance
-                // values the ledger defines, and nothing else may have been bolted on.
-                let normalized: String = sqlx::query_scalar(
-                    "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint \
-                      WHERE conname = $1 AND conrelid = 'public._migrations'::regclass",
-                )
-                .bind(DIGEST_ORIGIN_CHECK)
-                .fetch_one(&mut *tx)
-                .await?;
-                if !normalized.contains("applied") || !normalized.contains("baseline") {
+                // REV-096-F03: "contains the words applied and baseline" is not a
+                // definition check — a forged CHECK such as
+                // `digest_origin IN ('applied','baseline','forged')` or one that is
+                // always true would pass it while admitting values the ledger's
+                // provenance model does not define. Validate the ALLOWED SET by
+                // asking the server which values the predicate actually accepts.
+                let ok = digest_origin_check_admits_exactly(&mut tx, DIGEST_ORIGIN_CHECK).await?;
+                if !ok {
                     anyhow::bail!(
-                        "the migration ledger's `{DIGEST_ORIGIN_CHECK}` constraint is not the \
-                         expected definition (found `{def}`). It guards which digest \
-                         provenances are representable, so replacing it silently would erase \
-                         the evidence that someone changed it; reconcile deliberately"
+                        "the migration ledger's `{DIGEST_ORIGIN_CHECK}` constraint does not admit \
+                         exactly {{NULL, 'applied', 'baseline'}} (found `{def}`). It defines which \
+                         digest provenances are representable, so accepting a different predicate \
+                         would silently widen the ledger's trust model; reconcile deliberately"
                     );
                 }
             }

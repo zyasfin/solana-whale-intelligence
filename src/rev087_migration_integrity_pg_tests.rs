@@ -630,8 +630,10 @@ async fn a_corrupt_funding_subject_segment_is_refused_before_any_ddl() {
 /// commit's manifest, so the provenance is content-addressed rather than asserted.
 #[tokio::test]
 async fn an_authenticated_predecessor_bundle_converges_to_current() {
-    let pred_dir = std::env::temp_dir().join(format!("swi_r90_pred_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&pred_dir);
+    // REV-097-F06: guard-owned. This fixture previously created its database and
+    // temp dir by hand, so an assertion failure anywhere below stranded both.
+    let mut guard = crate::pg_test_support::ScratchDb::create("predconv").await;
+    let pred_dir = guard.temp_dir("pred");
     let Some(sql_count) = predecessor_bundle(&pred_dir) else {
         panic!(
             "the predecessor commit {PREDECESSOR_COMMIT} is unreachable from this checkout; \
@@ -640,30 +642,7 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
         );
     };
     assert!(sql_count > 0, "the predecessor bundle must contain SQL");
-
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_r90_pred_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url()
-            .rsplitn(2, '/')
-            .nth(1)
-            .expect("db url base"),
-        scratch
-    );
-    let pool = crate::db::connect(&url, 2).await.expect("scratch pool");
+    let pool = guard.pool().await;
 
     // Phase 1: the authenticated historical bytes.
     crate::db::migrate_dir_with(&pool, &pred_dir, true)
@@ -795,12 +774,9 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
     assert_eq!(baseline, 0, "an authenticated replay records no baseline rows");
     assert_eq!(applied, total, "every row is digest-verified as applied");
 
+    // REV-097-F06: guard-owned teardown, also on unwind.
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    let _ = std::fs::remove_dir_all(&pred_dir);
+    drop(guard);
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,9 +1031,9 @@ async fn a_zero_padded_funding_subject_is_not_refused() {
 /// those is not evidence of anything.
 #[test]
 fn the_manifest_parser_rejects_every_malformed_shape() {
-    let dir = std::env::temp_dir().join(format!("swi_r92_man_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    // REV-097-F06: guard-owned; the panicking cases below must not strand it.
+    let dir_guard = crate::pg_test_support::ScratchDir::create("manifest");
+    let dir = dir_guard.path().to_path_buf();
     let body = "-- probe\n";
     std::fs::write(dir.join("0001_a.sql"), body).expect("write a");
     std::fs::write(dir.join("0002_b.sql"), body).expect("write b");
@@ -1125,7 +1101,6 @@ fn the_manifest_parser_rejects_every_malformed_shape() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,45 +1465,6 @@ async fn a_second_pass_preserves_the_ledger_constraint_oid() {
     drop_scratch(&admin, pool, &scratch, &dir).await;
 }
 
-/// Two migrators against one database must both succeed, leaving exactly one
-/// correct constraint — no `duplicate_object` race at ADD CONSTRAINT.
-#[tokio::test]
-async fn two_concurrent_migrators_both_succeed() {
-    let (pool, admin, scratch, dir) = scratch_before("race", "9999_").await;
-
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url()
-            .rsplitn(2, '/')
-            .nth(1)
-            .expect("db url base"),
-        scratch
-    );
-    let a = crate::db::connect(&url, 2).await.expect("pool a");
-    let b = crate::db::connect(&url, 2).await.expect("pool b");
-    let dir_a = migrations_dir();
-    let dir_b = migrations_dir();
-
-    let (ra, rb) = tokio::join!(
-        crate::db::migrate_dir_with(&a, &dir_a, true),
-        crate::db::migrate_dir_with(&b, &dir_b, true),
-    );
-    ra.expect("first concurrent migrator must succeed");
-    rb.expect("second concurrent migrator must succeed (REV-093-F03)");
-
-    let constraints: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_constraint WHERE conname = '_migrations_digest_origin_check' \
-           AND conrelid = 'public._migrations'::regclass",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("constraint count");
-    assert_eq!(constraints, 1, "exactly one ledger CHECK must remain");
-
-    a.close().await;
-    b.close().await;
-    drop_scratch(&admin, pool, &scratch, &dir).await;
-}
 
 // ---------------------------------------------------------------------------
 // REV-093-F04 — every malformed manifest class fails through PRODUCTION
@@ -1757,23 +1693,511 @@ async fn no_scratch_database_outlives_the_fixtures_that_made_it() {
         "a guard dropped on the SUCCESS path must also remove its database"
     );
 
-    // And nothing this process created under the guard's naming scheme is still
-    // around at this instant.
+    // And nothing this process created is still around at this instant — measured
+    // over EVERY fixture naming family, not just the guard's own prefix.
+    //
+    // REV-097-F06: the previous probe matched `swi_scratch_%_<pid>_%` only, so a
+    // fixture that created a database or directory under any other spelling (the
+    // historical `swi_r85_*`, `swi_r87f03_*`, `swi_upg_*`, `swi_f0N_*` families)
+    // could leak without this class check noticing. The scan is now over the whole
+    // `swi%` namespace, restricted to THIS process id so a concurrent harness (the
+    // lib and bin test binaries run as separate processes) is never blamed.
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&admin_url)
         .await
         .expect("admin pool");
-    let mine = format!("swi_scratch_%_{}_%", std::process::id());
-    let residue: Vec<String> =
-        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname LIKE $1 ORDER BY datname")
-            .bind(&mine)
-            .fetch_all(&admin)
-            .await
-            .expect("residue probe");
+    let pid = std::process::id().to_string();
+    let residue: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database \
+          WHERE datname LIKE 'swi%' AND datname LIKE '%' || $1 || '%' ORDER BY datname",
+    )
+    .bind(&pid)
+    .fetch_all(&admin)
+    .await
+    .expect("residue probe");
     admin.close().await;
     assert!(
         residue.is_empty(),
         "these scratch databases from this process were not cleaned up: {residue:?}"
     );
+
+    // Temp directories are the other half of the same ownership rule: a fixture that
+    // builds a reduced migration bundle must not strand it either.
+    let dir_residue: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .expect("read temp dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("swi") && n.contains(&pid))
+        .collect();
+    assert!(
+        dir_residue.is_empty(),
+        "these temp directories from this process were not cleaned up: {dir_residue:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REV-096-F02 — 1041's constraint guards are table-qualified and definition-exact
+// ---------------------------------------------------------------------------
+
+/// A same-named constraint on ANOTHER table must not satisfy 1041's guard.
+///
+/// `conname` is not unique across a database. The guard used to look the name up
+/// without `conrelid`, so an unrelated table carrying `workspaces_id_positive_check`
+/// made 1041 skip installing the invariant on the table that actually needs it —
+/// and `safe_int8_predicate` would then be relying on a rule nothing enforced.
+#[tokio::test]
+async fn a_same_named_constraint_on_another_table_does_not_satisfy_1041() {
+    let (pool, admin, scratch, dir) = scratch_before("f02qual", "1041_").await;
+
+    // A decoy table carrying BOTH constraint names 1041 looks for.
+    sqlx::query("CREATE TABLE public.r97_decoy (id bigint)")
+        .execute(&pool)
+        .await
+        .expect("decoy table");
+    sqlx::query(
+        "ALTER TABLE public.r97_decoy \
+           ADD CONSTRAINT workspaces_id_positive_check CHECK (id > 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("decoy constraint a");
+    sqlx::query(
+        "ALTER TABLE public.r97_decoy \
+           ADD CONSTRAINT funding_radar_cases_id_positive_check CHECK (id > 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("decoy constraint b");
+
+    // Precondition: an unqualified lookup WOULD be satisfied by the decoys.
+    let unqualified: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname = 'workspaces_id_positive_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("unqualified probe");
+    assert_eq!(unqualified, 1, "exactly the decoy exists before 1041 runs");
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("1041 must still install the invariant on the real tables");
+
+    for (table, constraint) in [
+        ("workspaces", "workspaces_id_positive_check"),
+        ("funding_radar_cases", "funding_radar_cases_id_positive_check"),
+    ] {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1 \
+               AND conrelid = ($2::text)::regclass AND contype = 'c' AND convalidated)",
+        )
+        .bind(constraint)
+        .bind(format!("public.{table}"))
+        .fetch_one(&pool)
+        .await
+        .expect("qualified probe");
+        assert!(
+            present,
+            "{constraint} must exist ON public.{table}; a decoy of the same name on \
+             another table must not satisfy the guard (REV-096-F02)"
+        );
+    }
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// A constraint of the right NAME on the right TABLE but with the wrong definition
+/// must fail closed, even when that definition mentions the expected column.
+#[tokio::test]
+async fn a_wrong_but_plausible_1041_constraint_definition_fails_closed() {
+    let (pool, admin, scratch, dir) = scratch_before("f02def", "1041_").await;
+
+    // `id >= 0` admits zero: it contains the same column and looks right, but it is
+    // NOT the invariant safe_int8_predicate relies on.
+    sqlx::query(
+        "ALTER TABLE public.workspaces \
+           ADD CONSTRAINT workspaces_id_positive_check CHECK (id >= 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("plant a wrong-but-plausible constraint");
+
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("1041 must refuse a constraint whose definition is not id > 0");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("unexpected definition"),
+        "expected the named definition refusal, got: {msg}"
+    );
+
+    // Fail CLOSED: the wrong constraint is untouched and the cutover was not recorded.
+    let still: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = 'workspaces_id_positive_check' \
+            AND conrelid = 'public.workspaces'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint still present");
+    assert!(still.contains(">="), "the operator's constraint must be left as it was");
+    let cutover: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM schema_cutover_events WHERE cutover = 'positive_id_invariant'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(cutover, 0, "no cutover may be recorded for a migration that aborted");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-096-F05 — dual-table invalid IDs: both diagnostics, no partial state
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn invalid_ids_in_both_tables_are_both_reported_with_no_partial_state() {
+    let (pool, admin, scratch, dir) = scratch_before("f05dual", "1041_").await;
+
+    sqlx::query("INSERT INTO workspaces (id, name, slug) OVERRIDING SYSTEM VALUE VALUES (0, 'w', $1)")
+        .bind(tag("r97dualws"))
+        .execute(&pool)
+        .await
+        .expect("pre-1041 lane accepts id 0");
+    let recipient = tag("R97DUALRECIP");
+    sqlx::query(
+        "INSERT INTO wallets (chain, address, first_seen, last_seen, source) \
+         VALUES ('solana', $1, now(), now(), 'test') ON CONFLICT DO NOTHING",
+    )
+    .bind(&recipient)
+    .execute(&pool)
+    .await
+    .expect("wallet");
+    sqlx::query(
+        "INSERT INTO funding_radar_cases \
+             (id, chain, recipient, workspace_id, first_funded_at, first_funding_usd, \
+              first_funding_native, source_address, deploy_window_ends_at, stage, \
+              confidence, evidence) \
+         VALUES (0, 'solana', $1, (SELECT id FROM workspaces WHERE id = 0), now(), '1', '1', \
+                 'SRC', now() + interval '1 day', 'funded', 50, '{}'::jsonb)",
+    )
+    .bind(&recipient)
+    .execute(&pool)
+    .await
+    .expect("pre-1041 lane accepts case id 0");
+
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("1041 must refuse to install the invariant over violating data");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("positive-ID invariant violated"),
+        "expected the named diagnostic, got: {msg}"
+    );
+    // BOTH tables must be named, not just the first one checked.
+    assert!(
+        msg.contains("workspaces.id: 0"),
+        "the workspaces violation must be reported: {msg}"
+    );
+    assert!(
+        msg.contains("funding_radar_cases.id: 0"),
+        "the funding_radar_cases violation must be reported too (REV-096-F05): {msg}"
+    );
+
+    // No partial state: neither constraint installed, no cutover row, rows untouched.
+    let constraints: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname IN \
+           ('workspaces_id_positive_check', 'funding_radar_cases_id_positive_check')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint count");
+    assert_eq!(constraints, 0, "no constraint may be installed while data violates it");
+    let cutover: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM schema_cutover_events WHERE cutover = 'positive_id_invariant'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(cutover, 0, "no cutover may be recorded for an aborted migration");
+    let survivors: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM workspaces WHERE id <= 0) \
+              + (SELECT count(*) FROM funding_radar_cases WHERE id <= 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("survivor count");
+    assert_eq!(survivors, 2, "both offending rows must be left exactly as they were");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-096-F03 — a forged ledger CHECK that merely CONTAINS the two words
+// ---------------------------------------------------------------------------
+
+/// `digest_origin IN ('applied','baseline','forged')` contains both expected words
+/// and is therefore accepted by a substring test, while admitting a third provenance
+/// the ledger's trust model does not define.
+#[tokio::test]
+async fn a_forged_ledger_check_containing_both_values_is_refused() {
+    let (pool, admin, scratch, dir) = scratch_before("f03forge", "9999_").await;
+
+    sqlx::query("ALTER TABLE public._migrations DROP CONSTRAINT _migrations_digest_origin_check")
+        .execute(&pool)
+        .await
+        .expect("drop the real constraint");
+    sqlx::query(
+        "ALTER TABLE public._migrations ADD CONSTRAINT _migrations_digest_origin_check \
+           CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline', 'forged'))",
+    )
+    .execute(&pool)
+    .await
+    .expect("plant the forged constraint");
+
+    // Precondition: a substring test WOULD accept this.
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = '_migrations_digest_origin_check' \
+            AND conrelid = 'public._migrations'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("forged def");
+    assert!(
+        def.contains("applied") && def.contains("baseline"),
+        "the forged constraint must contain both words, or this proves nothing"
+    );
+
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("a widened provenance CHECK must be refused");
+    assert!(
+        format!("{err:#}").contains("does not admit exactly"),
+        "expected the allowed-set refusal, got: {err:#}"
+    );
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// Two migrators racing on a database with NOTHING applied yet.
+///
+/// REV-096-F03: the previous concurrency test used `scratch_before(.., "9999_")`,
+/// which applies every migration BEFORE the race starts — so both callers found an
+/// empty work list and the test was false-green. The real question is whether two
+/// processes can apply the SAME migrations at the same time. Here the scratch
+/// database is untouched, so both callers genuinely contend over the whole run.
+#[tokio::test]
+async fn two_concurrent_migrators_on_an_empty_database_both_succeed() {
+    let scratch = crate::pg_test_support::ScratchDb::create("f03race").await;
+
+    // Precondition: nothing is applied, so the race is over real work.
+    let pool_probe = scratch.pool().await;
+    let ledger_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+          WHERE table_schema = 'public' AND table_name = '_migrations')",
+    )
+    .fetch_one(&pool_probe)
+    .await
+    .expect("ledger probe");
+    assert!(!ledger_exists, "the race must start from an EMPTY database");
+    pool_probe.close().await;
+
+    let a = scratch.pool().await;
+    let b = scratch.pool().await;
+    let dir_a = migrations_dir();
+    let dir_b = migrations_dir();
+    let (ra, rb) = tokio::join!(
+        crate::db::migrate_dir_with(&a, &dir_a, true),
+        crate::db::migrate_dir_with(&b, &dir_b, true),
+    );
+    ra.expect("first concurrent migrator must succeed on an empty database");
+    rb.expect("second concurrent migrator must succeed on an empty database (REV-096-F03)");
+
+    let pool = scratch.pool().await;
+    // Ledger state must be correct, not merely non-erroring: one row per file, each
+    // recorded exactly once, none duplicated by the racing pass.
+    let on_disk = std::fs::read_dir(migrations_dir())
+        .expect("read migrations")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
+        .count() as i64;
+    let (total, distinct, applied, baseline): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT name), \
+                count(*) FILTER (WHERE digest_origin = 'applied'), \
+                count(*) FILTER (WHERE digest_origin = 'baseline') \
+           FROM public._migrations",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ledger fingerprint");
+    assert_eq!(total, distinct, "a racing migrator must not double-record any migration");
+    assert_eq!(total, on_disk, "every migration must be recorded exactly once");
+    assert_eq!(applied, total, "every row must be digest-verified as applied");
+    assert_eq!(baseline, 0, "a fresh race records no baseline rows");
+
+    // And exactly one ledger CHECK survives the race.
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname = '_migrations_digest_origin_check' \
+           AND conrelid = 'public._migrations'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint count");
+    assert_eq!(checks, 1, "exactly one ledger CHECK must remain after the race");
+
+    a.close().await;
+    b.close().await;
+    pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-096-F04 — resolver precedence proven through the PRODUCTION resolver
+// ---------------------------------------------------------------------------
+
+/// Run the real resolver against DIVERGENT directories and prove the packaged
+/// bundle wins.
+///
+/// REV-095 asserted only the ORDER of the candidate list, which is a statement about
+/// a Vec, not about what the migrator would load. This builds a legacy sibling whose
+/// contents differ from the packaged bundle and then checks which one production
+/// actually resolves and applies.
+#[tokio::test]
+async fn the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibling() {
+    // A divergent "legacy sibling" next to a fake crate root, plus a packaged
+    // `migrations/` under that same root. Only the packaged one is legitimate.
+    let root = crate::pg_test_support::ScratchDir::create("resolverroot");
+    let packaged = root.path().join("crate_root").join("migrations");
+    let sibling = root.path().join("swi-deploy").join("migrations");
+    std::fs::create_dir_all(&packaged).expect("packaged dir");
+    std::fs::create_dir_all(&sibling).expect("sibling dir");
+
+    // Packaged: the canonical bundle. Sibling: deliberately DIFFERENT content.
+    for entry in std::fs::read_dir(migrations_dir()).expect("read canonical") {
+        let entry = entry.expect("entry");
+        std::fs::copy(entry.path(), packaged.join(entry.file_name())).expect("copy packaged");
+    }
+    // The marker filename must NOT collide with any canonical file, or "did a sibling
+    // file get applied?" is unanswerable from the ledger.
+    std::fs::write(
+        sibling.join("9998_divergent_sibling.sql"),
+        "-- DIVERGENT LEGACY SIBLING: this must never be chosen\nSELECT 1;\n",
+    )
+    .expect("write sibling");
+
+    // ------------------------------------------------------------------
+    // The behavioural proof: run the PRODUCTION BINARY with its cwd inside the fake
+    // root, so `resolve_migration_dir` sees BOTH a packaged `./migrations` and a
+    // DIVERGENT `../swi-deploy/migrations`, and observe which one it applied.
+    // Asserting on the candidate Vec (REV-095) is a statement about a list; this is
+    // a statement about what ran.
+    // ------------------------------------------------------------------
+    let exe = {
+        let mut p = std::env::current_exe().expect("test exe path");
+        p.pop(); // deps/
+        p.pop(); // debug/
+        p.join(if cfg!(windows) {
+            "solana-whale-intelligence.exe"
+        } else {
+            "solana-whale-intelligence"
+        })
+    };
+    assert!(exe.exists(), "the production binary must be built at {}", exe.display());
+
+    let scratch = crate::pg_test_support::ScratchDb::create("f04resolve").await;
+    let out = std::process::Command::new(&exe)
+        .args(["db", "migrate", "--accept-legacy-baseline"])
+        .current_dir(root.path().join("crate_root"))
+        .env("DATABASE_URL", scratch.scratch_url())
+        .env("MIGRATION_DATABASE_URL", scratch.scratch_url())
+        .env_remove("SWI_MIGRATIONS_DIR")
+        .output()
+        .expect("spawn the production migrator");
+    assert!(
+        out.status.success(),
+        "db migrate failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pool = scratch.pool().await;
+    let on_disk = std::fs::read_dir(migrations_dir())
+        .expect("read canonical")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
+        .count() as i64;
+    let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM public._migrations")
+        .fetch_one(&pool)
+        .await
+        .expect("ledger count");
+    assert_eq!(
+        applied, on_disk,
+        "the resolver must have loaded the packaged bundle ({on_disk} migrations), not the \
+         one-file divergent sibling"
+    );
+    let sibling_row: i64 =
+        sqlx::query_scalar(
+            "SELECT count(*) FROM public._migrations WHERE name = '9998_divergent_sibling.sql'",
+        )
+            .fetch_one(&pool)
+            .await
+            .expect("sibling probe");
+    assert_eq!(sibling_row, 0, "no file from the divergent sibling may have been applied");
+    // A sibling-sourced lane could not have produced the invariant 1041 installs.
+    let invariant: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+           WHERE conname = 'workspaces_id_positive_check' \
+             AND conrelid = 'public.workspaces'::regclass)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("invariant probe");
+    assert!(invariant, "the applied bundle must be the canonical one");
+    pool.close().await;
+
+    // ------------------------------------------------------------------
+    // Second half — the real precedence question. With no cwd-local `./migrations`,
+    // the crate-relative PACKAGED bundle and the cwd-relative DIVERGENT SIBLING are
+    // both reachable, so whichever the binary applies is decided by precedence alone
+    // (REV-093-F05). Without this half the first assertion could hold merely because
+    // the sibling was never reachable.
+    // ------------------------------------------------------------------
+    let bare = root.path().join("bare_root");
+    std::fs::create_dir_all(&bare).expect("bare root");
+    assert!(
+        !bare.join("migrations").exists(),
+        "the cwd-local candidate must be absent, or precedence is not what decides"
+    );
+    assert!(
+        bare.join("../swi-deploy/migrations").is_dir(),
+        "the divergent sibling must be REACHABLE from this cwd: {}",
+        bare.display()
+    );
+    let scratch2 = crate::pg_test_support::ScratchDb::create("f04fallback").await;
+    let out2 = std::process::Command::new(&exe)
+        .args(["db", "migrate", "--accept-legacy-baseline"])
+        .current_dir(&bare)
+        .env("DATABASE_URL", scratch2.scratch_url())
+        .env("MIGRATION_DATABASE_URL", scratch2.scratch_url())
+        .env_remove("SWI_MIGRATIONS_DIR")
+        .output()
+        .expect("spawn the production migrator");
+    assert!(
+        out2.status.success(),
+        "fallback db migrate failed: {}{}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let pool2 = scratch2.pool().await;
+    let applied2: i64 = sqlx::query_scalar("SELECT count(*) FROM public._migrations")
+        .fetch_one(&pool2)
+        .await
+        .expect("fallback ledger count");
+    assert_eq!(
+        applied2, on_disk,
+        "with no cwd-local bundle the crate-relative PACKAGED bundle must still win over \
+         `../swi-deploy/migrations`"
+    );
+    pool2.close().await;
 }

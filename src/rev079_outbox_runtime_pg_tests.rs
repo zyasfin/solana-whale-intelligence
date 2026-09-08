@@ -62,7 +62,7 @@ fn worker_ctx(
 /// then brought forward by migration 1035 — the exact sequence REV-078-F01 broke.
 async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
         // REV-093-F06: guard-owned; cleans up on unwind too.
-    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let mut scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
     let scratch = scratch_guard.name().to_string();
 
     // Migrations dir minus 1034 and 1035: the pre-upgrade state.
@@ -71,9 +71,7 @@ async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, crate::
         .expect("parent")
         .join("swi-deploy/migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
-    let red_dir = std::env::temp_dir().join(format!("swi_upg_migrations_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+    let red_dir = scratch_guard.temp_dir("upg");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("entry");
         let name = entry.file_name().to_string_lossy().to_string();

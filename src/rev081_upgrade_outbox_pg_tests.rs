@@ -66,7 +66,7 @@ fn worker_ctx(
 /// the exact lane that aborted inside 1034 before the migrator preflight existed.
 async fn scratch_1033_with_pending(name: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
         // REV-093-F06: guard-owned; cleans up on unwind too.
-    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let mut scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
     let scratch = scratch_guard.name().to_string();
 
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -74,9 +74,7 @@ async fn scratch_1033_with_pending(name: &str) -> (PgPool, crate::pg_test_suppor
         .expect("parent")
         .join("swi-deploy/migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
-    let red_dir = std::env::temp_dir().join(format!("swi_f01_mig_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+    let red_dir = scratch_guard.temp_dir("f01");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("entry");
         let n = entry.file_name().to_string_lossy().to_string();

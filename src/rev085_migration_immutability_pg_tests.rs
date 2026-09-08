@@ -52,13 +52,11 @@ fn lf_digest(path: &std::path::Path) -> String {
 /// lane under test starts from a genuine historical schema.
 async fn scratch_through(name: &str, last_kept: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
         // REV-093-F06: guard-owned; cleans up on unwind too.
-    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let mut scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
     let scratch = scratch_guard.name().to_string();
 
     let src_dir = migrations_dir();
-    let red_dir = std::env::temp_dir().join(format!("swi_r85_mig_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir reduced migrations");
+    let red_dir = scratch_guard.temp_dir("r85");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("dir entry");
         let n = entry.file_name().to_string_lossy().to_string();

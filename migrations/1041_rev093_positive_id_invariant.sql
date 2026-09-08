@@ -47,6 +47,7 @@ DECLARE
     v_bad_workspaces bigint := 0;
     v_bad_cases      bigint := 0;
     v_detail         text   := '';
+    v_def            text;
 BEGIN
     -- ------------------------------------------------------------------
     -- Detection FIRST, before any DDL. A partially-constrained schema is
@@ -94,24 +95,51 @@ BEGIN
     -- ------------------------------------------------------------------
     -- Only now, with the data proven clean, install the invariant.
     -- ------------------------------------------------------------------
+    -- REV-096-F02: the guard is TABLE-QUALIFIED. `conname` alone is not unique across
+    -- a database, so a same-named constraint on any other table made this migration
+    -- silently skip installing the invariant where it is actually relied upon.
+    -- And existence is not enough: a constraint of the right name with the WRONG
+    -- definition must fail closed rather than be accepted as satisfied.
     IF EXISTS (
         SELECT 1 FROM information_schema.tables
          WHERE table_schema = 'public' AND table_name = 'workspaces'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'workspaces_id_positive_check'
     ) THEN
-        ALTER TABLE public.workspaces
-            ADD CONSTRAINT workspaces_id_positive_check CHECK (id > 0);
+        SELECT pg_get_constraintdef(oid) INTO v_def
+          FROM pg_constraint
+         WHERE conname = 'workspaces_id_positive_check'
+           AND conrelid = 'public.workspaces'::regclass;
+        IF v_def IS NULL THEN
+            ALTER TABLE public.workspaces
+                ADD CONSTRAINT workspaces_id_positive_check CHECK (id > 0);
+        ELSIF regexp_replace(v_def, '\s+', '', 'g') <> 'CHECK((id>0))' THEN
+            RAISE EXCEPTION
+                'constraint workspaces_id_positive_check exists on public.workspaces with an '
+                'unexpected definition (%); the positive-ID invariant cannot be assumed. '
+                'Reconcile it deliberately rather than letting this migration accept it',
+                v_def
+            USING ERRCODE = 'check_violation';
+        END IF;
     END IF;
 
     IF EXISTS (
         SELECT 1 FROM information_schema.tables
          WHERE table_schema = 'public' AND table_name = 'funding_radar_cases'
-    ) AND NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'funding_radar_cases_id_positive_check'
     ) THEN
-        ALTER TABLE public.funding_radar_cases
-            ADD CONSTRAINT funding_radar_cases_id_positive_check CHECK (id > 0);
+        SELECT pg_get_constraintdef(oid) INTO v_def
+          FROM pg_constraint
+         WHERE conname = 'funding_radar_cases_id_positive_check'
+           AND conrelid = 'public.funding_radar_cases'::regclass;
+        IF v_def IS NULL THEN
+            ALTER TABLE public.funding_radar_cases
+                ADD CONSTRAINT funding_radar_cases_id_positive_check CHECK (id > 0);
+        ELSIF regexp_replace(v_def, '\s+', '', 'g') <> 'CHECK((id>0))' THEN
+            RAISE EXCEPTION
+                'constraint funding_radar_cases_id_positive_check exists on '
+                'public.funding_radar_cases with an unexpected definition (%); the '
+                'positive-ID invariant cannot be assumed. Reconcile it deliberately',
+                v_def
+            USING ERRCODE = 'check_violation';
+        END IF;
     END IF;
 
     -- ------------------------------------------------------------------

@@ -109,6 +109,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-095 | 2026-09-08 | implementation of REV-093-F02..F06 (forward migration 1041 enforcing id > 0 with fail-closed detection and no silent repair; ledger CHECK made idempotent and concurrency-safe under an ACCESS EXCLUSIVE lock; one strict manifest parser in production shared with the fixture; resolver puts the packaged bundle ahead of the legacy sibling; fmt denominator corrected) | READY FOR REVIEW | 369/369 + 503/503; check gates 0 warning; disposable DB 53\|53\|0, FK 1, 2 validated positive-id CHECKs, cleanup verified 0 left; 10 focused tests each `--exact --list`=1 and `running 1 test`; 6 RED→GREEN; REV-094/F01 left intact and re-verified; F06 cleanup guard reported OPEN |
 | REV-096 | 2026-09-08 | implementation of the remaining REV-093-F06 cleanup mechanism (ScratchDb guard owning disposable DBs and temp dirs, cleaned up in Drop on the panic/unwind path; all nine scratch-creating fixtures migrated so `CREATE DATABASE` exists only inside the guard) | READY FOR REVIEW | 369/369 + 506/506; check gates 0 warning; disposable DB 53\|53\|0, FK 1; residue after a full lane with NO manual sweeping = 0 DBs, 0 temp dirs; 3 focused tests each `--exact --list`=1 and `running 1 test`; RED reproduced `survived a panicking test`; also proven on a real fixture forced to fail; SIGKILL/abort path stated as a limitation |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
+| REV-097 | 2026-09-09 | corrective for the independent review REV-096 (F02 table-qualified + definition-exact 1041 guards; F03 advisory lock held for the ENTIRE migration run and semantic allowed-set validation of the ledger CHECK; F04 resolver proven through the production binary with divergent directories; F05 dual-table invalid-ID diagnostics; F06 RAII temp dirs and a residue scan over every naming family) | READY FOR REVIEW | 369/369 default + 508/508 pg_tests (181 lib + 279 bin + 48 integration); check gates 0 warning; disposable DB 53\|53\|53 applied, 2 validated positive-id CHECKs, ledger CHECK admits exactly {NULL,applied,baseline}; residue after the full lane = 0 DBs, 0 temp dirs; 6 new focused tests; 5 RED→GREEN, each RED an assertion failure; 2 defects found by me and fixed (advisory lock never released -> 30-minute migrator deadlock; `CARGO_MANIFEST_DIR` read at RUNTIME so the shipped binary silently fell back to the unversioned legacy sibling) |
 
 ---
 
@@ -15300,6 +15301,214 @@ lane final dijalankan dari kondisi bersih tanpa sapuan manual sama sekali.
   yang dikoreksi REV-093-F06/REV-095. Tidak diminta round ini dan tidak diubah.
 - Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI (F05) dan regression cabang
   penolakan F06-REV-090 sebelum wiring produksi. Keduanya tidak berkaitan dengan F06 ini.
+- Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+## REV-097 — Implementasi corrective atas independent review REV-096
+
+**Tanggal:** 2026-09-09
+**Basis commit:** `e1e0403` (REV-096)
+**Scope:** REV-096 F02, F03, F04, F05, F06.
+**Verdict:** **READY FOR REVIEW** (bukan APPROVED; review independen Hermes menyusul).
+
+### Yang belum terimplementasi saat round ini dimulai
+
+Worktree diwarisi dalam keadaan dirty dari sesi sebelumnya. Kondisi nyata saat saya mulai:
+
+- `migrations/1041_rev093_positive_id_invariant.sql` masih memuat **probe RED yang belum
+  dikembalikan**: cabang `workspaces` memakai `ELSIF false THEN` (validasi definisi dimatikan)
+  dan lookup `pg_constraint`-nya belum ter-qualify `conrelid`. Jadi F02 hanya setengah jadi,
+  dan MANIFEST tidak cocok dengan file.
+- F03 punya `MigrationLock` yang **tidak pernah melepas lock**: `Drop`-nya hanya menulis
+  `tracing::debug!`, sementara lock diambil pada koneksi POOLED. Advisory lock session-level
+  ikut kembali ke pool dalam keadaan masih terpegang.
+- F04 masih memakai assertion atas urutan `Vec` kandidat, bukan invocation resolver produksi.
+
+### F02 — guard 1041 table-qualified dan exact-definition
+
+`migrations/1041_rev093_positive_id_invariant.sql`
+
+- Lama: `SELECT 1 FROM pg_constraint WHERE conname = 'workspaces_id_positive_check'` — tanpa
+  `conrelid`. `conname` tidak unik lintas tabel, jadi constraint bernama sama di tabel lain
+  membuat 1041 melewati pemasangan invariant pada tabel yang benar-benar memerlukannya, dan
+  `db.rs::safe_int8_predicate` lalu bersandar pada aturan yang tidak ditegakkan siapa pun.
+- Baru: kedua cabang mengambil `pg_get_constraintdef(oid)` dengan
+  `AND conrelid = 'public.<tabel>'::regclass`, lalu:
+  `v_def IS NULL` → pasang; definisi ada tetapi
+  `regexp_replace(v_def, '\s+', '', 'g') <> 'CHECK((id>0))'` → `RAISE EXCEPTION` fail-closed.
+- Kenapa mekanisme ini otoritatif: yang dibandingkan adalah **rendering server sendiri** atas
+  constraint (`pg_get_constraintdef`), bukan teks yang kita tulis, sehingga perbedaan spasi atau
+  kutip tidak pernah terbaca sebagai drift, dan constraint yang salah tidak pernah diterima
+  hanya karena namanya benar.
+
+### F03 — lock untuk SELURUH run + validasi allowed-set semantik
+
+`src/db.rs`
+
+1. **Lock seluruh run.** Versi REV-095 memegang `LOCK TABLE ... ACCESS EXCLUSIVE` di dalam
+   transaksi yang commit sebelum loop migrasi dimulai; hanya langkah constraint yang terlindung.
+   Sekarang satu advisory lock session-level (`pg_advisory_lock(0x5357495F4D494752)`) diambil
+   **sebagai statement pertama fungsi**, sebelum bootstrap ledger, dan dilepas lewat `Drop`.
+2. **Lock benar-benar dilepas.** Koneksi pemegang lock di-`detach()` dari pool dan dimiliki oleh
+   `MigrationLock`; drop menutup socket dan PostgreSQL melepas advisory lock milik session
+   bersama backend-nya. `Drop` tidak bisa `await`, itulah sebabnya pelepasan diekspresikan
+   sebagai "tutup session", bukan round-trip `pg_advisory_unlock`.
+3. **Allowed-set semantik.** `def.contains("applied") && def.contains("baseline")` diganti
+   `digest_origin_check_admits_exactly`: ekspresi constraint diambil via `pg_get_expr(conbin,
+   conrelid)`, lalu setiap nilai probe (`NULL`, `applied`, `baseline`, `forged`, `''`,
+   `APPLIED`) dievaluasi terhadap ekspresi itu oleh server. Substring tidak bisa menjawab
+   pertanyaan tentang sebuah HIMPUNAN; evaluasi predikat bisa.
+
+### F04 — resolver produksi dengan direktori divergen
+
+`src/rev087_migration_integrity_pg_tests.rs::the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibling`
+
+Test membangun fake root berisi `crate_root/migrations` (bundle kanonis) dan
+`swi-deploy/migrations` (satu file `9998_divergent_sibling.sql` yang sengaja berbeda), lalu
+menjalankan **binary produksi** `swi db migrate --accept-legacy-baseline` dengan cwd di dalam
+root itu, `SWI_MIGRATIONS_DIR` dihapus. Dua paruh:
+
+- cwd punya `./migrations` → 53 migrasi kanonis terpasang, baris sibling 0, constraint 1041 ada.
+- cwd TANPA `./migrations` tetapi sibling divergen terjangkau → bundle packaged crate-relative
+  tetap menang. Paruh kedua ini yang membuat paruh pertama bermakna.
+
+### F05 — dual-table invalid ID
+
+`invalid_ids_in_both_tables_are_both_reported_with_no_partial_state` menanam `id = 0` di
+`workspaces` DAN `funding_radar_cases` pada lane pra-1041, lalu menuntut: diagnostik menyebut
+KEDUA tabel, tidak ada constraint terpasang, tidak ada baris cutover, dan kedua baris pelanggar
+utuh (`survivors = 2`).
+
+### F06 — RAII temp dir + sapuan residu semua keluarga nama
+
+- `src/pg_test_support.rs`: `ScratchDir` baru — temp dir yang menghapus dirinya pada `Drop`,
+  termasuk saat unwind, untuk fixture yang butuh direktori tanpa scratch DB.
+- Fixture yang masih memakai `std::env::temp_dir()` telanjang dan `CREATE DATABASE` manual
+  dipindah ke guard.
+- `no_scratch_database_outlives_the_fixtures_that_made_it`: probe lama hanya
+  `swi_scratch_%_<pid>_%`. Sekarang scan atas seluruh namespace `swi%` yang memuat PID proses
+  ini — menutup keluarga historis `swi_upg_*`, `swi_r85_*`, `swi_r87f03_*`, `swi_f0N_*` — plus
+  paruh kedua: tidak boleh ada direktori `swi*` milik PID ini tersisa di temp.
+- DROP disengaja pada `the_scratch_guard_is_what_performs_the_cleanup` tetap ada dan
+  terdokumentasi: guard sengaja dilucuti (`leak_for_tests`) untuk membuktikan `Drop`-lah yang
+  membersihkan, lalu kebocoran itu dibereskan manual di test yang sama.
+
+### Dua defect yang SAYA temukan sendiri (tidak ada di daftar reviewer)
+
+1. **Migrator deadlock 30 menit.** Advisory lock diambil pada koneksi pooled dan tidak pernah
+   dilepas, sehingga migrator kedua menunggu lock yang tidak akan pernah bebas. Terlihat sebagai
+   `cargo test` yang hang 1800 detik, bukan sebagai kegagalan test. Diperbaiki dengan
+   `detach()` + kepemilikan koneksi di `MigrationLock`.
+2. **Resolver kehilangan bundle packaged di binary yang dideploy.** `migration_dir_candidates`
+   membaca `CARGO_MANIFEST_DIR` lewat `std::env::var` — variabel itu hanya ada selama cargo yang
+   menjalankan proses. Di binary nyata kandidat 3 dan 5 hilang diam-diam, jadi `swi db migrate`
+   dari direktori tanpa `./migrations` menerapkan `../swi-deploy/migrations`, salinan yang tidak
+   diversioning. Diperbaiki menjadi konstanta compile-time `env!("CARGO_MANIFEST_DIR")`.
+   Bukti: RED pada paruh kedua F04 memberi `left: 1 / right: 53` — binary benar-benar menerapkan
+   file sibling.
+
+### Bukti RED→GREEN (verbatim, semuanya assertion failure, bukan compile error)
+
+RED F02-a — kualifikasi `conrelid` dilepas dari cabang workspaces:
+```
+workspaces_id_positive_check must exist ON public.workspaces; a decoy of the same name on
+another table must not satisfy the guard (REV-096-F02)
+test result: FAILED. 0 passed; 1 failed
+```
+
+RED F02-b — pemeriksaan definisi dilonggarkan menjadi `v_def NOT LIKE '%id%'`:
+```
+1041 must refuse a constraint whose definition is not id > 0: ()
+test result: FAILED. 0 passed; 1 failed
+```
+
+RED F05 — diagnostik hanya melaporkan tabel pertama:
+```
+the funding_radar_cases violation must be reported too (REV-096-F05): error returned from
+database: positive-ID invariant violated: 1 workspace row(s) and 1 funding-case row(s) carry
+id <= 0 (workspaces.id: 0). ...
+test result: FAILED. 0 passed; 1 failed
+```
+
+RED F03-a — validasi allowed-set diganti substring `def.contains("applied") && def.contains("baseline")`:
+```
+a widened provenance CHECK must be refused: ()
+test result: FAILED. 0 passed; 1 failed
+```
+
+RED F03-b — blok advisory lock dihapus seluruhnya:
+```
+second concurrent migrator must succeed on an empty database (REV-096-F03): error returned from
+database: duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+test result: FAILED. 0 passed; 1 failed
+```
+
+RED F04 — resolver dikembalikan ke lookup `std::env::var("CARGO_MANIFEST_DIR")`:
+```
+assertion `left == right` failed: with no cwd-local bundle the crate-relative PACKAGED bundle
+must still win over `../swi-deploy/migrations`
+  left: 1
+ right: 53
+test result: FAILED. 0 passed; 1 failed
+```
+
+GREEN setelah semua fix dipulihkan:
+```
+test rev087_migration_integrity_pg_tests::a_forged_ledger_check_containing_both_values_is_refused ... ok
+test rev087_migration_integrity_pg_tests::a_same_named_constraint_on_another_table_does_not_satisfy_1041 ... ok
+test rev087_migration_integrity_pg_tests::a_wrong_but_plausible_1041_constraint_definition_fails_closed ... ok
+test rev087_migration_integrity_pg_tests::invalid_ids_in_both_tables_are_both_reported_with_no_partial_state ... ok
+test rev087_migration_integrity_pg_tests::the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibling ... ok
+test rev087_migration_integrity_pg_tests::two_concurrent_migrators_on_an_empty_database_both_succeed ... ok
+test result: ok. 6 passed; 0 failed
+```
+
+### Gate
+
+```
+cargo +1.89.0 check --locked --all-targets                     -> Finished, 0 warning
+cargo +1.89.0 check --locked --features pg_tests --all-targets -> Finished, 0 warning
+cargo +1.89.0 test  --locked                                   -> 369 passed, 0 failed
+   (173 + 145 + 7 + 3 + 3 + 5 + 20 + 4 + 6 + 3 + 0)
+cargo +1.89.0 test --locked --features pg_tests --lib   -- --test-threads=1 -> 181 passed, 0 failed
+cargo +1.89.0 test --locked --features pg_tests --bin … -- --test-threads=1 -> 279 passed, 0 failed
+cargo +1.89.0 test --locked --features pg_tests --tests -- --test-threads=1 -> 48 passed, 0 failed
+                                                                pg total    -> 508 passed, 0 failed
+```
+
+Readback database sekali pakai (`swi_test`, dibuat baru, `db migrate` lewat binary produksi):
+
+```
+_migrations                       : 53 | 53 | 53   (count | sha256 | digest_origin='applied')
+workspaces_id_positive_check      : CHECK ((id > 0))
+funding_radar_cases_id_positive_check : CHECK ((id > 0))
+_migrations_digest_origin_check   : CHECK (((digest_origin IS NULL) OR
+                                    (digest_origin = ANY (ARRAY['applied'::text,'baseline'::text]))))
+schema_cutover_events             : positive_id_invariant
+```
+
+Residu setelah lane penuh: `SELECT datname FROM pg_database WHERE datname LIKE 'swi%'` → hanya
+`swi_test`; `%TEMP%\swi*` → 0 entri.
+
+### Yang TIDAK saya kerjakan / batasan
+
+- **Tidak ada self-approval.** Verdict READY FOR REVIEW.
+- Sebelum round ini saya menyapu 203 direktori temp basi milik PROSES LAMA (keluarga
+  `swi_upg_*`, `swi_f0N_*`, `swi_r85_*`, `swi_r87f03_*`, umur sampai 3,4 hari) yang ditinggalkan
+  round-round sebelum guard ada. Lane final dijalankan dari kondisi nol dan tidak meninggalkan
+  apa pun tanpa sapuan manual.
+- Satu direktori temp tertinggal saat sesi ini karena proses test **di-kill paksa** ketika
+  migrator deadlock. `Drop` tidak berjalan pada SIGKILL/abort — batasan yang sama seperti yang
+  dinyatakan REV-096 dan tidak ditutup di sini.
+- Cek kelas residu menyaring nama yang memuat PID proses ini. Proses lain yang berjalan
+  bersamaan tidak diperiksa; test tidak bisa membedakan lane sehat yang sedang jalan dari residu.
+- Advisory lock melindungi migrator terhadap migrator lain. Ia tidak melindungi terhadap DDL
+  manual yang dijalankan operator langsung ke database saat migrasi berlangsung.
+- `cargo +1.89.0 fmt --check` tetap gagal pra-ada (84 dari 103 file `.rs` tracked), sama seperti
+  base. Tidak diminta round ini dan tidak diubah.
+- Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI dan regression cabang
+  penolakan F06-REV-090 sebelum wiring produksi.
 - Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

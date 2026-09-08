@@ -41,12 +41,10 @@ fn tag(prefix: &str) -> String {
 /// insertable. The reduced set is passed explicitly; no env var is mutated.
 async fn scratch_through_1036(_label: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String, std::path::PathBuf) {
         // REV-093-F06: guard-owned; cleans up on unwind too.
-    let scratch_guard = crate::pg_test_support::ScratchDb::create("swi_r87f03").await;
+    let mut scratch_guard = crate::pg_test_support::ScratchDb::create("swi_r87f03").await;
     let scratch = scratch_guard.name().to_string();
 
-    let red_dir = std::env::temp_dir().join(format!("swi_r87f03_mig_{scratch}"));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+    let red_dir = scratch_guard.temp_dir("r87f03");
     for entry in std::fs::read_dir(migrations_dir()).expect("read migrations") {
         let entry = entry.expect("entry");
         let n = entry.file_name().to_string_lossy().to_string();

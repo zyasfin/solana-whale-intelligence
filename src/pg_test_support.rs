@@ -289,3 +289,41 @@ impl Drop for ScratchDb {
         }
     }
 }
+
+/// A temp directory that removes itself on `Drop`, including on unwind.
+///
+/// REV-097-F06: several fixtures build a reduced-migration directory without needing
+/// a scratch database (or before one exists). They used `std::env::temp_dir().join(..)`
+/// and removed it only on the success path, so a failing assertion stranded it. The
+/// same ownership rule as [`ScratchDb`] applies: whoever creates it owns it.
+pub struct ScratchDir {
+    path: std::path::PathBuf,
+}
+
+impl ScratchDir {
+    /// Create a uniquely named temp directory owned by this guard.
+    pub fn create(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "swi_scratchdir_{label}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        Self { path }
+    }
+
+    /// The directory path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // Never panic from Drop.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}

@@ -166,16 +166,14 @@ async fn same_recipient_funding_cases_are_workspace_independent() {
 #[tokio::test]
 async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
     // REV-093-F06: guard-owned teardown, also on unwind.
-    let admin = crate::pg_test_support::ScratchDb::create("f02up").await;
+    let mut admin = crate::pg_test_support::ScratchDb::create("f02up").await;
     let scratch = admin.name().to_string();
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("parent")
         .join("swi-deploy/migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
-    let red_dir = std::env::temp_dir().join(format!("swi_f02_mig_{scratch}"));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+    let red_dir = admin.temp_dir("f02");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("entry");
         let n = entry.file_name().to_string_lossy().to_string();
@@ -263,15 +261,13 @@ async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
 #[tokio::test]
 async fn pre_1033_alerts_table_survives_preflight() {
     // REV-093-F06: guard-owned teardown, also on unwind.
-    let admin = crate::pg_test_support::ScratchDb::create("f03up").await;
+    let mut admin = crate::pg_test_support::ScratchDb::create("f03up").await;
     let scratch = admin.name().to_string();
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("parent")
         .join("swi-deploy/migrations");
-    let red_dir = std::env::temp_dir().join(format!("swi_f03_mig_{scratch}"));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+    let red_dir = admin.temp_dir("f03");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("entry");
         let n = entry.file_name().to_string_lossy().to_string();
