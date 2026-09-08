@@ -101,6 +101,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-087 | 2026-09-07 | independent full review of REV-085 against REV-086 | CHANGES REQUIRED / NOT GO | default Rust PASS; focused PG 7/7; full PG incomplete: 7 recent pipeline failures |
 | REV-088 | 2026-09-08 | implementation of REV-086/REV-087 F01–F06 (migrator digest-drift rejection, transactional range-safe preflight, complete funding-case merge + alert identity reconciliation via preflight, migration 1040 composite alert/case ownership + claim-time validation, evaluator claim release and error accounting, fenced exit writer, explicit migration-dir test lane) | READY FOR REVIEW | 369/369 + 487/487; 4/4 Rust 1.89 gates 0 warning; migration 1040 applied, manifest 52/52, fingerprint 52\|52\|0 on a unique disposable DB asserted present before and after; F01(x3)/F02/F03/F04(x3)/F05/F06 RED→GREEN; also fixed an unreported infinite loop that hung the full pg lane for 80 minutes |
 | REV-089 | 2026-09-08 | independent verification of REV-088 + versioned migration artifact | APPROVED / REV-088 F01â€“F06 ACCEPTED | full PG 487/487; fresh packaged migration 52/52; focused adversarial probes PASS |
+| REV-090 | 2026-09-08 | correction after late independent dissent on REV-089 F01 | CHANGES REQUIRED / PARTIAL | F02â€“F06 accepted; F01 int8/control-flow/provenance gaps open |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14473,3 +14474,60 @@ a_stale_claim_token_cannot_write_an_exit_signal                                P
 - Tidak ada source logic yang diubah oleh independent review. Satu-satunya perubahan sebelum ledger adalah packaging byte-identical migration artifact di commit `a60647d`.
 
 **Final:** REV-088 F01â€“F06 **APPROVED / ACCEPTED**. Next implementation changes require a new REV; do not rewrite REV-088 or REV-089.
+---
+
+## REV-090 â€” Correction after late independent dissent on REV-089
+
+**Tanggal:** 2026-09-08
+**Mode:** append-only correction; read-only source verification + disposable PostgreSQL probe
+**Acuan:** REV-089 approval, late audit result for REV-088 F01
+
+### Verdict
+
+**CHANGES REQUIRED / PARTIAL.** REV-089 approval was appended before the late independent F01 audit completed. F02â€“F06 remain accepted; F01 is reopened. This section corrects the verdict without rewriting REV-088 or REV-089.
+
+### REV-090-F01 â€” OPEN / HIGH â€” int8 validation and preflight control flow are incomplete
+
+**Lokasi:** `src/db.rs:260-267,309-359,382-389`; `migrations/1036_rev080_alert_workspace_subject_cutover.sql:62-66,110-117`; `src/rev087_migration_integrity_pg_tests.rs:37-87,145-210`.
+
+**Masalah:**
+
+1. `SAFE_INT8_SEGMENT = "^[0-9]{1,18}$"` is sufficient but not exact. Valid positive `int8` values from `1000000000000000000` through `9223372036854775807` have 19 digits and are classified unsafe. A valid workspace owner in that range is reassigned to the default workspace, corrupting tenancy.
+2. The preflight returns at `if !needs_repair` before checking the funding subject segment. A row with a valid workspace segment and corrupt/out-of-range subject segment bypasses the named preflight refusal and later reaches 1036's raw `::bigint` cast.
+3. The cutoff fixture copies current migration files. The new packaging commit authenticates the current bundle, but not an actual predecessor artifact; historical-byte provenance remains a proof gap.
+
+**Independent probe on current source:**
+
+```text
+VALID19|f|t
+# current regex rejects 1000000000000000000; PostgreSQL bigint accepts it
+
+CONTROLFLOW|INSERT 0 1;f|t;DELETE 1
+# needs_repair=false while unsafe_subject=true, proving the early-return bypass
+
+CLEANUP_RC|0
+```
+
+**Saran fix:**
+
+- Replace length-only regex with exact positive-int8 validation, e.g. guarded cast using a numeric comparison or a predicate that accepts 1â€“18 digits plus bounded 19-digit values up to `9223372036854775807`.
+- Compute/check unsafe funding subject independently before `if !needs_repair`; fail with the named preflight error before any 1036 DDL.
+- Store a predecessor migration fixture or signed/tagged artifact and replay it explicitly; do not call a copy of current files historical proof.
+
+**Regression wajib:**
+
+1. `signal:1000000000000000000:<subject>:<dest>` preserves that valid workspace owner.
+2. `funding:<valid-ws>:9223372036854775808:<dest>` fails with the named preflight error and leaves schema/data unchanged.
+3. Authenticated predecessor bundle â†’ current migrator â†’ second pass converges with verified provenance.
+
+### Retained acceptance
+
+- F02 completion boolean: ACCEPTED.
+- F03 semantic merge/JSON/alert identity: ACCEPTED.
+- F04 composite ownership: ACCEPTED.
+- F05 worker lifecycle mechanism: ACCEPTED; CLI dual-error regression remains recommended.
+- F06 fenced exit writer: ACCEPTED; rejection-branch regression required before production wiring.
+- Versioned migration artifact: ACCEPTED. One LOW documentation issue remains: resolver comments still describe sibling-only layout and do not match candidate order.
+- Full unique-DB PG gate remains PASS 487/487; green tests did not cover the two F01 counterexamples above.
+
+**Final:** REV-088/REV-089 are **PARTIAL / CHANGES REQUIRED** until REV-090-F01 is fixed and independently re-reviewed.
