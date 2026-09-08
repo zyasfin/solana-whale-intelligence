@@ -106,6 +106,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-092 | 2026-09-08 | corrective for the independent review of REV-091 (leading-zero normalization before length/range so padded ids are judged by value, all-zero rejected as non-positive, strict manifest bijection parser, convergence test on the packaged bundle with ledger/schema/constraint/cutover snapshot around an exact-no-op second pass, stale resolver error text) | READY FOR REVIEW | 369/369 + 494/494 (490 + 4 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, resolver readback `migrations`; 7 focused tests each `running 1 test`; 6 RED→GREEN incl. padded owner preserved and lax parser rejected; `fmt --check` fails PRE-EXISTING (84/84 files unformatted at base, unchanged by this round) |
 | REV-094 | 2026-09-08 | corrective for REV-093-F01 (segment validation delegates to PostgreSQL's own bigint parser via a guarded `pg_input_is_valid` CASE instead of a fourth hand-written regex; `+`-signed and whitespace-padded ids are valid again, `+0`/`-1`/overflow/junk still refused, invalid input proven never to reach the cast) | READY FOR REVIEW | 369/369 + 497/497 (494 + 3 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, FK 1, cleanup verified 0 left; 10 focused tests each `running 1 test`; 4 RED→GREEN at cf58b43 reproducing the reviewer's `left: 1 / right: 1000000000000000000` |
 | REV-093 | 2026-09-08 | independent review of REV-092 — APPENDED LATE, after REV-094 was already committed (`f01975a`), because the handoff carrying it arrived late; recorded out of numeric order rather than rewriting history | CHANGES REQUIRED | F01 bigint lexical domain (closed by REV-094); F02 zero-ID invariant unenforced, F03 constraint OID churn + concurrent DDL race, F04 strict manifest parser test-only, F05 resolver precedence, F06 cleanup/fmt wording — all closed by REV-095 |
+| REV-095 | 2026-09-08 | implementation of REV-093-F02..F06 (forward migration 1041 enforcing id > 0 with fail-closed detection and no silent repair; ledger CHECK made idempotent and concurrency-safe under an ACCESS EXCLUSIVE lock; one strict manifest parser in production shared with the fixture; resolver puts the packaged bundle ahead of the legacy sibling; fmt denominator corrected) | READY FOR REVIEW | 369/369 + 503/503; check gates 0 warning; disposable DB 53\|53\|0, FK 1, 2 validated positive-id CHECKs, cleanup verified 0 left; 10 focused tests each `--exact --list`=1 and `running 1 test`; 6 RED→GREEN; REV-094/F01 left intact and re-verified; F06 cleanup guard reported OPEN |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14993,3 +14994,178 @@ fmt             FAIL pre-existing; 84/103 files on both base and HEAD
 Test hijau tidak membatalkan F01–F05 karena jalur negatifnya absen atau hanya lokal di test.
 
 **Final:** REV-092 **CHANGES REQUIRED**.
+
+
+
+---
+
+## REV-095 — Implementasi REV-093-F02 sampai F06
+
+**Tanggal:** 2026-09-08
+**Mode:** implementation; Rust 1.89.0; PostgreSQL 17.11 (localhost, disposable `swi_r95_full_203500`)
+**Base:** `f01975a` (REV-094), ledger append REV-093 pada `e8ea4c4`
+**Scope:** REV-093-F02, F03, F04, F05, F06. F01 SUDAH ditutup REV-094 dan tidak disentuh — hanya diverifikasi ulang di gate akhir.
+
+### Kenapa REV-095, bukan REV-094 kedua
+
+REV-094 (`f01975a`) sudah ter-push dan hanya menutup F01, karena handoff yang memuat REV-093
+baru ditemukan setelahnya. Pemilik repo memilih mempertahankan sejarah: `f01975a` tidak
+di-reset, di-amend, atau di-force-push, dan tidak ada REV-094 kedua. Sisa temuan ditulis di
+sini sebagai round terpisah.
+
+### Per-finding
+
+#### REV-093-F02 — CLOSED — invariant `id > 0` ditegakkan skema, pelanggaran gagal tertutup
+
+**Root cause:** `safe_int8_predicate` menolak segment non-positif dan preflight memindahkan
+barisnya ke default workspace. Itu benar HANYA jika id non-positif tidak pernah menamai baris
+nyata — dan skema tidak pernah menyatakannya. `workspaces.id` adalah `GENERATED ALWAYS AS
+IDENTITY` (1001:39), `funding_radar_cases.id` adalah `bigserial` (0001:258); `OVERRIDING SYSTEM
+VALUE` bisa menyimpan `0`. Pada database seperti itu, owner yang SAH menurut skema diperlakukan
+tidak aman lalu alert-nya dipindah diam-diam.
+
+**Kebijakan (keputusan pemilik repo, opsi 2):** tegakkan `id > 0` di skema sehingga asumsi
+predikat produksi menjadi fakta.
+
+**Fix:** migration forward `1041_rev093_positive_id_invariant.sql`. Deteksi dijalankan LEBIH
+DULU, sebelum DDL apa pun: bila ada `workspaces.id <= 0` atau `funding_radar_cases.id <= 0`,
+migration ABORT dengan diagnostic bernama yang menyebut tabel dan id (maksimal 20 contoh),
+SQLSTATE `check_violation`. Tidak ada baris yang di-reassign, dihapus, atau dinomori ulang —
+baris itu bisa direferensikan alerts, funding_radar_events, dan dedup key outbox, jadi memilih
+id baru untuk data orang lain bukan keputusan yang boleh diambil migration. Setelah data
+terbukti bersih, dua validated CHECK dipasang persis pada domain ID yang dipakai
+`safe_int8_predicate`, tidak lebih luas.
+
+**Lokasi:** `migrations/1041_rev093_positive_id_invariant.sql`; `MANIFEST.sha256` (+1 entry)
+
+#### REV-093-F03 — CLOSED — ledger CHECK tidak lagi dibuat ulang tiap pass; migrator konkuren aman
+
+**Root cause:** setiap pass menjalankan `DROP CONSTRAINT IF EXISTS` lalu `ADD CONSTRAINT` tanpa
+syarat. OID berubah tiap run, sehingga klaim REV-092 "exact no-op" SALAH — snapshotnya hanya
+membandingkan `(conname, contype)` yang buta terhadap drop-and-recreate. Dua migrator konkuren
+juga bisa saling balap dan yang kalah gagal `duplicate_object`.
+
+**Fix:** keputusan berbasis state di dalam satu transaksi yang memegang `ACCESS EXCLUSIVE` pada
+`public._migrations`. Constraint benar → TANPA DDL. Hilang → tambah sekali. Definisi salah →
+fail closed dengan pesan bernama, karena mengganti diam-diam justru menghapus bukti bahwa
+seseorang mengubahnya. Perbandingan memakai rendering ternormalisasi server
+(`pg_get_expr(conbin, conrelid)`), jadi perbedaan spasi/kutip milik kita tidak pernah terbaca
+sebagai drift. Migrator konkuren menunggu lock lalu mengamati state final.
+
+**Lokasi:** `src/db.rs:843-915`
+
+#### REV-093-F04 — CLOSED — satu parser manifest strict di PRODUKSI
+
+**Root cause:** produksi memakai `let Some(x) = parts.next() else { continue }` dan mengembalikan
+match filename PERTAMA. Baris malformed lenyap, field ketiga diabaikan, digest bukan 64-hex
+diterima apa adanya, dan filename duplikat menang berdasarkan posisi. REV-092 menulis parser
+strict, tetapi HANYA di modul test — jalur runtime tetap permisif, jadi test strict itu tidak
+membuktikan apa pun tentang produksi.
+
+**Fix:** `db::parse_migration_manifest` menjadi satu-satunya implementasi: tepat dua field,
+digest 64 hex, nama `.sql`, filename unik, tiap kelas ditolak dengan pesan spesifik.
+`manifest_digest` produksi memakainya, dan fixture predecessor memanggilnya lewat
+`parse_migration_manifest_for_tests`. Bijeksi terhadap SQL yang ada TIDAK diletakkan di parser,
+karena produksi juga mem-parse reduced lane yang sengaja mengirim subset; pemanggil yang butuh
+bijeksi menegaskannya sendiri.
+
+**Lokasi:** `src/db.rs:1418-1506`; `src/rev087_migration_integrity_pg_tests.rs`
+(`verify_manifest_bijection` kini memanggil parser produksi)
+
+#### REV-093-F05 — CLOSED — packaged bundle mendahului sibling legacy
+
+**Root cause:** urutan kandidat menempatkan `../swi-deploy/migrations` SEBELUM
+`$CARGO_MANIFEST_DIR/migrations`. Run yang cwd-nya tidak punya `./migrations` memilih sibling
+legacy yang tidak diversikan dan bisa drift, mengalahkan bundle packaged yang didokumentasikan
+canonical.
+
+**Fix:** urutan menjadi override → `./migrations` → `$CARGO_MANIFEST_DIR/migrations` → sibling
+legacy (cwd-relative) → sibling legacy (crate-relative). Kedua ejaan packaged kini mendahului
+setiap fallback legacy.
+
+**Lokasi:** `src/db.rs:112-145`
+
+#### REV-093-F06 — PARTIAL — kata-kata formatting dikoreksi; cleanup guard TIDAK dikerjakan
+
+**Formatting, dikoreksi:** angka yang benar adalah **84 dari 103** file `.rs` tracked gagal
+`fmt --check`, bukan "84 dari 84 file sumber" seperti yang saya tulis di REV-092. Diukur ulang
+pada HEAD round ini: `84 of 103 tracked .rs`. Repo belum pernah di-rustfmt; saya tidak
+memformat ulang di dalam corrective ini.
+
+**Cleanup guard, TIDAK dikerjakan — lihat batas klaim.**
+
+### Gates
+
+```text
+Rust                                                            1.89.0
+PostgreSQL                                                      17.11
+cargo +1.89.0 check --locked --all-targets                      PASS (0 warnings)
+cargo +1.89.0 check --locked --features pg_tests --all-targets  PASS (0 warnings)
+cargo +1.89.0 test --locked                                     PASS 369/369
+cargo +1.89.0 test --locked --features pg_tests -- --test-threads=1   PASS 503/503
+disposable DB                                                   swi_r95_full_203500
+db migrate / db status                                          rc 0 / schema current; digest-verified
+ledger fingerprint                                              53|53|0  (sql on disk 53, manifest 53)
+migration 1041 digest_origin                                    applied
+alerts_funding_case_workspace_fk                                1
+validated positive-id CHECKs                                    2
+DB cleanup terverifikasi                                        0 tersisa (`swi%` = none)
+fmt --check                                                     FAIL pre-existing, 84/103 tracked .rs
+```
+
+Focused, tiap test dibuktikan `--exact --list` = 1 lalu `running 1 test`, sepuluh-duanya PASS:
+
+```text
+the_positive_id_invariant_is_enforced_by_the_schema
+a_preexisting_non_positive_id_aborts_with_a_named_diagnostic
+a_second_pass_preserves_the_ledger_constraint_oid
+two_concurrent_migrators_both_succeed
+production_migration_refuses_every_malformed_manifest_class
+the_resolver_prefers_the_packaged_bundle_over_a_legacy_sibling
+padded_and_boundary_int8_segments_are_classified_by_value            (REV-094 F01, verified intact)
+a_plus_signed_workspace_segment_keeps_its_owner                      (REV-094 F01, verified intact)
+a_plus_signed_funding_subject_is_not_refused                         (REV-094 F01, verified intact)
+invalid_segments_never_reach_the_bigint_cast                         (REV-094 F01, verified intact)
+```
+
+### RED→GREEN
+
+Tiap fix dilepas lebih dulu; kegagalan berupa assertion, bukan gagal kompilasi; source dipulihkan.
+
+| Finding | Probe RED | RED | GREEN |
+|---|---|---|---|
+| F02 | migration 1041 + entry manifest-nya dilepas | FAILED 1 (CHECK tidak ada) | PASS 1 |
+| F02 | idem, dengan baris id=0 sudah tertanam | FAILED 1 | PASS 1 |
+| F03 | `DROP`+`ADD` tanpa syarat dikembalikan | FAILED 1 (OID berubah) | PASS 1 |
+| F03 | idem, dua migrator konkuren | FAILED 1 | PASS 1 |
+| F04 | parser permisif `filter_map` dikembalikan | FAILED 1 | PASS 1 |
+| F05 | urutan sibling-sebelum-packaged dikembalikan | FAILED 1 | PASS 1 |
+
+### Yang TIDAK saya klaim
+
+- Tidak ada self-approval: verdict **READY FOR REVIEW**.
+- **REV-093-F06 bagian cleanup guard TIDAK dikerjakan.** Fixture masih memanggil `drop_scratch`
+  hanya di jalur sukses, jadi setiap probe RED meninggalkan scratch DB. Delapan DB bocor dari
+  round ini saya drop manual dan sudah diverifikasi nol tersisa, tetapi mekanismenya belum
+  diperbaiki. Perbaikan yang benar adalah guard RAII yang men-drop pada `Drop`; itu menyentuh
+  setiap fixture pg dan pantas jadi round tersendiri. Saya melaporkannya terbuka, bukan
+  menyebutnya selesai.
+- **Versi PostgreSQL efektif naik ke 16+** karena `pg_input_is_valid` (dibawa REV-094). Tidak
+  berubah di round ini, tetapi tetap berlaku dan `1041` tidak mengubahnya.
+- **Test manifest produksi menempuh jalur backfill**, karena di situlah manifest benar-benar
+  dikonsultasikan. Versi pertama test ini saya tulis salah: ia memanggil `migrate_dir_with` pada
+  database yang sudah termigrasi penuh, yang tidak pernah membaca manifest, sehingga lulus tanpa
+  membuktikan apa pun. Saya menemukannya karena test itu gagal, lalu menulis ulang agar
+  benar-benar melintasi trust boundary — dan memverifikasi ulang bahwa versi barunya tetap MERAH
+  terhadap parser permisif.
+- **F03 fail-closed hanya memeriksa bahwa definisi constraint masih memuat kedua nilai
+  provenance.** Itu menangkap penghapusan/penggantian nilai, bukan setiap kemungkinan penulisan
+  ulang ekspresi yang tetap memuat kedua kata tersebut.
+- `1041` membatasi diri pada dua domain ID yang dipakai `safe_int8_predicate`. Tabel lain dengan
+  `bigserial` tidak dibatasi; memperluas invariant melampaui yang diandalkan predikat adalah
+  scope yang tidak diberikan temuan ini.
+- Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI (F05) dan regression cabang
+  penolakan F06 sebelum wiring produksi.
+- Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

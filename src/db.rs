@@ -112,10 +112,16 @@ pub fn pool_size(scale_workers: usize) -> u32 {
 /// The order below matches the code exactly:
 ///   1. `$SWI_MIGRATIONS_DIR` — explicit operator override (deployment lane).
 ///   2. `./migrations` — cwd-local packaged bundle; CANONICAL for a normal run.
-///   3. `../swi-deploy/migrations` — legacy sibling checkout (cwd-relative).
-///   4. `$CARGO_MANIFEST_DIR/migrations` — packaged bundle, crate-relative
-///      (test/dev, where cwd may differ from the crate root).
+///   3. `$CARGO_MANIFEST_DIR/migrations` — the SAME packaged bundle, crate-relative,
+///      for runs whose cwd is not the crate root (tests, tooling).
+///   4. `../swi-deploy/migrations` — legacy sibling checkout, cwd-relative.
 ///   5. `<crate>/../swi-deploy/migrations` — legacy sibling, crate-relative.
+///
+/// REV-093-F05: candidates 3 and 4 used to be the other way round, so a run whose
+/// cwd lacked `./migrations` picked the LEGACY sibling over the packaged bundle the
+/// documentation calls canonical. The sibling is unversioned and can drift, so that
+/// ordering let a stale copy silently beat the reviewed one. Both packaged spellings
+/// now precede every legacy fallback.
 ///
 /// Resolution is fail-closed: if none exists, `migrate()` reports every path tried
 /// rather than applying zero files (REV-027-F10 / REV-028-F08).
@@ -127,15 +133,23 @@ fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
         }
     }
     candidates.push(std::path::PathBuf::from("migrations"));
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        candidates.push(std::path::Path::new(&manifest_dir).join("migrations"));
+    }
     candidates.push(std::path::PathBuf::from("../swi-deploy/migrations"));
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let manifest = std::path::Path::new(&manifest_dir);
-        candidates.push(manifest.join("migrations"));
-        if let Some(parent) = manifest.parent() {
+        if let Some(parent) = std::path::Path::new(&manifest_dir).parent() {
             candidates.push(parent.join("swi-deploy").join("migrations"));
         }
     }
     candidates
+}
+
+/// Test-only accessor for [`migration_dir_candidates`] (REV-093-F05), so the
+/// precedence regression exercises the production resolver rather than a copy.
+#[cfg(test)]
+pub fn migration_dir_candidates_for_tests() -> Vec<std::path::PathBuf> {
+    migration_dir_candidates()
 }
 
 /// Resolve the first candidate directory that exists, or report every path tried
@@ -840,19 +854,72 @@ pub async fn migrate_dir_with(
     sqlx::query("ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS digest_origin text")
         .execute(pool)
         .await?;
-    sqlx::query(
-        "ALTER TABLE public._migrations \
-           DROP CONSTRAINT IF EXISTS _migrations_digest_origin_check",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE public._migrations \
-           ADD CONSTRAINT _migrations_digest_origin_check \
-           CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline'))",
-    )
-    .execute(pool)
-    .await?;
+    // REV-093-F03: this used to be an unconditional
+    // `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` on EVERY migrate pass. Two
+    // consequences, both real:
+    //
+    //   * the constraint's OID changed on every run, so "a second pass is an exact
+    //     no-op" was false. REV-092's convergence snapshot compared only
+    //     `(conname, contype)`, which is blind to a drop-and-recreate — the test
+    //     agreed with a claim the code did not honour;
+    //   * two migrators racing here interleave as DROP/DROP/ADD/ADD and the loser
+    //     fails with `duplicate_object`.
+    //
+    // Correct constraint -> no DDL at all. Missing -> add it once. Present but
+    // WRONG -> fail closed: silently replacing a ledger CHECK that someone
+    // deliberately altered would destroy the evidence of that alteration.
+    //
+    // The whole decision runs inside one transaction holding an ACCESS EXCLUSIVE
+    // lock on the ledger, so a concurrent migrator waits and then observes the
+    // finished state instead of racing it.
+    const DIGEST_ORIGIN_CHECK: &str = "_migrations_digest_origin_check";
+    const DIGEST_ORIGIN_EXPR: &str =
+        "CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline'))";
+    {
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql("LOCK TABLE public._migrations IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = $1 \
+               AND conrelid = 'public._migrations'::regclass",
+        )
+        .bind(DIGEST_ORIGIN_CHECK)
+        .fetch_optional(&mut *tx)
+        .await?;
+        match existing {
+            None => {
+                sqlx::raw_sql(&format!(
+                    "ALTER TABLE public._migrations \
+                       ADD CONSTRAINT {DIGEST_ORIGIN_CHECK} {DIGEST_ORIGIN_EXPR}"
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+            Some(def) => {
+                // Verify against the SERVER's normalized rendering, so a difference
+                // in our own spacing or quoting never reads as drift. The check is
+                // semantic: the constraint must admit exactly the two provenance
+                // values the ledger defines, and nothing else may have been bolted on.
+                let normalized: String = sqlx::query_scalar(
+                    "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint \
+                      WHERE conname = $1 AND conrelid = 'public._migrations'::regclass",
+                )
+                .bind(DIGEST_ORIGIN_CHECK)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !normalized.contains("applied") || !normalized.contains("baseline") {
+                    anyhow::bail!(
+                        "the migration ledger's `{DIGEST_ORIGIN_CHECK}` constraint is not the \
+                         expected definition (found `{def}`). It guards which digest \
+                         provenances are representable, so replacing it silently would erase \
+                         the evidence that someone changed it; reconcile deliberately"
+                    );
+                }
+            }
+        }
+        tx.commit().await?;
+    }
     // The ledger is authority about schema state: no runtime role may write it.
     //
     // REV-039-F05: this used to revoke only PUBLIC and to ignore the result with
@@ -1362,6 +1429,73 @@ pub async fn baseline_migrations(pool: &PgPool) -> Result<Vec<String>> {
 /// Reviewed digest manifest, shipped beside the SQL (REV-039-F01).
 pub const MIGRATION_MANIFEST: &str = "MANIFEST.sha256";
 
+/// Parse `MANIFEST.sha256` STRICTLY into `filename -> digest`.
+///
+/// REV-093-F04: production used to scan the manifest line by line with
+/// `let Some(x) = parts.next() else { continue }` and return the FIRST filename
+/// match. That tolerated exactly the things a trust boundary must refuse:
+/// malformed lines vanished instead of failing, a third field was ignored, a digest
+/// that was not 64 hex characters was accepted verbatim, and a duplicate filename
+/// silently won by position — so two disagreeing digests for one file passed
+/// whenever the first one happened to match.
+///
+/// REV-092 wrote a strict parser, but only inside the test module, so the runtime
+/// path kept the permissive one and the strict tests proved nothing about
+/// production. This is now the single implementation; the predecessor fixture calls
+/// it through [`parse_migration_manifest_for_tests`].
+///
+/// Bijection against the SQL actually present is NOT checked here: this function is
+/// also used on reduced lanes that deliberately ship a subset. Callers that require
+/// a bijection assert it themselves.
+pub(crate) fn parse_migration_manifest(
+    body: &str,
+    source: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut recorded: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (idx, raw) in body.lines().enumerate() {
+        let line = raw.trim_end_matches('\r').trim();
+        let lineno = idx + 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 2 {
+            anyhow::bail!(
+                "{source} line {lineno} is malformed: expected `<sha256>  <filename>`, \
+                 found {} field(s) in {line:?}",
+                fields.len()
+            );
+        }
+        let (digest, name) = (fields[0], fields[1]);
+        if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "{source} line {lineno} does not carry a 64-character hex sha256: {digest:?}"
+            );
+        }
+        if !name.ends_with(".sql") {
+            anyhow::bail!("{source} line {lineno} names a non-SQL file: {name:?}");
+        }
+        if let Some(previous) = recorded.insert(name.to_string(), digest.to_ascii_lowercase()) {
+            anyhow::bail!(
+                "{source} lists `{name}` more than once (first {previous}, again at line \
+                 {lineno}); a duplicate entry means two digests claim the same file and the \
+                 manifest cannot say which was reviewed"
+            );
+        }
+    }
+    Ok(recorded)
+}
+
+/// Test-only accessor for [`parse_migration_manifest`], so the predecessor fixture
+/// authenticates blobs with the SAME parser production trusts (REV-093-F04).
+#[cfg(test)]
+pub fn parse_migration_manifest_for_tests(
+    body: &str,
+    source: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    parse_migration_manifest(body, source)
+}
+
 /// The digest the reviewed manifest records for `name`, or `None` when the
 /// manifest has no entry for it.
 ///
@@ -1381,19 +1515,8 @@ fn manifest_digest(dir: &std::path::Path, name: &str) -> Result<Option<String>> 
     }
     let body = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(digest) = parts.next() else { continue };
-        let Some(file) = parts.next() else { continue };
-        if file == name {
-            return Ok(Some(digest.to_ascii_lowercase()));
-        }
-    }
-    Ok(None)
+    let recorded = parse_migration_manifest(&body, &path.display().to_string())?;
+    Ok(recorded.get(name).cloned())
 }
 
 /// SHA-256 of a migration file body, hex-encoded.

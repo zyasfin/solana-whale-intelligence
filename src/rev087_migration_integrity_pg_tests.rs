@@ -168,56 +168,29 @@ fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
 /// Panics with a specific message per failure class, so a broken fixture says which
 /// invariant broke instead of just "mismatch".
 fn verify_manifest_bijection(manifest: &str, sql_names: &[String], dir: &std::path::Path) {
-    use std::collections::BTreeMap;
+    // REV-093-F04: parsing is the PRODUCTION parser. This used to be a second,
+    // stricter implementation living only in the test module, so the strict rules
+    // were never applied at the runtime trust boundary and these assertions proved
+    // nothing about `db migrate`. One parser, one policy.
+    let recorded = crate::db::parse_migration_manifest_for_tests(manifest, "manifest")
+        .unwrap_or_else(|e| panic!("{e:#}"));
 
-    let mut recorded: BTreeMap<String, String> = BTreeMap::new();
-    for (idx, raw) in manifest.lines().enumerate() {
-        let line = raw.trim_end_matches('\r');
-        let lineno = idx + 1;
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        // Exactly two whitespace-separated fields: <64 hex digits> <filename>.
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(
-            fields.len(),
-            2,
-            "manifest line {lineno} is malformed (expected `<sha256>  <filename>`, \
-             got {} field(s)): {line:?}",
-            fields.len()
-        );
-        let (digest, name) = (fields[0], fields[1]);
-        assert!(
-            digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
-            "manifest line {lineno} does not carry a 64-hex sha256: {digest:?}"
-        );
-        assert!(
-            name.ends_with(".sql"),
-            "manifest line {lineno} names a non-SQL file: {name:?}"
-        );
-        if let Some(previous) = recorded.insert(name.to_string(), digest.to_ascii_lowercase()) {
-            panic!(
-                "manifest lists `{name}` more than once (first {previous}, again at \
-                 line {lineno}); a duplicate entry means two digests claim the same file"
-            );
-        }
-    }
-
-    // Exact bijection, reported in both directions so the failure names itself.
-    let present: std::collections::BTreeSet<&str> =
-        sql_names.iter().map(|s| s.as_str()).collect();
-    let listed: std::collections::BTreeSet<&str> =
-        recorded.keys().map(|s| s.as_str()).collect();
+    // Bijection is asserted HERE rather than in the parser, because production also
+    // parses reduced lanes that deliberately ship a subset.
+    let present: std::collections::BTreeSet<&str> = sql_names.iter().map(|s| s.as_str()).collect();
+    let listed: std::collections::BTreeSet<&str> = recorded.keys().map(|s| s.as_str()).collect();
     let missing: Vec<&&str> = present.difference(&listed).collect();
     let extra: Vec<&&str> = listed.difference(&present).collect();
     assert!(
         missing.is_empty(),
-        "manifest has no entry for {} SQL file(s): {missing:?}"
-    , missing.len());
+        "manifest has no entry for {} SQL file(s): {missing:?}",
+        missing.len()
+    );
     assert!(
         extra.is_empty(),
-        "manifest lists {} entr(y/ies) with no SQL file present: {extra:?}"
-    , extra.len());
+        "manifest lists {} entr(y/ies) with no SQL file present: {extra:?}",
+        extra.len()
+    );
     assert_eq!(
         recorded.len(),
         sql_names.len(),
@@ -1116,7 +1089,7 @@ fn the_manifest_parser_rejects_every_malformed_shape() {
         (
             "malformed line",
             format!("{digest}  0001_a.sql\nnot-a-manifest-line\n{digest}  0002_b.sql\n"),
-            "malformed",
+            "is malformed",
         ),
         (
             "duplicate filename",
@@ -1136,12 +1109,12 @@ fn the_manifest_parser_rejects_every_malformed_shape() {
         (
             "short digest",
             format!("abc123  0001_a.sql\n{digest}  0002_b.sql\n"),
-            "64-hex",
+            "64-character hex",
         ),
         (
             "three fields",
             format!("{digest}  0001_a.sql extra\n{digest}  0002_b.sql\n"),
-            "malformed",
+            "is malformed",
         ),
         (
             "wrong digest",
@@ -1379,4 +1352,313 @@ async fn invalid_segments_never_reach_the_bigint_cast() {
     assert_eq!(unsafe_count, 5, "the other five segments are refused, not cast");
 
     drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F02 — the positive-ID invariant is enforced by the schema, and a
+// pre-existing violation aborts instead of being silently reassigned
+// ---------------------------------------------------------------------------
+
+/// Migration 1041 installs validated CHECKs on exactly the ID domains
+/// `safe_int8_predicate` relies on, so the predicate's positivity assumption is a
+/// schema fact rather than a hope.
+#[tokio::test]
+async fn the_positive_id_invariant_is_enforced_by_the_schema() {
+    let (pool, admin, scratch, dir) = scratch_before("posid", "9999_").await;
+
+    for (table, constraint) in [
+        ("workspaces", "workspaces_id_positive_check"),
+        ("funding_radar_cases", "funding_radar_cases_id_positive_check"),
+    ] {
+        let present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1 \
+               AND conrelid = ($2::text)::regclass AND contype = 'c' AND convalidated)",
+        )
+        .bind(constraint)
+        .bind(format!("public.{table}"))
+        .fetch_one(&pool)
+        .await
+        .expect("constraint probe");
+        assert!(present, "{table} must carry a VALIDATED {constraint} (REV-093-F02)");
+    }
+
+    // The invariant must actually bite: an explicit zero id is refused by the
+    // database, so no schema-legal-but-non-positive owner can exist for the guard
+    // to disagree with.
+    let err = sqlx::query(
+        "INSERT INTO workspaces (id, name, slug) OVERRIDING SYSTEM VALUE VALUES (0, 'w', $1)",
+    )
+    .bind(tag("r95zero"))
+    .execute(&pool)
+    .await
+    .expect_err("id 0 must be refused by the schema");
+    let db_err = err.as_database_error().expect("a database error");
+    assert_eq!(
+        db_err.code().as_deref(),
+        Some("23514"),
+        "expected check_violation, got {db_err:?}"
+    );
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// A database that ALREADY holds a non-positive id must abort with the named
+/// diagnostic, and must not be repaired behind the operator's back.
+#[tokio::test]
+async fn a_preexisting_non_positive_id_aborts_with_a_named_diagnostic() {
+    // Stop before 1041 so the offending row can be planted first.
+    let (pool, admin, scratch, dir) = scratch_before("posidbad", "1041_").await;
+
+    sqlx::query("INSERT INTO workspaces (id, name, slug) OVERRIDING SYSTEM VALUE VALUES (0, 'w', $1)")
+        .bind(tag("r95bad"))
+        .execute(&pool)
+        .await
+        .expect("a pre-1041 lane must still accept id 0 — that is the whole problem");
+
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM workspaces WHERE id <= 0")
+        .fetch_one(&pool)
+        .await
+        .expect("count before");
+    assert_eq!(before, 1, "the offending row must exist before the upgrade");
+
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("1041 must refuse to install the invariant over violating data");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("positive-ID invariant violated"),
+        "expected the named diagnostic, got: {msg}"
+    );
+    assert!(
+        msg.contains("workspaces.id: 0"),
+        "the diagnostic must name the offending table and id, got: {msg}"
+    );
+
+    // Fail CLOSED: the row is untouched, not reassigned/deleted/renumbered, and the
+    // constraint was not installed over bad data.
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM workspaces WHERE id <= 0")
+        .fetch_one(&pool)
+        .await
+        .expect("count after");
+    assert_eq!(after, 1, "the offending row must be left exactly as it was");
+    let installed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'workspaces_id_positive_check')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint probe");
+    assert!(!installed, "no constraint may be installed while data violates it");
+
+    // Operator reconciles; the lane then completes.
+    sqlx::query("DELETE FROM workspaces WHERE id <= 0")
+        .execute(&pool)
+        .await
+        .expect("operator reconciliation");
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("after reconciliation the invariant installs cleanly");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F03 — the ledger CHECK is not recreated every pass, and two migrators
+// may run concurrently
+// ---------------------------------------------------------------------------
+
+/// A second pass must leave the constraint's OID untouched.
+///
+/// REV-092 claimed an "exact no-op" while the migrator unconditionally dropped and
+/// re-added this CHECK on every run. The old snapshot compared `(conname, contype)`,
+/// which cannot see a drop-and-recreate; the OID can.
+#[tokio::test]
+async fn a_second_pass_preserves_the_ledger_constraint_oid() {
+    let (pool, admin, scratch, dir) = scratch_before("oid", "9999_").await;
+
+    let (oid_before, def_before): (i64, String) = sqlx::query_as(
+        "SELECT oid::bigint, pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = '_migrations_digest_origin_check' \
+            AND conrelid = 'public._migrations'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint must exist after the first pass");
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("second pass");
+
+    let (oid_after, def_after): (i64, String) = sqlx::query_as(
+        "SELECT oid::bigint, pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conname = '_migrations_digest_origin_check' \
+            AND conrelid = 'public._migrations'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint after");
+
+    assert_eq!(
+        oid_before, oid_after,
+        "the ledger CHECK was dropped and recreated: the OID changed, so the second \
+         pass is not the no-op it claims to be (REV-093-F03)"
+    );
+    assert_eq!(def_before, def_after, "and its definition must be unchanged");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// Two migrators against one database must both succeed, leaving exactly one
+/// correct constraint — no `duplicate_object` race at ADD CONSTRAINT.
+#[tokio::test]
+async fn two_concurrent_migrators_both_succeed() {
+    let (pool, admin, scratch, dir) = scratch_before("race", "9999_").await;
+
+    let url = format!(
+        "{}/{}",
+        crate::pg_test_support::require_live_url()
+            .rsplitn(2, '/')
+            .nth(1)
+            .expect("db url base"),
+        scratch
+    );
+    let a = crate::db::connect(&url, 2).await.expect("pool a");
+    let b = crate::db::connect(&url, 2).await.expect("pool b");
+    let dir_a = migrations_dir();
+    let dir_b = migrations_dir();
+
+    let (ra, rb) = tokio::join!(
+        crate::db::migrate_dir_with(&a, &dir_a, true),
+        crate::db::migrate_dir_with(&b, &dir_b, true),
+    );
+    ra.expect("first concurrent migrator must succeed");
+    rb.expect("second concurrent migrator must succeed (REV-093-F03)");
+
+    let constraints: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname = '_migrations_digest_origin_check' \
+           AND conrelid = 'public._migrations'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("constraint count");
+    assert_eq!(constraints, 1, "exactly one ledger CHECK must remain");
+
+    a.close().await;
+    b.close().await;
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F04 — every malformed manifest class fails through PRODUCTION
+// ---------------------------------------------------------------------------
+
+/// Drive the production migrator, not a test helper, against each malformed
+/// manifest shape. The strict rules must live at the runtime trust boundary.
+#[tokio::test]
+async fn production_migration_refuses_every_malformed_manifest_class() {
+    // The manifest is production's authority for BACKFILLING a pre-checksum ledger
+    // row, so it is consulted only when a migration is recorded as applied with no
+    // digest. That is the trust boundary; the test has to actually stand on it.
+    // (A fully-migrated database never reads the manifest at all, so asserting
+    // against a plain second pass would assert nothing.)
+    let (pool, admin, scratch, dir) = scratch_before("prodman", "1036_").await;
+
+    let good = std::fs::read_to_string(dir.join("MANIFEST.sha256")).expect("manifest");
+    let victim = "1035_rev078_outbox_grants_subjects_sweep.sql";
+    let sample = good
+        .lines()
+        .find(|l| l.contains(victim))
+        .unwrap_or_else(|| panic!("manifest must record {victim}"))
+        .to_string();
+    let digest = sample.split_whitespace().next().expect("digest").to_string();
+
+    // Force the backfill path: strip the digest from an applied row so the next
+    // pass must consult the manifest to re-establish provenance.
+    async fn strip(p: &sqlx::PgPool, victim: &str) {
+        sqlx::query(
+            "UPDATE public._migrations SET sha256 = NULL, digest_origin = NULL WHERE name = $1",
+        )
+        .bind(victim)
+        .execute(p)
+        .await
+        .expect("strip digest");
+    }
+
+    // Sanity: with a WELL-FORMED manifest the backfill path succeeds. Without this
+    // the refusals below could pass for the wrong reason.
+    strip(&pool, victim).await;
+    crate::db::migrate_dir_with(&pool, &dir, true)
+        .await
+        .expect("a well-formed manifest must let the backfill path succeed");
+
+    let cases: &[(&str, String, &str)] = &[
+        ("malformed line", format!("{good}\nthis-is-not-a-manifest-line\n"), "is malformed"),
+        ("extra field", format!("{good}\n{digest}  9999_ghost.sql extra\n"), "is malformed"),
+        ("short digest", format!("{good}\nabc123  9999_ghost.sql\n"), "64-character hex"),
+        (
+            "non-hex digest",
+            format!("{good}\n{}  9999_ghost.sql\n", "z".repeat(64)),
+            "64-character hex",
+        ),
+        ("duplicate filename", format!("{good}\n{digest}  {victim}\n"), "more than once"),
+    ];
+
+    for (label, body, expect) in cases {
+        std::fs::write(dir.join("MANIFEST.sha256"), body).expect("write manifest");
+        strip(&pool, victim).await;
+        let err = crate::db::migrate_dir_with(&pool, &dir, true)
+            .await
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(
+            err.contains(expect),
+            "{label}: production must refuse with a message naming {expect:?}, got {err:?}"
+        );
+    }
+
+    // Restored manifest: the lane recovers, proving the refusals were about the
+    // manifest and not about the database being wedged.
+    std::fs::write(dir.join("MANIFEST.sha256"), &good).expect("restore manifest");
+    strip(&pool, victim).await;
+    crate::db::migrate_dir_with(&pool, &dir, true)
+        .await
+        .expect("the restored manifest verifies again");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F05 — the packaged bundle beats a divergent legacy sibling
+// ---------------------------------------------------------------------------
+
+/// Exercise the RESOLVER, with the override unset, from a cwd that has no
+/// `./migrations` and a deliberately divergent legacy sibling in place.
+#[test]
+fn the_resolver_prefers_the_packaged_bundle_over_a_legacy_sibling() {
+    // The candidate list is what the resolver walks; assert the ORDER, since the
+    // defect was purely one of precedence.
+    let order = crate::db::migration_dir_candidates_for_tests();
+    let packaged = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let legacy_cwd = std::path::PathBuf::from("../swi-deploy/migrations");
+
+    let idx_packaged = order
+        .iter()
+        .position(|p| p == &packaged)
+        .expect("the crate-relative packaged bundle must be a candidate");
+    let idx_legacy = order
+        .iter()
+        .position(|p| p == &legacy_cwd)
+        .expect("the legacy sibling must remain a fallback");
+    assert!(
+        idx_packaged < idx_legacy,
+        "the packaged bundle must be tried BEFORE the legacy sibling (REV-093-F05); \
+         order was {order:?}"
+    );
+
+    // And the cwd-local packaged spelling must precede both.
+    let idx_cwd = order
+        .iter()
+        .position(|p| p == &std::path::PathBuf::from("migrations"))
+        .expect("cwd-local packaged bundle must be a candidate");
+    assert!(idx_cwd < idx_packaged, "./migrations comes first");
 }
