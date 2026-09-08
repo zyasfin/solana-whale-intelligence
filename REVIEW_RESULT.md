@@ -105,6 +105,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-091 | 2026-09-08 | implementation of REV-090-F01 only (exact positive-int8 segment validation, independent funding-subject check before the repair decision, authenticated content-addressed predecessor replay, resolver comment corrected to packaged-canonical order) | READY FOR REVIEW | 369/369 + 490/490 (487 + 3 new); 4/4 Rust 1.89 gates 0 warning; unique serial disposable DB, 52\|52\|0, baseline 0; all three sub-issues RED→GREEN incl. valid 19-digit owner preserved and named refusal before any DDL |
 | REV-092 | 2026-09-08 | corrective for the independent review of REV-091 (leading-zero normalization before length/range so padded ids are judged by value, all-zero rejected as non-positive, strict manifest bijection parser, convergence test on the packaged bundle with ledger/schema/constraint/cutover snapshot around an exact-no-op second pass, stale resolver error text) | READY FOR REVIEW | 369/369 + 494/494 (490 + 4 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, resolver readback `migrations`; 7 focused tests each `running 1 test`; 6 RED→GREEN incl. padded owner preserved and lax parser rejected; `fmt --check` fails PRE-EXISTING (84/84 files unformatted at base, unchanged by this round) |
 | REV-094 | 2026-09-08 | corrective for REV-093-F01 (segment validation delegates to PostgreSQL's own bigint parser via a guarded `pg_input_is_valid` CASE instead of a fourth hand-written regex; `+`-signed and whitespace-padded ids are valid again, `+0`/`-1`/overflow/junk still refused, invalid input proven never to reach the cast) | READY FOR REVIEW | 369/369 + 497/497 (494 + 3 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, FK 1, cleanup verified 0 left; 10 focused tests each `running 1 test`; 4 RED→GREEN at cf58b43 reproducing the reviewer's `left: 1 / right: 1000000000000000000` |
+| REV-093 | 2026-09-08 | independent review of REV-092 — APPENDED LATE, after REV-094 was already committed (`f01975a`), because the handoff carrying it arrived late; recorded out of numeric order rather than rewriting history | CHANGES REQUIRED | F01 bigint lexical domain (closed by REV-094); F02 zero-ID invariant unenforced, F03 constraint OID churn + concurrent DDL race, F04 strict manifest parser test-only, F05 resolver precedence, F06 cleanup/fmt wording — all closed by REV-095 |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14851,3 +14852,144 @@ Helper `cf58b43` dipulihkan verbatim, keempat test dijalankan, lalu source dikem
 - Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+
+---
+
+## REV-093 — Independent review of REV-092 (APPENDED LATE, OUT OF NUMERIC ORDER)
+
+**Tanggal review:** 2026-09-08
+**Tanggal pencatatan:** 2026-09-08, SETELAH REV-094 sudah ditulis dan di-commit (`f01975a`)
+**Mode:** independent correctness review; read-only source audit + real Rust 1.89.0 / PostgreSQL 17.11 execution
+**Target:** REV-092 pada commit `cf58b43`
+
+### Catatan urutan — baca ini dulu
+
+Bagian ini sengaja muncul SETELAH REV-094 di dalam file. Handoff yang memuat REV-093
+(`WORKER_COMMAND_REV094.md`) baru ditemukan setelah REV-094 selesai dan ter-push, sehingga
+worker saat itu hanya menerima kutipan REV-093-F01 saja dan mengerjakan F01 saja.
+
+Yang TIDAK dilakukan, dan alasannya:
+
+- REV-094 tidak ditulis ulang atau dinomori ulang — ledger ini append-only, dan `f01975a`
+  sudah ter-push;
+- tidak ada REV-094 kedua yang dibuat;
+- riwayat git tidak di-reset, di-amend, atau di-force-push.
+
+Jadi urutan numerik di file ini tidak sama dengan urutan waktu. Urutan sebenarnya:
+REV-092 (`cf58b43`) → REV-093 (review ini) → REV-094 (`f01975a`, hanya F01) → REV-095
+(implementasi F02–F06). Bagian ini adalah rekaman resmi temuan REV-093; status penutupan
+tiap temuan dicatat di REV-095, bukan di sini.
+
+### Verdict
+
+**CHANGES REQUIRED.**
+
+### REV-093-F01 — HIGH — PostgreSQL bigint lexical domain mismatch
+
+**Lokasi:** `src/db.rs`, `safe_int8_predicate` dan ketiga production caller.
+
+Predikat digit-only menolak ejaan positive bigint yang SAH menurut PostgreSQL, termasuk
+tanda `+` di depan dan whitespace di sekeliling. Oracle PostgreSQL 17.11 sungguhan:
+
+```text
+'+1'|cast_valid=t|positive=true|rev092_safe=f
+' +1'|cast_valid=t|positive=true|rev092_safe=f
+'+1 '|cast_valid=t|positive=true|rev092_safe=f
+'  +00000000000000000001  '|cast_valid=t|positive=true|rev092_safe=f
+```
+
+Reproduksi kepemilikan pada reduced lane REV-092:
+
+```text
++1000000000000000000|1000000000000000000|false
+preflight repair complete rows=1
+1|default|expected=1000000000000000000
+```
+
+Dampak: workspace owner diam-diam dipindah ke default; funding subject yang sah bisa
+ditolak; rekey identitas funding yang sah bisa dilewati.
+
+**Minimum fix:** predikat sentral wajib memakai PostgreSQL sebagai oracle. Prefer `CASE`
+di sekeliling `pg_input_is_valid(expr, 'bigint')`; jangan pernah bergantung pada urutan
+evaluasi `AND` SQL untuk melindungi sebuah cast.
+
+### REV-093-F02 — HIGH — invariant positive-ID tidak ditegakkan skema
+
+**Lokasi:** guard positive-only di `src/db.rs`; definisi PK workspace/funding-case.
+
+REV-092 menolak `0`, tetapi skema tidak punya `CHECK (id > 0)`. `OVERRIDING SYSTEM VALUE`
+dapat menyimpan ID `0`; preflight kemudian memperlakukan owner yang SAH menurut skema
+sebagai tidak aman dan memindahkannya ke default. Funding subject `0` juga diklasifikasikan
+"bukan 64-bit integer" padahal cast-nya valid.
+
+**Minimum fix:** pilih SATU invariant dan tegakkan ujung ke ujung: (1) terima setiap ID
+bigint yang sah menurut skema termasuk nol; atau (2) tambahkan forward migration/rekonsiliasi
+yang membuktikan dan menegakkan `id > 0` sebelum kode produksi bergantung pada positivity.
+Jangan pernah diam-diam memindahkan owner yang sah menurut skema.
+
+### REV-093-F03 — HIGH — klaim exact second-pass no-op itu salah; race DDL konkuren masih ada
+
+**Lokasi:** setup `_migrations_digest_origin_check` di `src/db.rs`; snapshot convergence di
+`src/rev087_migration_integrity_pg_tests.rs`.
+
+Setiap migration pass menjalankan `DROP CONSTRAINT IF EXISTS` lalu `ADD CONSTRAINT`. OID
+constraint berubah. Test yang ada hanya men-snapshot `(conname, contype)`, sehingga DDL nyata
+ini tidak terlihat. Migrator konkuren dapat berlomba di `ADD CONSTRAINT` dan menghasilkan
+`duplicate_object`.
+
+**Minimum fix:** constraint benar → tanpa DDL; constraint hilang → tambahkan sekali; definisi
+salah → fail closed atau ganti di bawah serialisasi DB. Serialisasi eksekusi migration
+konkuren pada batas otoritatif database.
+
+### REV-093-F04 — MEDIUM — parser manifest strict hanya ada di test
+
+**Lokasi:** `verify_manifest_bijection` strict di `src/rev087_migration_integrity_pg_tests.rs`;
+`manifest_digest` permisif di produksi `src/db.rs`.
+
+Produksi masih menerima field berlebih, digest malformed/bukan 64-hex, filename duplikat, dan
+ambiguitas first-match. Test strict yang baru hanya menguji helper test duplikat, bukan trust
+boundary runtime.
+
+**Minimum fix:** satu parser strict produksi yang dipakai bersama oleh migrator produksi dan
+fixture predecessor.
+
+### REV-093-F05 — MEDIUM — presedensi resolver packaged canonical tidak konsisten
+
+**Lokasi:** `src/db.rs`, `migration_dir_candidates`.
+
+Saat CWD tidak punya `./migrations`, legacy `../swi-deploy/migrations` dipilih SEBELUM
+`$CARGO_MANIFEST_DIR/migrations`. Bundle packaged yang didokumentasikan sebagai canonical bisa
+kalah oleh sibling legacy yang sudah drift.
+
+**Minimum fix, urutan:** (1) `SWI_MIGRATIONS_DIR`; (2) `./migrations`;
+(3) `$CARGO_MANIFEST_DIR/migrations`; (4) fallback sibling legacy.
+
+### REV-093-F06 — LOW — kata-kata bukti cleanup dan formatting
+
+- Pastikan cleanup DB/temp juga terjadi pada panic/error lewat semantik guard/finally.
+- Koreksi pernyataan formatting: **84 dari 103** file `.rs` tracked gagal `fmt --check` pada
+  base dan HEAD; tidak ada filename yang baru gagal, tetapi REV-092 menambah hunk rustfmt di
+  file test yang memang sudah gagal. Jangan mengklaim output identik atau "84 dari 84 file".
+
+### Gates terverifikasi independen (REV-093)
+
+```text
+HEAD/base       cf58b437... / 7c2e41f...
+Diff scope      3 files, +648/-40, diff-check PASS
+check default   PASS, zero warnings
+check pg        PASS, zero warnings
+default tests   369/369 PASS
+pg tests        494/494 PASS
+focused tests   7 tests; each running 1 test; PASS
+PostgreSQL      17.11
+ledger          52|52|0
+FK count        1
+DB cleanup      zero rev093_* residue
+fmt             FAIL pre-existing; 84/103 files on both base and HEAD
+```
+
+Test hijau tidak membatalkan F01–F05 karena jalur negatifnya absen atau hanya lokal di test.
+
+**Final:** REV-092 **CHANGES REQUIRED**.
