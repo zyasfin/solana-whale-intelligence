@@ -34,31 +34,14 @@ fn tag(prefix: &str) -> String {
 /// A scratch database migrated through 1036 ONLY: `funding_radar_cases.workspace_id`
 /// exists and is NOT NULL, but `funding_radar_cases_tenant_uidx` (created by 1037)
 /// does not, so the duplicate pair below is insertable.
-async fn scratch_through_1036(name: &str) -> (PgPool, PgPool, String) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_f03merge_{name}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create");
-
-    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations");
-    // REV-087 item 7: the temp dir carries the fixture NAME as well as the pid, or
-    // two concurrent calls remove_dir_all each other's directory mid-read.
-    let red_dir = std::env::temp_dir().join(format!("swi_rev085_mig_{name}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir");
+async fn scratch_through_1036(
+    name: &str,
+) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
+    // REV-093-F06: the scratch database and its reduced-migration temp dir are owned
+    // by a guard that also cleans up when a test unwinds.
+    let mut scratch = crate::pg_test_support::ScratchDb::create(name).await;
+    let red_dir = scratch.temp_dir("mig");
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
         let entry = entry.expect("entry");
         let n = entry.file_name().to_string_lossy().to_string();
@@ -70,16 +53,7 @@ async fn scratch_through_1036(name: &str) -> (PgPool, PgPool, String) {
         }
         std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
     }
-
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url()
-            .rsplitn(2, '/')
-            .nth(1)
-            .expect("db url"),
-        scratch
-    );
-    let pool = crate::db::connect(&url, 2).await.expect("scratch pool");
+    let pool = scratch.pool().await;
     crate::db::migrate_dir_with(&pool, &red_dir, true)
         .await
         .expect("migrate through 1036");
@@ -93,7 +67,8 @@ async fn scratch_through_1036(name: &str) -> (PgPool, PgPool, String) {
     .expect("uidx probe");
     assert!(!uidx, "the reduced set must stop BEFORE 1037 creates the identity index");
 
-    (pool, admin, scratch)
+    let nm = scratch.name().to_string();
+    (pool, scratch, nm)
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +77,7 @@ async fn scratch_through_1036(name: &str) -> (PgPool, PgPool, String) {
 
 #[tokio::test]
 async fn duplicate_funding_cases_merge_instead_of_losing_newer_state() {
-    let (pool, admin, scratch) = scratch_through_1036("a").await;
+    let (pool, admin, _scratch) = scratch_through_1036("a").await;
 
     let slug = tag("rev085ws");
     let ws: i64 = sqlx::query_scalar("INSERT INTO workspaces (name, slug) VALUES ($1, $2) RETURNING id")
@@ -275,8 +250,7 @@ async fn duplicate_funding_cases_merge_instead_of_losing_newer_state() {
         "the dead case id must not survive inside an alert identity (REV-086-F03)"
     );
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    // REV-093-F06: teardown is the guard's, and it also runs on unwind.
+    pool.close().await;
+    drop(admin);
 }

@@ -48,25 +48,11 @@ fn tag(prefix: &str) -> String {
 async fn scratch_before(
     label: &str,
     cutoff: &str,
-) -> (PgPool, PgPool, String, std::path::PathBuf) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_r87_{label}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
-
-    let red_dir = std::env::temp_dir().join(format!("swi_r87_mig_{scratch}"));
-    let _ = std::fs::remove_dir_all(&red_dir);
-    std::fs::create_dir_all(&red_dir).expect("mkdir reduced migrations");
+) -> (PgPool, crate::pg_test_support::ScratchDb, String, std::path::PathBuf) {
+    // REV-093-F06: the database and its temp directory are owned by a guard that
+    // drops them on unwind too, so a failing assertion no longer strands them.
+    let mut scratch = crate::pg_test_support::ScratchDb::create(label).await;
+    let red_dir = scratch.temp_dir("mig");
     for entry in std::fs::read_dir(migrations_dir()).expect("read migrations") {
         let entry = entry.expect("dir entry");
         let n = entry.file_name().to_string_lossy().to_string();
@@ -77,20 +63,12 @@ async fn scratch_before(
         }
         std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy migration");
     }
-
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url()
-            .rsplitn(2, '/')
-            .nth(1)
-            .expect("db url base"),
-        scratch
-    );
-    let pool = crate::db::connect(&url, 2).await.expect("scratch pool");
+    let pool = scratch.pool().await;
     crate::db::migrate_dir_with(&pool, &red_dir, true)
         .await
         .unwrap_or_else(|e| panic!("migrate below {cutoff}: {e:#}"));
-    (pool, admin, scratch, red_dir)
+    let name = scratch.name().to_string();
+    (pool, scratch, name, red_dir)
 }
 /// The commit that first versioned the migration bundle inside this crate. Its
 /// tree is a CONTENT-ADDRESSED artifact: git object ids are sha1 over the stored
@@ -207,13 +185,18 @@ fn verify_manifest_bijection(manifest: &str, sql_names: &[String], dir: &std::pa
     }
 }
 
-async fn drop_scratch(admin: &PgPool, pool: PgPool, scratch: &str, dir: &std::path::Path) {
+/// Explicit end-of-test release.
+///
+/// REV-093-F06: teardown is now owned by [`ScratchDb`]'s `Drop`, which also runs when
+/// a test unwinds. This helper only closes the pool early and then lets the guard go;
+/// it is kept so the success path still reads as a deliberate teardown.
+async fn drop_scratch(
+    _guard: &crate::pg_test_support::ScratchDb,
+    pool: PgPool,
+    _scratch: &str,
+    _dir: &std::path::Path,
+) {
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(admin)
-        .await
-        .expect("drop scratch");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,4 +1644,136 @@ fn the_resolver_prefers_the_packaged_bundle_over_a_legacy_sibling() {
         .position(|p| p == &std::path::PathBuf::from("migrations"))
         .expect("cwd-local packaged bundle must be a candidate");
     assert!(idx_cwd < idx_packaged, "./migrations comes first");
+}
+
+// ---------------------------------------------------------------------------
+// REV-093-F06 — disposable databases and temp dirs are cleaned up on the
+// FAILURE path, not only on success
+// ---------------------------------------------------------------------------
+
+/// A panicking test must still leave no database and no temp directory behind.
+///
+/// Every fixture used to end with an explicit `drop_scratch(...).await` on the
+/// success path only, so a failing assertion unwound past it and stranded the
+/// scratch database. The REV-095 round leaked eight that way and they were swept by
+/// hand afterwards — which is not a mechanism, because the next failing test leaks
+/// again. Ownership now sits in `ScratchDb::drop`.
+///
+/// The proof runs a real panic inside `catch_unwind`, then asserts from OUTSIDE the
+/// unwound scope that both the database and the temp dir are gone. Names are
+/// captured first so they can be probed after the guard is destroyed.
+#[tokio::test]
+async fn a_panicking_test_still_cleans_up_its_scratch_database() {
+    let admin_url = crate::pg_test_support::require_live_url();
+
+    // Build the guard, remember what it owns, then panic while holding it.
+    let (name, dir) = {
+        let mut guard = crate::pg_test_support::ScratchDb::create("f06panic").await;
+        let dir = guard.temp_dir("probe");
+        let name = guard.name().to_string();
+        std::fs::write(dir.join("marker.txt"), b"probe").expect("write marker");
+
+        // Precondition: both really exist while the guard is alive, otherwise the
+        // assertions below would pass vacuously.
+        assert!(
+            crate::pg_test_support::ScratchDb::exists(&admin_url, &name).await,
+            "the scratch database must exist before the panic"
+        );
+        assert!(dir.join("marker.txt").exists(), "the temp dir must exist before the panic");
+
+        // Unwind with the guard owned by the panicking scope. `Drop` runs during the
+        // unwind; it must not itself panic (that would abort the process).
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _owned = guard;
+            panic!("REV-093-F06 deliberate failure-path probe");
+        }));
+        assert!(unwound.is_err(), "the probe must actually have panicked");
+        (name, dir)
+    };
+
+    // The guard was dropped during the unwind, so both resources are gone.
+    assert!(
+        !crate::pg_test_support::ScratchDb::exists(&admin_url, &name).await,
+        "database {name} survived a panicking test: failure-path cleanup is not \
+         wired up (REV-093-F06)"
+    );
+    assert!(
+        !dir.exists(),
+        "temp dir {} survived a panicking test (REV-093-F06)",
+        dir.display()
+    );
+}
+
+/// The guard is what does the cleaning: disarm it and the database survives.
+///
+/// Without this, the test above could pass because something ELSE removed the
+/// database — a stray sweep, or a name that was never created. Proving the negative
+/// pins the causality on `Drop`.
+#[tokio::test]
+async fn the_scratch_guard_is_what_performs_the_cleanup() {
+    let admin_url = crate::pg_test_support::require_live_url();
+    let guard = crate::pg_test_support::ScratchDb::create("f06disarm").await;
+    let name = guard.leak_for_tests(); // consumes the guard WITHOUT dropping the DB
+
+    assert!(
+        crate::pg_test_support::ScratchDb::exists(&admin_url, &name).await,
+        "a disarmed guard must leave the database behind — otherwise the cleanup \
+         assertions elsewhere prove nothing about the guard"
+    );
+
+    // Clean up this deliberate leak by hand so the run leaves no residue.
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("admin pool");
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .expect("drop the deliberately leaked database");
+    admin.close().await;
+    assert!(
+        !crate::pg_test_support::ScratchDb::exists(&admin_url, &name).await,
+        "the deliberate leak must not outlive this test"
+    );
+}
+
+/// The whole pg lane must leave no `swi_scratch_%` database behind.
+///
+/// A per-guard proof does not establish that every FIXTURE adopted the guard. This
+/// one is a class check: after this test's own guard is gone, no scratch database
+/// from any fixture in this process may remain. It runs last by name ordering
+/// within the module and is deliberately cheap.
+#[tokio::test]
+async fn no_scratch_database_outlives_the_fixtures_that_made_it() {
+    let admin_url = crate::pg_test_support::require_live_url();
+    let name = {
+        let guard = crate::pg_test_support::ScratchDb::create("f06sweep").await;
+        guard.name().to_string()
+    }; // dropped here
+
+    assert!(
+        !crate::pg_test_support::ScratchDb::exists(&admin_url, &name).await,
+        "a guard dropped on the SUCCESS path must also remove its database"
+    );
+
+    // And nothing this process created under the guard's naming scheme is still
+    // around at this instant.
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("admin pool");
+    let mine = format!("swi_scratch_%_{}_%", std::process::id());
+    let residue: Vec<String> =
+        sqlx::query_scalar("SELECT datname FROM pg_database WHERE datname LIKE $1 ORDER BY datname")
+            .bind(&mine)
+            .fetch_all(&admin)
+            .await
+            .expect("residue probe");
+    admin.close().await;
+    assert!(
+        residue.is_empty(),
+        "these scratch databases from this process were not cleaned up: {residue:?}"
+    );
 }

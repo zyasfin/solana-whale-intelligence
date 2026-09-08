@@ -64,15 +64,10 @@ fn worker_ctx(
 
 /// A scratch database migrated through 1033 ONLY, holding a pending alert row —
 /// the exact lane that aborted inside 1034 before the migrator preflight existed.
-async fn scratch_1033_with_pending(name: &str) -> (PgPool, PgPool, String) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_f01up_{name}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}")).execute(&admin).await.expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}")).execute(&admin).await.expect("create");
+async fn scratch_1033_with_pending(name: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
+        // REV-093-F06: guard-owned; cleans up on unwind too.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let scratch = scratch_guard.name().to_string();
 
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -122,7 +117,7 @@ async fn scratch_1033_with_pending(name: &str) -> (PgPool, PgPool, String) {
     .execute(&pool)
     .await
     .expect("pending alert");
-    (pool, admin, scratch)
+    (pool, scratch_guard, scratch)
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +126,7 @@ async fn scratch_1033_with_pending(name: &str) -> (PgPool, PgPool, String) {
 
 #[tokio::test]
 async fn an_unassisted_1033_upgrade_with_pending_alerts_reaches_current() {
-    let (pool, admin, scratch) = scratch_1033_with_pending("a").await;
+    let (pool, _scratch_guard, _scratch) = scratch_1033_with_pending("a").await;
 
     // NO manual ALTER, NO operator step: the production migrator alone must carry
     // this lane to current. The preflight repairs the known pre-1034 shape before
@@ -164,10 +159,7 @@ async fn an_unassisted_1033_upgrade_with_pending_alerts_reaches_current() {
     .expect("ws col");
     assert!(has_ws_col, "the lane reached 1036");
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }
 
 // ---------------------------------------------------------------------------

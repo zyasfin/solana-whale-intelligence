@@ -107,6 +107,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-094 | 2026-09-08 | corrective for REV-093-F01 (segment validation delegates to PostgreSQL's own bigint parser via a guarded `pg_input_is_valid` CASE instead of a fourth hand-written regex; `+`-signed and whitespace-padded ids are valid again, `+0`/`-1`/overflow/junk still refused, invalid input proven never to reach the cast) | READY FOR REVIEW | 369/369 + 497/497 (494 + 3 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, FK 1, cleanup verified 0 left; 10 focused tests each `running 1 test`; 4 RED→GREEN at cf58b43 reproducing the reviewer's `left: 1 / right: 1000000000000000000` |
 | REV-093 | 2026-09-08 | independent review of REV-092 — APPENDED LATE, after REV-094 was already committed (`f01975a`), because the handoff carrying it arrived late; recorded out of numeric order rather than rewriting history | CHANGES REQUIRED | F01 bigint lexical domain (closed by REV-094); F02 zero-ID invariant unenforced, F03 constraint OID churn + concurrent DDL race, F04 strict manifest parser test-only, F05 resolver precedence, F06 cleanup/fmt wording — all closed by REV-095 |
 | REV-095 | 2026-09-08 | implementation of REV-093-F02..F06 (forward migration 1041 enforcing id > 0 with fail-closed detection and no silent repair; ledger CHECK made idempotent and concurrency-safe under an ACCESS EXCLUSIVE lock; one strict manifest parser in production shared with the fixture; resolver puts the packaged bundle ahead of the legacy sibling; fmt denominator corrected) | READY FOR REVIEW | 369/369 + 503/503; check gates 0 warning; disposable DB 53\|53\|0, FK 1, 2 validated positive-id CHECKs, cleanup verified 0 left; 10 focused tests each `--exact --list`=1 and `running 1 test`; 6 RED→GREEN; REV-094/F01 left intact and re-verified; F06 cleanup guard reported OPEN |
+| REV-096 | 2026-09-08 | implementation of the remaining REV-093-F06 cleanup mechanism (ScratchDb guard owning disposable DBs and temp dirs, cleaned up in Drop on the panic/unwind path; all nine scratch-creating fixtures migrated so `CREATE DATABASE` exists only inside the guard) | READY FOR REVIEW | 369/369 + 506/506; check gates 0 warning; disposable DB 53\|53\|0, FK 1; residue after a full lane with NO manual sweeping = 0 DBs, 0 temp dirs; 3 focused tests each `--exact --list`=1 and `running 1 test`; RED reproduced `survived a panicking test`; also proven on a real fixture forced to fail; SIGKILL/abort path stated as a limitation |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -15167,5 +15168,138 @@ Tiap fix dilepas lebih dulu; kegagalan berupa assertion, bukan gagal kompilasi; 
 - Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI (F05) dan regression cabang
   penolakan F06 sebelum wiring produksi.
 - Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+
+---
+
+## REV-096 — Implementasi REV-093-F06 (mekanisme cleanup failure-path)
+
+**Tanggal:** 2026-09-08
+**Mode:** implementation; Rust 1.89.0; PostgreSQL 17.11 (disposable `swi_r96_final_213440`)
+**Base:** `7872305` (REV-095)
+**Scope:** HANYA sisa REV-093-F06 — mekanisme cleanup pada jalur gagal. REV-093/094/095 tidak ditulis ulang; tidak ada shipped migration SQL yang diedit.
+
+### Ringkasan
+
+REV-095 menutup bagian kata-kata F06 tetapi melaporkan bagian mekanismenya TERBUKA: fixture
+memanggil `drop_scratch` hanya di jalur sukses, jadi setiap probe RED meninggalkan disposable DB.
+Waktu itu delapan DB bocor saya hapus manual — dan menyapu manual bukan mekanisme, karena test
+gagal berikutnya bocor lagi. Round ini memindahkan kepemilikan ke guard.
+
+### Fix
+
+`pg_test_support::ScratchDb` memiliki database sekali pakai beserta temp dir-nya dan
+membersihkannya di `Drop`, termasuk saat test PANIC.
+
+Kenapa thread, bukan `block_on`/`block_in_place`: `Drop` tidak bisa `.await`; `#[tokio::test]`
+default-nya runtime current-thread, tempat `block_in_place` panik dan `Runtime::block_on` dari
+dalam runtime juga panik; dan panik kedua saat unwind akan meng-abort proses. Jadi cleanup
+berjalan di `std::thread` baru dengan runtime sendiri lalu di-join sebelum `Drop` kembali, dan
+tidak pernah panik keluar dari `Drop`. `DROP DATABASE ... WITH (FORCE)` mengakhiri backend yang
+tersisa sendiri, sehingga pool yang masih dipegang test tidak menghalangi teardown.
+
+Penamaan memakai label + pid + counter monotonik, karena `std::process::id()` saja tidak unik
+lintas dua harness (lib + bin) yang dijalankan `cargo test --features pg_tests`.
+
+**SELURUH sembilan fixture** yang membuat scratch DB dipindahkan ke guard, bukan sebagian:
+`rev075`, `rev077`, `rev079`, `rev081`, `rev083` (dua helper), `rev085_funding_merge`,
+`rev085_migration_immutability`, `rev087_funding_identity`, `rev087_migration_integrity`.
+Diverifikasi mekanis: `grep -n "CREATE DATABASE" src/*.rs` kini hanya cocok di
+`pg_test_support.rs`.
+
+Dua fixture inline (`rev075:719` `swi_1032_replay_*`, `rev079:518` `swi_noqueue_*`) ditemukan
+justru oleh readback residu saya sendiri setelah lane pertama — keduanya membuat DB tanpa guard
+dan akan bocor TANPA SYARAT. Keduanya sekarang guard-owned.
+
+**Lokasi:** `src/pg_test_support.rs:141-300` (`ScratchDb`); sembilan file fixture di atas
+
+### Regression
+
+`src/rev087_migration_integrity_pg_tests.rs`:
+
+- `a_panicking_test_still_cleans_up_its_scratch_database` — panik SUNGGUHAN di dalam
+  `catch_unwind` sambil memegang guard, lalu dari luar scope yang sudah unwind memastikan DB dan
+  temp dir hilang. Prekondisi menegaskan keduanya ADA sebelum panik, jadi assertion tidak bisa
+  lulus secara vacuous;
+- `the_scratch_guard_is_what_performs_the_cleanup` — guard di-disarm, DB harus SELAMAT. Tanpa ini
+  test di atas bisa lulus karena sesuatu yang lain menghapus DB; ini memakukan kausalitas pada
+  `Drop`. Kebocoran sengaja itu dibersihkan sendiri di akhir test;
+- `no_scratch_database_outlives_the_fixtures_that_made_it` — cek kelas: tidak ada
+  `swi_scratch_%` milik proses ini yang tersisa.
+
+Tidak ada file naratif baru (`SMOKE_TEST.md` dan sejenisnya) yang dibuat.
+
+### Bukti mekanisme dijalankan fixture NYATA
+
+Bukti per-guard tidak membuktikan fixture mengadopsinya. Jadi satu fixture sungguhan
+(`an_oversized_numeric_workspace_segment_survives_the_1036_cast`) diberi `panic!` sementara tepat
+setelah alokasi scratch:
+
+```text
+test result: FAILED. 0 passed; 1 failed
+scratch DBs before: 0 | after the FAILED fixture run: (none)
+```
+
+Probe itu dihapus lagi; source dipulihkan byte-identik.
+
+### Gates
+
+```text
+Rust                                                            1.89.0
+PostgreSQL                                                      17.11
+cargo +1.89.0 check --locked --all-targets                      PASS rc=0, 0 warnings
+cargo +1.89.0 check --locked --features pg_tests --all-targets  PASS rc=0, 0 warnings
+cargo +1.89.0 test --locked                                     PASS 369/369, 0 warnings
+cargo +1.89.0 test --locked --features pg_tests -- --test-threads=1   PASS 506/506
+disposable DB                                                   swi_r96_final_213440
+db migrate / db status                                          rc 0 / schema current; digest-verified
+ledger fingerprint                                              53|53|0
+alerts_funding_case_workspace_fk                                1
+residue after the FULL lane, no manual sweeping                 swi_scratch_% = 0; temp dirs = 0
+residue after teardown of the run's own DBs                     swi_% = 0
+```
+
+Focused, tiap test `--exact --list` = 1 lalu `running 1 test`, semuanya PASS:
+
+```text
+a_panicking_test_still_cleans_up_its_scratch_database
+the_scratch_guard_is_what_performs_the_cleanup
+no_scratch_database_outlives_the_fixtures_that_made_it
+```
+
+### RED→GREEN
+
+`Drop` dinetralkan menjadi no-op (persis dunia pra-REV-096), keduanya gagal pada assertion
+cleanup — bukan gagal kompilasi:
+
+| Test | RED | GREEN |
+|---|---|---|
+| `a_panicking_test_still_cleans_up_its_scratch_database` | FAILED 1 — `database swi_scratch_f06panic_213172_0 survived a panicking test: failure-path cleanup is not wired up (REV-093-F06)` | PASS 1 |
+| `no_scratch_database_outlives_the_fixtures_that_made_it` | FAILED 1 | PASS 1 |
+
+Probe RED itu sendiri membocorkan 3 DB (karena `Drop` memang dimatikan) — dibersihkan, lalu
+lane final dijalankan dari kondisi bersih tanpa sapuan manual sama sekali.
+
+### Yang TIDAK saya klaim
+
+- Tidak ada self-approval: verdict **READY FOR REVIEW**.
+- **Cleanup berjalan pada unwind, BUKAN pada `SIGKILL`/abort.** Bila proses test dimatikan paksa
+  atau meng-abort (misalnya panik saat unwind di tempat lain), `Drop` tidak berjalan dan DB akan
+  tertinggal. Menutup kelas itu butuh sapuan berbasis umur di luar proses; tidak dikerjakan di
+  sini dan bukan bagian F06.
+- Cek kelas menyaring `swi_scratch_%` milik PID proses ini. DB dari proses lain yang berjalan
+  bersamaan tidak diperiksa, karena test tidak bisa membedakan lane sehat yang sedang berjalan
+  dari residu.
+- Guard menulis diagnostik ke stderr bila drop gagal (misalnya DB tidak terjangkau) alih-alih
+  panik, karena panik dari `Drop` saat unwind meng-abort proses. Artinya kegagalan cleanup
+  terlihat tetapi tidak menggagalkan test.
+- `cargo +1.89.0 fmt --check` tetap gagal pra-ada: **84 dari 103** file `.rs` tracked, sama seperti
+  yang dikoreksi REV-093-F06/REV-095. Tidak diminta round ini dan tidak diubah.
+- Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI (F05) dan regression cabang
+  penolakan F06-REV-090 sebelum wiring produksi. Keduanya tidak berkaitan dengan F06 ini.
+- Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

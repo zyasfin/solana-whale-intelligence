@@ -165,21 +165,9 @@ async fn same_recipient_funding_cases_are_workspace_independent() {
 
 #[tokio::test]
 async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_f02up_{}_{}", tag("k"), std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create");
-
+    // REV-093-F06: guard-owned teardown, also on unwind.
+    let admin = crate::pg_test_support::ScratchDb::create("f02up").await;
+    let scratch = admin.name().to_string();
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("parent")
@@ -264,10 +252,8 @@ async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
         "nonnumeric second segment must fall through to the default workspace (REV-082-F02)"
     );
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    // REV-093-F06: the guard drops the database, on success and on unwind alike.
+    drop(admin);
 }
 
 // ---------------------------------------------------------------------------
@@ -276,21 +262,9 @@ async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
 
 #[tokio::test]
 async fn pre_1033_alerts_table_survives_preflight() {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_f03up_{}_{}", tag("k"), std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create");
-
+    // REV-093-F06: guard-owned teardown, also on unwind.
+    let admin = crate::pg_test_support::ScratchDb::create("f03up").await;
+    let scratch = admin.name().to_string();
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("parent")
@@ -349,10 +323,8 @@ async fn pre_1033_alerts_table_survives_preflight() {
     .expect("check state column after");
     assert!(has_state_after, "post-migration lane must have state column");
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    // REV-093-F06: the guard drops the database, on success and on unwind alike.
+    drop(admin);
 }
 
 // ---------------------------------------------------------------------------

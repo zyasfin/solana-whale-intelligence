@@ -60,15 +60,10 @@ fn worker_ctx(
 
 /// A scratch database migrated through 1033 ONLY (the 1034-aborted-upgrade lane),
 /// then brought forward by migration 1035 — the exact sequence REV-078-F01 broke.
-async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, PgPool, String) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_upg_{name}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}")).execute(&admin).await.expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}")).execute(&admin).await.expect("create");
+async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
+        // REV-093-F06: guard-owned; cleans up on unwind too.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let scratch = scratch_guard.name().to_string();
 
     // Migrations dir minus 1034 and 1035: the pre-upgrade state.
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -139,12 +134,12 @@ async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, PgPool,
             .expect("alert");
         }
     }
-    (pool, admin, scratch)
+    (pool, scratch_guard, scratch)
 }
 
 #[tokio::test]
 async fn a_1033_database_with_alert_history_survives_the_sent_at_cutover() {
-    let (pool, admin, scratch) = scratch_through_1033_with_alert_history("f01").await;
+    let (pool, _scratch_guard, _scratch) = scratch_through_1033_with_alert_history("f01").await;
 
     // Pre-check the lane really is pre-1034-shape: sent_at is NOT NULL with a default.
     let nullable: String = sqlx::query_scalar(
@@ -200,10 +195,7 @@ async fn a_1033_database_with_alert_history_survives_the_sent_at_cutover() {
     .expect("nullable after");
     assert_eq!(nullable_after, "YES");
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }
 
 // ---------------------------------------------------------------------------
@@ -518,19 +510,9 @@ async fn an_unreadable_queue_authority_fails_closed() {
     let _ctx = worker_ctx(&pool, ws, None);
     // Directly exercise the checked form's failure mapping with a poisoned pool:
     // a pool connected to a database where queue_state does not exist at all.
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin");
-    let scratch = format!("swi_noqueue_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}")).execute(&admin).await.expect("drop");
-    sqlx::query(&format!("CREATE DATABASE {scratch}")).execute(&admin).await.expect("create");
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url().rsplitn(2, '/').nth(1).expect("db url"),
-        scratch
-    );
+    // REV-093-F06: guard-owned, so the fail-closed assertions below cannot strand it.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create("noqueue").await;
+    let url = scratch_guard.scratch_url().to_string();
     let empty_pool = crate::db::connect(&url, 2).await.expect("empty pool");
     let broken_ctx = worker_ctx(&empty_pool, ws, None);
     let checked = broken_ctx.queue_allowed_checked(crate::queues::QUEUE_SIGNAL_EVAL).await;
@@ -540,10 +522,7 @@ async fn an_unreadable_queue_authority_fails_closed() {
         "an unreadable authority must FAIL CLOSED (REV-078-F05)"
     );
     let _ = probe;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }
 
 // ---------------------------------------------------------------------------

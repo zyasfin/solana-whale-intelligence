@@ -435,23 +435,13 @@ async fn funding_alerts_use_the_outbox_and_retry_transient_failures() {
 // skips; exactly one signal exists.
 #[tokio::test]
 async fn two_workers_on_one_workspace_cannot_double_evaluate() {
-    let (pool, admin, scratch) = {
-        let admin = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&crate::pg_test_support::require_live_url())
-            .await
-            .expect("admin pool");
-        let scratch = format!("swi_f02c_{}", std::process::id());
-        sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}")).execute(&admin).await.expect("drop");
-        sqlx::query(&format!("CREATE DATABASE {scratch}")).execute(&admin).await.expect("create");
-        let url = format!(
-            "{}/{}",
-            crate::pg_test_support::require_live_url().rsplitn(2, '/').nth(1).expect("db url"),
-            scratch
-        );
-        let pool = crate::db::connect(&url, 2).await.expect("scratch pool");
+    // REV-093-F06: guard-owned; cleans up even if the assertions below fail.
+    let (pool, admin, _scratch) = {
+        let guard = crate::pg_test_support::ScratchDb::create("f02c").await;
+        let pool = guard.pool().await;
         crate::db::migrate_with(&pool, true).await.expect("migrate");
-        (pool, admin, scratch)
+        let name = guard.name().to_string();
+        (pool, guard, name)
     };
 
     let ws = workspace(&pool, &tag("g76f02a")).await;
@@ -563,10 +553,8 @@ async fn two_workers_on_one_workspace_cannot_double_evaluate() {
         "two concurrent workers on one workspace must produce exactly ONE signal (REV-076-F02)"
     );
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    // REV-093-F06: the guard drops the database, on success and on unwind alike.
+    drop(admin);
 }
 
 // ---------------------------------------------------------------------------

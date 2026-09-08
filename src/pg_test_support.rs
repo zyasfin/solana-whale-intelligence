@@ -117,3 +117,175 @@ pub fn configure_admin_auth() -> &'static str {
     );
     ADMIN_TEST_PASSWORD
 }
+
+/// A disposable database (and any temp directories) that clean themselves up on
+/// `Drop`, including when the test PANICS.
+///
+/// REV-093-F06: every live fixture used to finish with an explicit
+/// `drop_scratch(...).await` on the SUCCESS path only. A failing assertion unwinds
+/// before that line, so each RED probe stranded a database — the REV-095 round alone
+/// leaked eight, and they were removed by hand afterwards. Manual sweeping is not a
+/// mechanism: the next failing test leaks again. Ownership belongs to a guard.
+///
+/// Why a thread rather than `block_on`/`block_in_place`:
+///
+///   * `Drop` cannot `.await`;
+///   * `#[tokio::test]` defaults to a CURRENT-THREAD runtime, where
+///     `block_in_place` panics, and calling `Runtime::block_on` while already inside
+///     a runtime panics too;
+///   * during unwind a second panic would abort the process.
+///
+/// So cleanup runs on a fresh `std::thread` with its own single-thread runtime and is
+/// joined before `Drop` returns. That is safe from any runtime flavour and from
+/// inside a panic.
+///
+/// `DROP DATABASE ... WITH (FORCE)` terminates leftover backends itself, so a pool the
+/// test still holds does not block teardown.
+pub struct ScratchDb {
+    name: String,
+    admin_url: String,
+    url: String,
+    temp_dirs: Vec<std::path::PathBuf>,
+    disarmed: bool,
+}
+
+impl ScratchDb {
+    /// Create a uniquely named disposable database.
+    ///
+    /// The name carries the caller's label, the process id, and a monotonic counter,
+    /// so two harness processes (lib + bin) and two tests in one process cannot
+    /// collide — `std::process::id()` alone is not unique across the two harnesses
+    /// `cargo test --features pg_tests` starts.
+    pub async fn create(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let admin_url = require_live_url();
+        let name = format!(
+            "swi_scratch_{label}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&admin_url)
+            .await
+            .expect("admin pool for scratch creation");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .expect("drop pre-existing scratch");
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .expect("create scratch");
+        admin.close().await;
+        let url = format!(
+            "{}/{}",
+            admin_url.rsplitn(2, '/').nth(1).expect("database url base"),
+            name
+        );
+        Self { name, admin_url, url, temp_dirs: Vec::new(), disarmed: false }
+    }
+
+    /// The scratch database's own URL.
+    pub fn scratch_url(&self) -> &str {
+        &self.url
+    }
+
+    /// The scratch database's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// A pool connected the way the RUNTIME connects (see [`live_pool`]).
+    pub async fn pool(&self) -> PgPool {
+        crate::db::connect(&self.url, 2)
+            .await
+            .expect("connect to the scratch database")
+    }
+
+    /// A uniquely named temp directory whose lifetime is tied to this guard.
+    pub fn temp_dir(&mut self, label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{}_{label}", self.name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch temp dir");
+        self.temp_dirs.push(dir.clone());
+        dir
+    }
+
+    /// Give up ownership WITHOUT cleaning up.
+    ///
+    /// Only for the regression that has to observe a leak; production fixtures never
+    /// call this.
+    #[cfg(test)]
+    pub fn leak_for_tests(mut self) -> String {
+        self.disarmed = true;
+        self.name.clone()
+    }
+
+    /// Whether a database of this name still exists. Used by the cleanup regression.
+    pub async fn exists(admin_url: &str, name: &str) -> bool {
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(admin_url)
+            .await
+            .expect("admin pool for existence probe");
+        let found: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+                .bind(name)
+                .fetch_one(&admin)
+                .await
+                .expect("existence probe");
+        admin.close().await;
+        found
+    }
+
+}
+
+impl Drop for ScratchDb {
+    fn drop(&mut self) {
+        for dir in &self.temp_dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if self.disarmed {
+            return;
+        }
+        let name = self.name.clone();
+        let admin_url = self.admin_url.clone();
+        // Own runtime on its own thread: valid from a current-thread test, from a
+        // multi-thread test, and from inside an unwind.
+        let handle = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("scratch cleanup: could not build runtime for {name}: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async {
+                let admin = match sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&admin_url)
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("scratch cleanup: could not connect to drop {name}: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                    .execute(&admin)
+                    .await
+                {
+                    eprintln!("scratch cleanup: could not drop {name}: {e}");
+                }
+                admin.close().await;
+            });
+        });
+        // Never panic from Drop: a second panic during unwind aborts the process.
+        if handle.join().is_err() {
+            eprintln!("scratch cleanup thread panicked for {}", self.name);
+        }
+    }
+}

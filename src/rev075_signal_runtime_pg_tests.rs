@@ -181,21 +181,10 @@ async fn seed_accepting_fixture(pool: &PgPool, ws: i64, stem: &str, mint: &str, 
 /// A fully migrated, EMPTY scratch database for tests whose batch selection must
 /// not race sibling tests' rows on the shared token table (REV-056-F06-style
 /// isolation by fresh namespace, the same pattern the 1032 replay uses below).
-async fn scratch_pool(name: &str) -> (PgPool, PgPool, String) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_f02_{name}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
+async fn scratch_pool(name: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
+        // REV-093-F06: guard-owned; cleans up on unwind too.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let scratch = scratch_guard.name().to_string();
     let url = format!(
         "{}/{}",
         crate::pg_test_support::require_live_url()
@@ -208,14 +197,11 @@ async fn scratch_pool(name: &str) -> (PgPool, PgPool, String) {
     crate::db::migrate_with(&pool, true)
         .await
         .expect("migrate scratch");
-    (pool, admin, scratch)
+    (pool, scratch_guard, scratch)
 }
 
-async fn drop_scratch(admin: &PgPool, scratch: &str) {
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(admin)
-        .await
-        .expect("drop scratch");
+async fn drop_scratch(_guard: &crate::pg_test_support::ScratchDb, _scratch: &str) {
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }
 
 fn worker_ctx(
@@ -307,7 +293,7 @@ async fn two_workspaces_can_write_the_same_signal_at_the_same_timestamp() {
 // against seeded due evidence, with NO CLI involvement.
 #[tokio::test]
 async fn the_worker_loop_evaluates_due_tokens_without_a_cli_call() {
-    let (pool, admin, scratch) = scratch_pool("main").await;
+    let (pool, scratch_guard, scratch) = scratch_pool("main").await;
     let ws = workspace(&pool, &tag("g74f02a")).await;
     let stem = tag("G74F02");
     let mint = format!("{stem}MINT");
@@ -366,14 +352,14 @@ async fn the_worker_loop_evaluates_due_tokens_without_a_cli_call() {
     .await
     .expect("count b signals");
     assert_eq!(b_signals, 0, "workspace B's policy must not inherit A's acceptance");
-    drop_scratch(&admin, &scratch).await;
+    drop_scratch(&scratch_guard, &scratch).await;
 }
 
 // A bad token must not stop the batch. `evaluate_token_signals` errors on an
 // untracked token, so the loop must catch that per-token and continue to the next.
 #[tokio::test]
 async fn one_bad_token_does_not_stop_later_tokens() {
-    let (pool, admin, scratch) = scratch_pool("bad").await;
+    let (pool, scratch_guard, scratch) = scratch_pool("bad").await;
     let ws = workspace(&pool, &tag("g74f02c")).await;
     let stem = tag("G74F02C");
     let good_mint = format!("{stem}GOOD");
@@ -411,7 +397,7 @@ async fn one_bad_token_does_not_stop_later_tokens() {
     .await
     .expect("count signals");
     assert_eq!(signals, 1, "the good token was still evaluated after the bad one");
-    drop_scratch(&admin, &scratch).await;
+    drop_scratch(&scratch_guard, &scratch).await;
 }
 
 // The queue gate is the ONLY thing between the loop and a pressured system: a
@@ -725,30 +711,9 @@ async fn two_chains_at_the_same_microsecond_produce_two_correctly_labeled_alerts
 #[tokio::test]
 async fn migration_1032_repairs_a_transitive_overlap_idempotently() {
     // A scratch database migrated only through 1031, so 1032 runs HERE under test.
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_1032_replay_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
-
-    let url = format!(
-        "{}/{}",
-        crate::pg_test_support::require_live_url()
-            .rsplitn(2, '/')
-            .nth(1)
-            .expect("url has a database"),
-        scratch
-    );
-    let pool = crate::db::connect(&url, 2).await.expect("scratch pool");
+    // REV-093-F06: guard-owned, so an assertion failure below cannot strand it.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create("replay1032").await;
+    let pool = scratch_guard.pool().await;
 
     // Apply everything EXCEPT 1032 via the production runner, then seed the
     // pre-1032 duplicate state, then apply 1032 by hand exactly as the runner does.
@@ -853,8 +818,5 @@ async fn migration_1032_repairs_a_transitive_overlap_idempotently() {
     assert_eq!(events, 1, "one cutover event from the repairing replay");
     assert_eq!(events_after, 1, "the second replay logs nothing new");
 
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }

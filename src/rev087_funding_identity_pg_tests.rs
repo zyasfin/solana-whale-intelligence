@@ -39,21 +39,10 @@ fn tag(prefix: &str) -> String {
 /// A scratch database migrated through 1036 — `funding_radar_cases` carries a
 /// workspace but 1037's identity index does not exist yet, so duplicates are
 /// insertable. The reduced set is passed explicitly; no env var is mutated.
-async fn scratch_through_1036(label: &str) -> (PgPool, PgPool, String, std::path::PathBuf) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_r87f03_{label}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
+async fn scratch_through_1036(_label: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String, std::path::PathBuf) {
+        // REV-093-F06: guard-owned; cleans up on unwind too.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create("swi_r87f03").await;
+    let scratch = scratch_guard.name().to_string();
 
     let red_dir = std::env::temp_dir().join(format!("swi_r87f03_mig_{scratch}"));
     let _ = std::fs::remove_dir_all(&red_dir);
@@ -89,16 +78,17 @@ async fn scratch_through_1036(label: &str) -> (PgPool, PgPool, String, std::path
     .expect("uidx probe");
     assert!(!uidx, "the reduced set must stop BEFORE 1037 creates the identity index");
 
-    (pool, admin, scratch, red_dir)
+    (pool, scratch_guard, scratch, red_dir)
 }
 
-async fn drop_scratch(admin: &PgPool, pool: PgPool, scratch: &str, dir: &std::path::Path) {
+async fn drop_scratch(
+    _guard: &crate::pg_test_support::ScratchDb,
+    pool: PgPool,
+    _scratch: &str,
+    _dir: &std::path::Path,
+) {
+    // REV-093-F06: teardown belongs to the guard, which also runs on unwind.
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(admin)
-        .await
-        .expect("drop scratch");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[allow(clippy::too_many_arguments)]

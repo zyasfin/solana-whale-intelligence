@@ -50,21 +50,10 @@ fn lf_digest(path: &std::path::Path) -> String {
 /// A scratch database migrated through `last_kept` only: every migration whose
 /// filename sorts after it is withheld from a temp directory, so the upgrade
 /// lane under test starts from a genuine historical schema.
-async fn scratch_through(name: &str, last_kept: &str) -> (PgPool, PgPool, String) {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&crate::pg_test_support::require_live_url())
-        .await
-        .expect("admin pool");
-    let scratch = format!("swi_r85_{name}_{}", std::process::id());
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop scratch");
-    sqlx::query(&format!("CREATE DATABASE {scratch}"))
-        .execute(&admin)
-        .await
-        .expect("create scratch");
+async fn scratch_through(name: &str, last_kept: &str) -> (PgPool, crate::pg_test_support::ScratchDb, String) {
+        // REV-093-F06: guard-owned; cleans up on unwind too.
+    let scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
+    let scratch = scratch_guard.name().to_string();
 
     let src_dir = migrations_dir();
     let red_dir = std::env::temp_dir().join(format!("swi_r85_mig_{name}_{}", std::process::id()));
@@ -97,15 +86,12 @@ async fn scratch_through(name: &str, last_kept: &str) -> (PgPool, PgPool, String
         .await
         .unwrap_or_else(|e| panic!("migrate through {last_kept}: {e:#}"));
 
-    (pool, admin, scratch)
+    (pool, scratch_guard, scratch)
 }
 
-async fn drop_scratch(admin: &PgPool, pool: PgPool, scratch: &str) {
+async fn drop_scratch(_guard: &crate::pg_test_support::ScratchDb, pool: PgPool, _scratch: &str) {
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)"))
-        .execute(admin)
-        .await
-        .expect("drop scratch");
+    /* REV-093-F06: guard-owned teardown, also runs on unwind */
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +132,7 @@ async fn migration_1036_matches_its_reviewed_digest() {
 
 #[tokio::test]
 async fn a_database_holding_the_reviewed_1036_digest_upgrades_to_current() {
-    let (pool, admin, scratch) = scratch_through("at1036", MIGRATION_1036).await;
+    let (pool, scratch_guard, scratch) = scratch_through("at1036", MIGRATION_1036).await;
 
     let ledger: String =
         sqlx::query_scalar("SELECT sha256 FROM public._migrations WHERE name = $1")
@@ -182,7 +168,7 @@ async fn a_database_holding_the_reviewed_1036_digest_upgrades_to_current() {
     .expect("head migration applied");
     assert!(applied_head, "the lane reached the newest migration");
 
-    drop_scratch(&admin, pool, &scratch).await;
+    drop_scratch(&scratch_guard, pool, &scratch).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +177,7 @@ async fn a_database_holding_the_reviewed_1036_digest_upgrades_to_current() {
 
 #[tokio::test]
 async fn a_pre_1036_database_with_nonnumeric_dedup_keys_upgrades_unassisted() {
-    let (pool, admin, scratch) =
+    let (pool, scratch_guard, scratch) =
         scratch_through("legacykey", "1035_rev078_outbox_grants_subjects_sweep.sql").await;
 
     sqlx::query("INSERT INTO workspaces (name, slug) VALUES ('w','legacyws') ON CONFLICT DO NOTHING")
@@ -241,5 +227,5 @@ async fn a_pre_1036_database_with_nonnumeric_dedup_keys_upgrades_unassisted() {
          workspace, exactly as 1036's own fallback intends"
     );
 
-    drop_scratch(&admin, pool, &scratch).await;
+    drop_scratch(&scratch_guard, pool, &scratch).await;
 }
