@@ -100,6 +100,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-086 | 2026-09-07 | independent verification of REV-085 F01â€“F06 | CHANGES REQUIRED / NOT GO | focused PG 7/7; full PG harness 223 passed, 22 failed |
 | REV-087 | 2026-09-07 | independent full review of REV-085 against REV-086 | CHANGES REQUIRED / NOT GO | default Rust PASS; focused PG 7/7; full PG incomplete: 7 recent pipeline failures |
 | REV-088 | 2026-09-08 | implementation of REV-086/REV-087 F01–F06 (migrator digest-drift rejection, transactional range-safe preflight, complete funding-case merge + alert identity reconciliation via preflight, migration 1040 composite alert/case ownership + claim-time validation, evaluator claim release and error accounting, fenced exit writer, explicit migration-dir test lane) | READY FOR REVIEW | 369/369 + 487/487; 4/4 Rust 1.89 gates 0 warning; migration 1040 applied, manifest 52/52, fingerprint 52\|52\|0 on a unique disposable DB asserted present before and after; F01(x3)/F02/F03/F04(x3)/F05/F06 RED→GREEN; also fixed an unreported infinite loop that hung the full pg lane for 80 minutes |
+| REV-089 | 2026-09-08 | independent verification of REV-088 + versioned migration artifact | APPROVED / REV-088 F01â€“F06 ACCEPTED | full PG 487/487; fresh packaged migration 52/52; focused adversarial probes PASS |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14405,3 +14406,70 @@ Full pg lane sebelum perbaikan tiga test pre-existing: `252 passed; 3 failed`. S
 - Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+---
+
+## REV-089 â€” Independent verification of REV-088 + versioned migration artifact
+
+**Tanggal:** 2026-09-08
+**Mode:** independent correctness review; read-only source audit + real Rust/PostgreSQL execution
+**Target:** REV-088 implementation at `6ab1e28`; reviewed delivery at `a60647d`
+**Scope:** REV-086/087 F01â€“F06, migration 1040, full PG lane, packaged migration provenance
+
+### Verdict
+
+**APPROVED for REV-088 scoped fixes.** F01â€“F06 are independently accepted. The migration bundle is now a versioned artifact in the source repository. Pure-information launch boundary remains unchanged; this is not approval of deferred execution/trading scope.
+
+### Acceptance + saran lanjutan
+
+| Item | Hasil | Independent evidence | Saran lanjutan |
+|---|---|---|---|
+| F01 migration drift/preflight | **ACCEPTED** | Applied same-name digest drift is rejected; preflight is data-keyed and transactional; oversized `9223372036854775808` regression PASS. | Keep shipped SQL immutable; every future correction uses forward migration or narrowly justified preflight. |
+| F02 outbox completion | **ACCEPTED** | Signal drain handles `mark_alert_failed() == false`; stale in-flight failure is logged, not counted, and does not clear the new owner. | Keep every completion caller checking both DB error and fenced boolean. |
+| F03 funding merge | **ACCEPTED** | Scalar `null` + array evidence, every semantic field, event FK, stale alert key, and dedup collision exercised; one survivor + one sent logical alert read back. | Preserve explicit field/collision policy when adding funding-case columns. |
+| F04 alert/case ownership | **ACCEPTED** | `claim_alert` rejects cross-workspace case; raw mismatched INSERT fails under `alerts_funding_case_workspace_fk`; fresh DB readback found exactly one composite FK. | Keep composite FK as authority; reader joins remain defense-in-depth. |
+| F05 evaluator lifecycle | **ACCEPTED** | Forced DB write failure releases fenced claim immediately, returns count 0, then retries successfully; CLI preserves evaluator + release failures. | Add telemetry for cleanup failure; never report failed evaluation as completed work. |
+| F06 exit writer | **ACCEPTED** | `evaluate_exit_fenced` is crate-private, validates/locks durable claim in the write transaction; stale token writes zero; live token writes then releases. | Do not wire an exit producer without this claim path. |
+| Versioned migrations | **ACCEPTED** | Commit `a60647d` tracks 52 SQL + `MANIFEST.sha256`; packaged and sibling sets are 53/53 byte-identical; normalized manifest mismatches 0; no suspicious secret/temp path. | Treat repository `migrations/` as canonical release artifact; avoid maintaining a divergent sibling copy. |
+
+### Independent gates
+
+```text
+HEAD / local remote                              a60647dac892afad18b03671bea0638b695c0cdf / identical
+worktree before review                          clean
+Rust                                             1.89.0
+PostgreSQL                                       17.11
+fresh packaged migration, no override            PASS 52/52
+production resolver readback                     migrations_dir=migrations
+schema status                                    PASS, digest-verified
+fingerprint                                      52|52|0
+composite ownership FK readback                  1
+full pg_tests, unique DB, --test-threads=1       PASS 487/487
+reviewer-owned DB teardown                       PASS
+packaged tracked files                           53 = 52 SQL + 1 manifest
+packaged vs sibling byte mismatch                0
+manifest missing/extra/hash mismatch             0/0/0
+```
+
+### Focused adversarial readback
+
+```text
+an_oversized_numeric_workspace_segment_survives_the_1036_cast                  PASS
+an_edited_shipped_migration_is_refused_by_the_migrator                         PASS
+a_half_finished_preflight_is_completed_on_the_next_run                         PASS
+duplicate_cases_merge_every_column_and_reconcile_alert_identity                PASS
+a_cross_tenant_funding_alert_is_refused_at_the_claim_boundary                  PASS
+the_composite_ownership_constraint_rejects_a_mismatched_insert                 PASS
+a_stale_signal_drain_failure_is_observed_and_not_counted                       PASS
+a_failed_evaluation_releases_its_claim_and_is_not_counted                      PASS
+a_stale_claim_token_cannot_write_an_exit_signal                                PASS
+```
+
+### Batas klaim
+
+- Database yang sudah menerapkan 1037 lama tidak dapat memulihkan kolom yang pernah terhapus; acceptance ini membuktikan upgrade lane sebelum 1037 dan current/fresh lanes.
+- Legacy funding key dengan subject segment korup ditolak fail-closed untuk rekonsiliasi operator.
+- `--test-threads=1` tetap constraint gate karena cluster-global roles/state.
+- Tidak ada source logic yang diubah oleh independent review. Satu-satunya perubahan sebelum ledger adalah packaging byte-identical migration artifact di commit `a60647d`.
+
+**Final:** REV-088 F01â€“F06 **APPROVED / ACCEPTED**. Next implementation changes require a new REV; do not rewrite REV-088 or REV-089.
