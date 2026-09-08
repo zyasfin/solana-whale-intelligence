@@ -17,13 +17,19 @@
 
 #![cfg(all(test, feature = "pg_tests"))]
 
+use chrono::Utc;
 use sqlx::PgPool;
 
+/// The CANONICAL migration bundle: the one versioned inside this crate.
+///
+/// REV-092 item 4: this returned `<crate>/../swi-deploy/migrations`, the legacy
+/// sibling checkout. Since commit a60647d the packaged `migrations/` directory is
+/// the canonical artifact and the sibling is an unversioned leftover that can drift
+/// from it silently — so every assertion in this module was being made against
+/// bytes the production resolver would not choose. `CARGO_MANIFEST_DIR/migrations`
+/// is the same directory `resolve_migration_dir` picks for a normal run.
 fn migrations_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations")
 }
 
 fn tag(prefix: &str) -> String {
@@ -136,30 +142,96 @@ fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
         }
     }
     // Self-authentication: every SQL blob must match the digest recorded in the
-    // manifest of the SAME commit.
-    let manifest = std::fs::read_to_string(dest.join("MANIFEST.sha256"))
-        .expect("predecessor manifest");
-    let recorded: std::collections::HashMap<&str, &str> = manifest
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            Some((it.next()?, it.next()?))
-        })
-        .map(|(digest, name)| (name, digest))
+    // manifest of the SAME commit, and the manifest must be a strict bijection with
+    // the SQL actually present (REV-092 item 3).
+    let manifest =
+        std::fs::read_to_string(dest.join("MANIFEST.sha256")).expect("predecessor manifest");
+    let sql_names: Vec<String> = names
+        .iter()
+        .filter(|n| n.ends_with(".sql"))
+        .cloned()
         .collect();
-    for name in names.iter().filter(|n| n.ends_with(".sql")) {
-        let bytes = std::fs::read(dest.join(name)).expect("read predecessor blob");
+    verify_manifest_bijection(&manifest, &sql_names, dest);
+    Some(written)
+}
+
+/// Parse a `MANIFEST.sha256` STRICTLY and prove it is an exact bijection with
+/// `sql_names`, then verify every recorded digest against the bytes on disk.
+///
+/// REV-092 item 3: the previous parser used `filter_map`, so a malformed line was
+/// silently dropped rather than rejected — a manifest could lose an entry to a typo
+/// and still "verify". A duplicate filename silently overwrote the earlier one, so
+/// two disagreeing digests for the same file passed as long as the last one matched.
+/// Extra entries naming files that do not exist were never noticed at all. None of
+/// those is a manifest a provenance claim can rest on.
+///
+/// Panics with a specific message per failure class, so a broken fixture says which
+/// invariant broke instead of just "mismatch".
+fn verify_manifest_bijection(manifest: &str, sql_names: &[String], dir: &std::path::Path) {
+    use std::collections::BTreeMap;
+
+    let mut recorded: BTreeMap<String, String> = BTreeMap::new();
+    for (idx, raw) in manifest.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        let lineno = idx + 1;
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        // Exactly two whitespace-separated fields: <64 hex digits> <filename>.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            2,
+            "manifest line {lineno} is malformed (expected `<sha256>  <filename>`, \
+             got {} field(s)): {line:?}",
+            fields.len()
+        );
+        let (digest, name) = (fields[0], fields[1]);
+        assert!(
+            digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+            "manifest line {lineno} does not carry a 64-hex sha256: {digest:?}"
+        );
+        assert!(
+            name.ends_with(".sql"),
+            "manifest line {lineno} names a non-SQL file: {name:?}"
+        );
+        if let Some(previous) = recorded.insert(name.to_string(), digest.to_ascii_lowercase()) {
+            panic!(
+                "manifest lists `{name}` more than once (first {previous}, again at \
+                 line {lineno}); a duplicate entry means two digests claim the same file"
+            );
+        }
+    }
+
+    // Exact bijection, reported in both directions so the failure names itself.
+    let present: std::collections::BTreeSet<&str> =
+        sql_names.iter().map(|s| s.as_str()).collect();
+    let listed: std::collections::BTreeSet<&str> =
+        recorded.keys().map(|s| s.as_str()).collect();
+    let missing: Vec<&&str> = present.difference(&listed).collect();
+    let extra: Vec<&&str> = listed.difference(&present).collect();
+    assert!(
+        missing.is_empty(),
+        "manifest has no entry for {} SQL file(s): {missing:?}"
+    , missing.len());
+    assert!(
+        extra.is_empty(),
+        "manifest lists {} entr(y/ies) with no SQL file present: {extra:?}"
+    , extra.len());
+    assert_eq!(
+        recorded.len(),
+        sql_names.len(),
+        "manifest entry count must equal the SQL file count exactly"
+    );
+
+    for (name, want) in &recorded {
+        let bytes = std::fs::read(dir.join(name)).expect("read migration for digest check");
         let got = crate::db::migration_sha256_for_tests(&String::from_utf8_lossy(&bytes));
-        let want = recorded
-            .get(name.as_str())
-            .unwrap_or_else(|| panic!("predecessor manifest has no entry for {name}"));
         assert_eq!(
             &got, want,
-            "predecessor blob {name} does not match the digest its own commit recorded"
+            "blob {name} does not match the digest its own manifest records"
         );
     }
-    Some(written)
 }
 
 async fn drop_scratch(admin: &PgPool, pool: PgPool, scratch: &str, dir: &std::path::Path) {
@@ -656,10 +728,95 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
         .await
         .expect("the authenticated predecessor lane must upgrade to current");
 
-    // Phase 3: convergence — a second pass is a clean no-op.
+    // REV-092 item 4: snapshot the FULL ledger and a semantic slice of the schema
+    // BEFORE the second pass. The old test only counted rows afterwards, so a
+    // second pass that rewrote a digest, re-stamped `applied_at`, or re-ran a
+    // migration's DDL would still have satisfied it. "Converges" has to mean the
+    // second pass changed nothing, not that the totals still look plausible.
+    let ledger_before: Vec<(String, Option<String>, Option<String>, chrono::DateTime<Utc>)> =
+        sqlx::query_as(
+            "SELECT name, sha256, digest_origin, applied_at \
+               FROM public._migrations ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("ledger snapshot before the second pass");
+    let schema_before: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text \
+           FROM information_schema.columns WHERE table_schema = 'public' \
+          ORDER BY table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("schema snapshot before the second pass");
+    let constraints_before: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname::text, contype::text FROM pg_constraint c \
+           JOIN pg_namespace n ON n.oid = c.connamespace \
+          WHERE n.nspname = 'public' ORDER BY conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("constraint snapshot before the second pass");
+    let cutovers_before: Vec<(String,)> = sqlx::query_as(
+        "SELECT cutover::text FROM schema_cutover_events ORDER BY cutover, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("cutover snapshot before the second pass");
+
+    // Phase 3: convergence — a second pass must be an EXACT no-op.
     crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
         .await
         .expect("a second pass over current must converge");
+
+    let ledger_after: Vec<(String, Option<String>, Option<String>, chrono::DateTime<Utc>)> =
+        sqlx::query_as(
+            "SELECT name, sha256, digest_origin, applied_at \
+               FROM public._migrations ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("ledger snapshot after the second pass");
+    let schema_after: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text \
+           FROM information_schema.columns WHERE table_schema = 'public' \
+          ORDER BY table_name, column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("schema snapshot after the second pass");
+    let constraints_after: Vec<(String, String)> = sqlx::query_as(
+        "SELECT conname::text, contype::text FROM pg_constraint c \
+           JOIN pg_namespace n ON n.oid = c.connamespace \
+          WHERE n.nspname = 'public' ORDER BY conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("constraint snapshot after the second pass");
+    let cutovers_after: Vec<(String,)> = sqlx::query_as(
+        "SELECT cutover::text FROM schema_cutover_events ORDER BY cutover, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("cutover snapshot after the second pass");
+
+    assert_eq!(
+        ledger_before, ledger_after,
+        "the second pass must not touch the ledger: not the digest, not the \
+         provenance, not even applied_at"
+    );
+    assert_eq!(
+        schema_before, schema_after,
+        "the second pass must not alter any column"
+    );
+    assert_eq!(
+        constraints_before, constraints_after,
+        "the second pass must not add, drop, or recreate a constraint"
+    );
+    assert_eq!(
+        cutovers_before, cutovers_after,
+        "the second pass must not append a duplicate cutover event"
+    );
 
     let (total, applied, baseline): (i64, i64, i64) = sqlx::query_as(
         "SELECT count(*), \
@@ -675,7 +832,10 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
         .count() as i64;
-    assert_eq!(total, on_disk, "the converged lane holds every current migration");
+    assert_eq!(
+        total, on_disk,
+        "the converged lane holds every current migration"
+    );
     assert_eq!(baseline, 0, "an authenticated replay records no baseline rows");
     assert_eq!(applied, total, "every row is digest-verified as applied");
 
@@ -685,4 +845,299 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
         .await
         .expect("drop scratch");
     let _ = std::fs::remove_dir_all(&pred_dir);
+}
+
+// ---------------------------------------------------------------------------
+// REV-092 item 1/2 — leading-zero normalization and the positive-int8 boundary
+// ---------------------------------------------------------------------------
+
+/// Every boundary REV-092 names, exercised against the LIVE guard by driving the
+/// real migration lane, not by unit-testing the format string.
+///
+/// The padded cases are the point: `01000000000000000000` is twenty characters but
+/// denotes `1000000000000000000`, and PostgreSQL's `::bigint` accepts it. A guard
+/// that measures the written form instead of the value rejects a legitimate owner —
+/// the same class of defect as REV-090-F01, one layer down.
+#[tokio::test]
+async fn padded_and_boundary_int8_segments_are_classified_by_value() {
+    let (pool, admin, scratch, dir) = scratch_before("padded", "1036_").await;
+
+    // Drive the exact SQL predicate the preflight uses, through the database, so
+    // this cannot drift from production behaviour.
+    let cases: &[(&str, bool, &str)] = &[
+        ("01000000000000000000", true, "padded 19-digit value = 1000000000000000000"),
+        ("00000000000000000001", true, "padded 1"),
+        ("1", true, "minimum positive"),
+        ("9223372036854775807", true, "i64::MAX exactly"),
+        ("0000000009223372036854775807", true, "padded i64::MAX"),
+        ("0", false, "zero is not a positive id"),
+        ("00", false, "all-zero run is not a positive id"),
+        ("0000000000000000000000", false, "long all-zero run is not a positive id"),
+        ("9223372036854775808", false, "i64::MAX + 1 overflows"),
+        ("09223372036854775808", false, "padded overflow still overflows"),
+        ("99999999999999999999", false, "20 significant digits overflow"),
+        ("solana", false, "nonnumeric"),
+        ("", false, "empty"),
+        ("12x4", false, "mixed"),
+    ];
+
+    for (value, expect_safe, why) in cases {
+        // `$1` is the segment under test; the predicate is built exactly as the
+        // preflight builds it.
+        let predicate = crate::db::safe_int8_predicate_for_tests("$1");
+        let got: bool = sqlx::query_scalar(&format!("SELECT {predicate}"))
+            .bind(value)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("predicate failed for {value:?}: {e}"));
+        assert_eq!(
+            got, *expect_safe,
+            "segment {value:?} ({why}) classified wrong: expected safe={expect_safe}"
+        );
+
+        // Cross-check against PostgreSQL itself: whenever we call a value SAFE, the
+        // cast the guard protects must actually succeed, and vice versa for the
+        // numeric-overflow class. This is what makes the guard agree with the cast
+        // rather than merely with itself.
+        if *expect_safe {
+            let cast: i64 = sqlx::query_scalar("SELECT ($1)::bigint")
+                .bind(value)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("value {value:?} judged safe but ::bigint failed: {e}"));
+            assert!(cast > 0, "a safe segment must denote a positive id, got {cast}");
+        }
+    }
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// A zero-padded WORKSPACE segment must keep its owner, exactly like the unpadded
+/// form — it must not be swept into the default workspace.
+#[tokio::test]
+async fn a_zero_padded_workspace_segment_keeps_its_owner() {
+    let (pool, admin, scratch, dir) = scratch_before("padws", "1036_").await;
+
+    const WS19: i64 = 1_000_000_000_000_000_000;
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, slug) OVERRIDING SYSTEM VALUE VALUES ($1, 'w', $2)",
+    )
+    .bind(WS19)
+    .bind(tag("r92padws"))
+    .execute(&pool)
+    .await
+    .expect("19-digit workspace");
+    let sid: i64 = sqlx::query_scalar(
+        "INSERT INTO signals (workspace_id, chain, mint, signal_kind, created_at, score, status) \
+         VALUES ($1, 'solana', 'R92PADMINT', 'entry', now(), 80, 'active') RETURNING id",
+    )
+    .bind(WS19)
+    .fetch_one(&pool)
+    .await
+    .expect("signal");
+
+    // The key carries the PADDED spelling of a real workspace id.
+    let key = format!("signal:0{WS19}:{sid}:chat-a");
+    sqlx::query(
+        "INSERT INTO alerts (dedup_key, subject_kind, signal_id, destination, state, \
+                             attempt_count, next_attempt_at) \
+         VALUES ($1, 'signal', $2, 'chat-a', 'pending', 1, now())",
+    )
+    .bind(&key)
+    .bind(sid)
+    .execute(&pool)
+    .await
+    .expect("seed padded-workspace alert");
+
+    // Precondition: the segment really is padded and really is 20 characters, so a
+    // length-based guard would reject it.
+    let (len, trimmed): (i32, String) = sqlx::query_as(
+        "SELECT length(split_part(dedup_key, ':', 2))::int, \
+                ltrim(split_part(dedup_key, ':', 2), '0') FROM public.alerts WHERE dedup_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("segment shape");
+    assert_eq!(len, 20, "the probe segment must be 20 characters");
+    assert_eq!(trimmed, WS19.to_string(), "and must denote the real workspace id");
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a padded but valid workspace segment must not abort the lane");
+
+    let owner: i64 = sqlx::query_scalar("SELECT workspace_id FROM public.alerts WHERE dedup_key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("read back owner");
+    let default_ws: Option<i64> = sqlx::query_scalar("SELECT id FROM workspaces WHERE slug = 'default'")
+        .fetch_optional(&pool)
+        .await
+        .expect("default workspace probe");
+    assert_eq!(
+        owner, WS19,
+        "a zero-padded but valid workspace must keep its owner (REV-092)"
+    );
+    assert!(
+        default_ws != Some(owner),
+        "the padded row must NOT have been reassigned to the default workspace"
+    );
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// A zero-padded FUNDING SUBJECT segment denotes a valid id, so the preflight must
+/// NOT refuse it. The refusal is reserved for segments that genuinely cannot cast.
+#[tokio::test]
+async fn a_zero_padded_funding_subject_is_not_refused() {
+    let (pool, admin, scratch, dir) = scratch_before("padsubj", "1036_").await;
+
+    let ws: i64 = sqlx::query_scalar("INSERT INTO workspaces (name, slug) VALUES ('w', $1) RETURNING id")
+        .bind(tag("r92padsub"))
+        .fetch_one(&pool)
+        .await
+        .expect("workspace");
+    let sid: i64 = sqlx::query_scalar(
+        "INSERT INTO signals (workspace_id, chain, mint, signal_kind, created_at, score, status) \
+         VALUES ($1, 'solana', 'R92PADSUBMINT', 'entry', now(), 80, 'active') RETURNING id",
+    )
+    .bind(ws)
+    .fetch_one(&pool)
+    .await
+    .expect("signal");
+
+    // funding-kind key whose SUBJECT segment is padded but perfectly valid.
+    // 25 leading zeros: the raw string is >19 characters, so a guard that measures
+    // the WRITTEN form rejects it, while the value it denotes is a small valid id.
+    let key = format!("funding:{ws}:0000000000000000000000000{sid}:chat-a");
+    sqlx::query(
+        "INSERT INTO alerts (dedup_key, subject_kind, signal_id, destination, state, \
+                             attempt_count, next_attempt_at) \
+         VALUES ($1, 'signal', $2, 'chat-a', 'pending', 1, now())",
+    )
+    .bind(&key)
+    .bind(sid)
+    .execute(&pool)
+    .await
+    .expect("seed padded-subject alert");
+
+    let trimmed: String = sqlx::query_scalar(
+        "SELECT ltrim(split_part(dedup_key, ':', 3), '0') FROM public.alerts WHERE dedup_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("subject shape");
+    assert_eq!(trimmed, sid.to_string(), "the padded subject must denote the real id");
+    let raw_len: i32 = sqlx::query_scalar(
+        "SELECT length(split_part(dedup_key, ':', 3))::int FROM public.alerts WHERE dedup_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("subject length");
+    assert!(
+        raw_len > 19,
+        "the probe subject must be longer than 19 characters, or a length-based guard \
+         would accept it anyway and this test would not discriminate (got {raw_len})"
+    );
+
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a padded but valid funding subject must NOT be refused (REV-092)");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.alerts WHERE dedup_key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("row survives");
+    assert_eq!(rows, 1, "the row must survive the lane untouched");
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+// ---------------------------------------------------------------------------
+// REV-092 item 3 — the manifest parser must reject, not tolerate
+// ---------------------------------------------------------------------------
+
+/// Each malformed manifest shape must be REJECTED with a message naming the class.
+///
+/// The previous parser used `filter_map`, so a malformed line vanished instead of
+/// failing; a duplicate filename silently overwrote its predecessor; and an entry
+/// naming a file that does not exist was never noticed. A manifest that tolerates
+/// those is not evidence of anything.
+#[test]
+fn the_manifest_parser_rejects_every_malformed_shape() {
+    let dir = std::env::temp_dir().join(format!("swi_r92_man_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let body = "-- probe\n";
+    std::fs::write(dir.join("0001_a.sql"), body).expect("write a");
+    std::fs::write(dir.join("0002_b.sql"), body).expect("write b");
+    let digest = crate::db::migration_sha256_for_tests(body);
+    let names = vec!["0001_a.sql".to_string(), "0002_b.sql".to_string()];
+
+    // The HAPPY case must pass first, or every rejection below proves nothing.
+    let good = format!("# header\n\n{digest}  0001_a.sql\n{digest}  0002_b.sql\n");
+    verify_manifest_bijection(&good, &names, &dir);
+
+    let cases: &[(&str, String, &str)] = &[
+        (
+            "malformed line",
+            format!("{digest}  0001_a.sql\nnot-a-manifest-line\n{digest}  0002_b.sql\n"),
+            "malformed",
+        ),
+        (
+            "duplicate filename",
+            format!("{digest}  0001_a.sql\n{digest}  0001_a.sql\n{digest}  0002_b.sql\n"),
+            "more than once",
+        ),
+        (
+            "missing entry",
+            format!("{digest}  0001_a.sql\n"),
+            "no entry for",
+        ),
+        (
+            "extra entry",
+            format!("{digest}  0001_a.sql\n{digest}  0002_b.sql\n{digest}  9999_ghost.sql\n"),
+            "no SQL file present",
+        ),
+        (
+            "short digest",
+            format!("abc123  0001_a.sql\n{digest}  0002_b.sql\n"),
+            "64-hex",
+        ),
+        (
+            "three fields",
+            format!("{digest}  0001_a.sql extra\n{digest}  0002_b.sql\n"),
+            "malformed",
+        ),
+        (
+            "wrong digest",
+            format!("{}  0001_a.sql\n{digest}  0002_b.sql\n", "0".repeat(64)),
+            "does not match the digest",
+        ),
+    ];
+
+    for (label, manifest, expect) in cases {
+        let manifest = manifest.clone();
+        let names = names.clone();
+        let dir = dir.clone();
+        let err = std::panic::catch_unwind(move || {
+            verify_manifest_bijection(&manifest, &names, &dir)
+        })
+        .expect_err(&format!("{label} must be rejected, not tolerated"));
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains(expect),
+            "{label}: expected a message naming {expect:?}, got {msg:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

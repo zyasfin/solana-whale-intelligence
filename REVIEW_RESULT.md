@@ -103,6 +103,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-089 | 2026-09-08 | independent verification of REV-088 + versioned migration artifact | APPROVED / REV-088 F01â€“F06 ACCEPTED | full PG 487/487; fresh packaged migration 52/52; focused adversarial probes PASS |
 | REV-090 | 2026-09-08 | correction after late independent dissent on REV-089 F01 | CHANGES REQUIRED / PARTIAL | F02â€“F06 accepted; F01 int8/control-flow/provenance gaps open |
 | REV-091 | 2026-09-08 | implementation of REV-090-F01 only (exact positive-int8 segment validation, independent funding-subject check before the repair decision, authenticated content-addressed predecessor replay, resolver comment corrected to packaged-canonical order) | READY FOR REVIEW | 369/369 + 490/490 (487 + 3 new); 4/4 Rust 1.89 gates 0 warning; unique serial disposable DB, 52\|52\|0, baseline 0; all three sub-issues RED→GREEN incl. valid 19-digit owner preserved and named refusal before any DDL |
+| REV-092 | 2026-09-08 | corrective for the independent review of REV-091 (leading-zero normalization before length/range so padded ids are judged by value, all-zero rejected as non-positive, strict manifest bijection parser, convergence test on the packaged bundle with ledger/schema/constraint/cutover snapshot around an exact-no-op second pass, stale resolver error text) | READY FOR REVIEW | 369/369 + 494/494 (490 + 4 new); check gates 0 warning; disposable DB 52\|52\|0 baseline 0, resolver readback `migrations`; 7 focused tests each `running 1 test`; 6 RED→GREEN incl. padded owner preserved and lax parser rejected; `fmt --check` fails PRE-EXISTING (84/84 files unformatted at base, unchanged by this round) |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 
 ---
@@ -14613,6 +14614,124 @@ Tiap probe dijalankan dengan fix DILEPAS lebih dulu; source dipulihkan setelahny
 - Provenance yang dibuktikan bersifat content-addressed terhadap riwayat git repositori INI. Bila object database dipalsukan seluruhnya, fixture tidak dapat mendeteksinya; jaminan yang lebih kuat memerlukan signed tag atau artifact eksternal.
 - Predecessor commit `a60647d` adalah commit packaging pertama; tidak ada riwayat migration yang lebih awal di git karena sebelumnya file berada di luar repo. Jadi ini predecessor terautentikasi paling awal yang tersedia, bukan asal-usul historis penuh.
 - `1000000000000000000` dipakai sebagai nilai batas 19 digit; rentang penuh sampai `9223372036854775807` dijamin oleh predikat, bukan dienumerasi oleh test.
+- Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+
+---
+
+## REV-092 — Implementasi corrective atas independent review REV-091
+
+**Tanggal:** 2026-09-08
+**Mode:** implementation; Rust 1.89.0; PostgreSQL 17.11 (localhost, disposable `swi_r92_full_163603`)
+**Base:** `7c2e41f`
+**Scope:** lima item hasil independent review REV-091. Tidak ada shipped migration SQL yang diedit; tidak ada REV historis yang ditulis ulang.
+
+### Ringkasan
+
+Reviewer benar pada kelimanya. Item 1 adalah pengulangan pola yang sama untuk ketiga kalinya: guard mengukur BENTUK TERTULIS, bukan NILAI. `^[0-9]+$` menerima overflow; `^[0-9]{1,18}$` menolak 19 digit yang sah; dan REV-091 masih mengukur panjang string mentah, sehingga `01000000000000000000` — dua puluh karakter, tetapi bernilai `1000000000000000000` dan diterima `::bigint` — ditolak lagi. Normalisasi leading zero menutup kelasnya, bukan kasusnya.
+
+### Per-item
+
+#### 1 — CLOSED — normalisasi leading zero sebelum cek panjang/range
+
+**Root cause:** predikat mengukur `length(expr)` atas string mentah. Padding nol mengubah panjang tanpa mengubah nilai, jadi id sah dengan padding diklasifikasikan tidak aman dan pemiliknya dipindahkan ke default workspace — persis kelas kerusakan REV-090-F01, satu lapis lebih dalam.
+
+**Fix:** `ltrim(expr, '0')` dijalankan LEBIH DULU, lalu panjang dan range diukur atas hasilnya. Semantik ini sengaja disamakan dengan `::bigint` PostgreSQL, yang juga mengabaikan padding — sebuah guard yang tidak setuju dengan cast yang dilindunginya bukan guard.
+
+- positif wajib: all-zero run menormalisasi ke string kosong dan ditolak (`0`, `00`, `0000…`). Setiap id yang dijaga (`workspaces.id`, `funding_radar_cases.id`) adalah identity/bigserial yang mulai dari 1, jadi nol tidak pernah pemilik nyata;
+- valid sampai `9223372036854775807` inklusif;
+- overflow tetap fail-closed: >19 digit signifikan, atau tepat 19 digit di atas `i64::MAX`. Perbandingan tetap string-vs-string pada panjang sama (urutan leksikografis = urutan numerik), jadi tidak ada trial cast yang justru bisa memicu 22003 saat memutuskan apakah 22003 mungkin.
+
+**Tiga caller memakai helper yang sama** — tidak ada duplikasi predikat: `src/db.rs:344` (workspace segment), `:345` (funding subject segment), `:665` (join rekey identitas alert).
+
+**Lokasi:** `src/db.rs:268-315`
+
+#### 2 — CLOSED — live PostgreSQL regressions untuk seluruh boundary
+
+Tabel boundary dijalankan lewat database sungguhan memakai predikat yang dibangun produksi (`safe_int8_predicate_for_tests`), bukan format string yang ditulis ulang di test. Untuk setiap nilai yang disebut AMAN, test juga menjalankan `($1)::bigint` sungguhan dan menuntut hasilnya positif — inilah yang memaksa guard setuju dengan cast, bukan dengan dirinya sendiri.
+
+Kasus wajib yang diminta reviewer, seluruhnya hijau: `01000000000000000000` valid (= `1000000000000000000`), `00000000000000000001` valid (= 1), `0` dan `00` invalid, `9223372036854775807` valid, `9223372036854775808` invalid. Ditambah: padded `i64::MAX`, padded overflow, 20 digit signifikan, nonnumerik, string kosong, campuran.
+
+Dua regression lane-level memakai migrator sungguhan: padded workspace TIDAK dipindahkan ke default, dan padded funding subject TIDAK ditolak. Keduanya menegaskan prekondisi lebih dulu (panjang mentah dan nilai hasil trim) supaya tidak lulus karena alasan yang salah — subject probe memakai 25 nol sehingga string mentahnya >19 karakter, tanpa itu guard berbasis panjang akan menerimanya dan test tidak mendiskriminasi apa pun.
+
+**Lokasi:** `src/rev087_migration_integrity_pg_tests.rs:856-1050`
+
+#### 3 — CLOSED — parser manifest predecessor diperketat
+
+**Root cause:** parser memakai `filter_map`, jadi baris malformed lenyap alih-alih ditolak; nama file duplikat diam-diam menimpa pendahulunya sehingga dua digest yang bertentangan lolos asal yang terakhir cocok; dan entry yang menamai file tidak ada tidak pernah diperiksa.
+
+**Fix:** `verify_manifest_bijection` menolak per kelas dengan pesan spesifik: baris malformed (bukan tepat dua field), digest bukan 64 hex, nama bukan `.sql`, filename duplikat, entry hilang, entry berlebih, dan digest tidak cocok. Bijeksi SQL↔️manifest ditegakkan dua arah plus kesetaraan jumlah.
+
+**Lokasi:** `src/rev087_migration_integrity_pg_tests.rs:152-229`
+
+#### 4 — CLOSED — convergence memakai packaged bundle + snapshot sebelum pass kedua
+
+**Root cause dua bagian:** (a) `migrations_dir()` mengembalikan sibling `swi-deploy/migrations`, bukan packaged `CARGO_MANIFEST_DIR/migrations` yang dipilih resolver produksi — jadi SELURUH modul ini menegaskan sesuatu atas byte yang bukan pilihan produksi; (b) convergence hanya menghitung baris SETELAH pass kedua, sehingga pass kedua yang menulis ulang digest, men-stempel ulang `applied_at`, atau menjalankan ulang DDL tetap lolos.
+
+**Fix:** `migrations_dir()` menunjuk packaged bundle. Sebelum pass kedua, di-snapshot: ledger penuh (`name, sha256, digest_origin, applied_at`), seluruh kolom `information_schema.columns`, seluruh constraint `pg_constraint`, dan seluruh baris `schema_cutover_events`. Keempatnya dibandingkan persis setelahnya — "konvergen" kini berarti pass kedua tidak mengubah apa pun.
+
+**Lokasi:** `src/rev087_migration_integrity_pg_tests.rs:22-32`, `:730-839`
+
+#### 5 — CLOSED — teks error resolver
+
+**Root cause:** pesan `resolve_migration_dir` masih menyuruh operator menunjuk `SWI_MIGRATIONS_DIR` ke "canonical location (swi-deploy/migrations)" — nasihat yang salah sejak `a60647d`, dan bertentangan dengan komentar kandidat yang sudah diperbaiki REV-091.
+
+**Fix:** pesan menyatakan packaged `migrations/` sebagai canonical, sibling sebagai fallback legacy, dan `SWI_MIGRATIONS_DIR` sebagai override keduanya.
+
+**Lokasi:** `src/db.rs:150-161`
+
+### Gates
+
+```text
+Rust                                                            1.89.0
+PostgreSQL                                                      17.11 (localhost)
+cargo +1.89.0 fmt --check                                       FAIL (pra-ada; lihat batas klaim)
+cargo +1.89.0 check --locked --all-targets                      PASS (0 warnings)
+cargo +1.89.0 check --locked --features pg_tests --all-targets  PASS (0 warnings)
+cargo +1.89.0 test --locked                                     PASS 369/369
+cargo +1.89.0 test --locked --features pg_tests -- --test-threads=1   PASS 494/494
+disposable DB (unique, serial)                                  swi_r92_full_163603
+db migrate / db status                                          rc 0 / schema current; digest-verified
+resolver readback                                               migrations_dir=migrations (packaged)
+_migrations | applied | baseline                                52 | 52 | 0
+alerts_funding_case_workspace_fk                                1
+DB hadir sebelum DAN sesudah lane                               PASS
+```
+
+Focused, masing-masing `running 1 test`, semuanya PASS:
+
+```text
+padded_and_boundary_int8_segments_are_classified_by_value
+a_zero_padded_workspace_segment_keeps_its_owner
+a_zero_padded_funding_subject_is_not_refused
+the_manifest_parser_rejects_every_malformed_shape
+an_authenticated_predecessor_bundle_converges_to_current
+a_valid_nineteen_digit_workspace_segment_keeps_its_owner
+a_corrupt_funding_subject_segment_is_refused_before_any_ddl
+```
+
+### RED→GREEN probes
+
+| Item | Probe | RED | GREEN |
+|---|---|---|---|
+| 1 padding | `ltrim` dihapus dari helper | FAILED — `left: false` untuk `01000000000000000000` | PASS |
+| 1 padding (lane) | idem, lewat migrator sungguhan | FAILED — `left: 1`, pemilik padded dipindah ke default workspace | PASS |
+| 1 padding (subject) | idem, subject 25 nol | FAILED — subject padded yang sah ditolak preflight | PASS |
+| 1 positif | syarat `<> ''` dilonggarkan | FAILED — `left: true` untuk `0` | PASS |
+| 3 parser | parser `filter_map` permisif dikembalikan | FAILED — `malformed line must be rejected, not tolerated` | PASS |
+| 4 no-op | pass kedua dibuat men-stempel ulang `applied_at` | FAILED — snapshot ledger berbeda | PASS |
+
+### Yang TIDAK saya klaim
+
+- Tidak ada self-approval: verdict **READY FOR REVIEW**.
+- **`cargo +1.89.0 fmt --check` GAGAL, dan kegagalan itu PRA-ADA.** `rustfmt` belum terpasang untuk toolchain 1.89.0 di host ini (saya pasang lewat `rustup component add`), dan setelah terpasang 84 dari 84 file sumber melaporkan diff — repositori ini tampaknya belum pernah di-rustfmt. Dua file yang saya sentuh termasuk di dalamnya. Saya TIDAK memformat ulang 84 file yang tidak berkaitan di dalam corrective ini; itu diff besar yang menyamarkan perubahan REV-092 dan tidak diminta. Hitungan diff sebelum dan sesudah perubahan saya sama-sama 84 file, jadi saya tidak menambah kegagalan baru. Memformat seluruh repo layak jadi commit tersendiri.
+- **RED untuk item 4 bagian direktori tidak dapat ditunjukkan hari ini.** Bundle packaged dan sibling saat ini byte-identical (53 file, 0 selisih setelah normalisasi LF), jadi menunjuk sibling tidak punya efek teramati sekarang. Perbaikan ini mencegah drift SENYAP di masa depan; buktinya adalah kesetaraan byte yang saya ukur, bukan sebuah test yang gagal. Bagian snapshot no-op dari item 4 TERBUKTI RED→GREEN secara terpisah.
+- Rentang penuh sampai `9223372036854775807` dijamin oleh predikat, bukan dienumerasi oleh test; test menutup batas-batasnya (`1`, `i64::MAX`, `i64::MAX + 1`, bentuk padded masing-masing).
+- Provenance tetap content-addressed terhadap riwayat git repositori INI; object database yang dipalsukan seluruhnya tidak terdeteksi.
+- Dua rekomendasi REV-090 masih terbuka dan di luar scope corrective ini: regression dual-error CLI untuk F05, dan regression cabang penolakan F06 sebelum wiring produksi.
 - Tidak ada perubahan pada pure-information boundary (REV-048/049/051).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
