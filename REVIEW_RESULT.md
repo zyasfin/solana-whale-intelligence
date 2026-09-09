@@ -119,6 +119,9 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-104 | 2026-09-09 | independent verification of REV-103 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 523/523; `db status` authority bypass reproduced |
 | REV-105 | 2026-09-09 | implementasi corrective REV-104 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 525/525 serial; RED->GREEN 2/2; probe real-binary 4/4; pred 580198a rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane rc=0; residu 0 |
 | REV-106 | 2026-09-09 | independent verification of REV-105 | CHANGES REQUIRED / BLOCKED | source PASS; Rust/PG gates PASS; migration lane unavailable; reviewer cleanup recovered |
+| REV-107 | 2026-09-09 | evidence remediation for REV-106 migration/provenance lane | READY FOR REVIEW | source unchanged; fresh/idempotent/predecessor upgrade PASS; residue 0 |
+| REV-108 | 2026-09-09 | independent verification of REV-107 | APPROVED / REV-106 BLOCKED evidence closed | 3/3 lanes; default 369/369; pg_tests 525/525; predecessor upgrade + residue PASS |
+
 
 
 
@@ -16867,3 +16870,56 @@ untracked                                                                  WORKE
 ```
 
 **Verdict: READY FOR REVIEW.**
+
+
+---
+
+## REV-108 - Independent verification of REV-107
+
+**Tanggal:** 2026-09-09
+**Mode:** automatic independent review; three isolated Hermes lanes plus synthesizer
+**Target:** `3d3f6515a69b9bafcff28e6ee84ada16cbb8a610` (REV-107)
+**Against:** `03ebf5e97e1584cffccf9b153f9a213b571af98a` (REV-106)
+**Tree:** tracked clean; only `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**APPROVED.** REV-107 closes the missing migration/provenance evidence from REV-106. No product/source change was required.
+
+### Acceptance
+
+- REV-104-F01 collation authority: PASS. `db status` and migrator both fail closed on nondeterministic collation + byte-distinct `APPLIED`.
+- REV-104-F02 inheritance authority: PASS. `db status` and migrator both fail closed on descendant ledger + `NO INHERIT`.
+- Migration immutability/provenance: PASS. 54 SQL, 54 manifest entries, zero mismatch/orphan/raw drift.
+- Fresh production migrate/status/idempotent: PASS.
+- Authenticated predecessor upgrade: PASS, ledger `54|54|54|0`.
+- Embedded package/override authority: PASS.
+
+### Independent gates
+
+```text
+Rust/Cargo 1.89.0
+cargo check default                    PASS
+cargo check pg_tests                   PASS
+default suite                          369/369
+full PG serial                         525/525
+REV-105 authority focused              2/2 exact
+migration focused                      5/5 exact
+production build                       PASS rc=0
+fresh migrate/status/idempotent        PASS rc=0
+predecessor -> HEAD                     PASS
+```
+
+### Cleanup
+
+```text
+reviewer DB residue                    0
+custom PostgreSQL root/listener        0
+reviewer temp/artifact                 0
+HEAD/local/master/bare                 unchanged at 3d3f651...
+tracked diff                           empty
+```
+
+The independent review discovered that a prior cleanup claim was false: a custom PostgreSQL cluster on port 55432 remained. REV-107 stopped it and removed its data directory; the final review independently confirmed zero nonstandard PostgreSQL processes/listeners and zero reviewer-owned database/temp residue.
+
+**Verdict: APPROVED.** Pure-information release-candidate preparation may proceed. Deferred LP/execution/AUTO_BOUNDED scope remains outside this approval.
