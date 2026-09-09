@@ -1075,6 +1075,141 @@ async fn digest_origin_check_is_canonical(
     Ok(installed == canonical)
 }
 
+/// The provenances the ledger's trust model defines, byte-for-byte.
+const LEGAL_DIGEST_ORIGINS: [&str; 2] = ["applied", "baseline"];
+
+/// Assert that the ledger's provenance domain is what it claims to be.
+///
+/// `digest_origin IN ('applied', 'baseline')` is only a statement about VALUES if
+/// two things hold, and REV-102 reproduced a bypass of each on 17.11:
+///
+///   * F01 — equality is collation-defined. Under a NONDETERMINISTIC collation
+///     (`CREATE COLLATION ... (provider = icu, deterministic = false)`) the
+///     server's `=` is a locale match, so `APPLIED` satisfies the canonical
+///     predicate, passes validation, and is then read back by every ledger scan
+///     as a provenance this binary never writes. The expression comparison in
+///     [`digest_origin_check_is_canonical`] cannot see this: the deparsed text is
+///     identical, the difference lives in `pg_attribute.attcollation`. So the
+///     column's collation must be DETERMINISTIC, and the rows are additionally
+///     checked BYTEWISE (`convert_to(..., 'UTF8')` compares `bytea`, which has no
+///     collation) rather than with `=`.
+///
+///   * F02 — a CHECK constrains one relation. `ALTER TABLE ... ADD CONSTRAINT
+///     ... NO INHERIT` leaves the predicate uncopied to children, and a child
+///     created with `INHERITS (public._migrations)` contributes its rows to every
+///     unqualified scan of the parent — including this migrator's and
+///     [`ensure_schema_current`]'s. A rogue provenance is then simultaneously
+///     ledger truth and outside the constraint that defines ledger truth. The
+///     ledger is a singular authority by construction, so ANY descendant is
+///     rejected, and the constraint is required to be inheritable so that a
+///     descendant cannot later be created outside it.
+///
+/// Read-only and cheap: three catalog queries and one bounded row scan. Runs
+/// before the constraint gate and before any migration SQL, so a bypassed ledger
+/// fails closed with a diagnosis rather than with a bare `23514`.
+async fn assert_ledger_provenance_authority(pool: &PgPool) -> Result<()> {
+    let nondeterministic: Option<String> = sqlx::query_scalar(
+        "SELECT c.collname FROM pg_attribute a \
+           JOIN pg_collation c ON c.oid = a.attcollation \
+          WHERE a.attrelid = 'public._migrations'::regclass \
+            AND a.attname = 'digest_origin' \
+            AND NOT c.collisdeterministic",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("failed to inspect the collation of the ledger's digest_origin column")?;
+    if let Some(collname) = nondeterministic {
+        anyhow::bail!(
+            "the migration ledger's `digest_origin` column uses the nondeterministic \
+             collation `{collname}`. Equality under a nondeterministic collation is a \
+             locale match, not a byte match, so values such as `APPLIED` satisfy the \
+             canonical provenance CHECK while being provenances this binary never \
+             writes. Give the column a deterministic collation (`ALTER TABLE \
+             public._migrations ALTER COLUMN digest_origin TYPE text COLLATE \"C\"`) \
+             before migrating"
+        );
+    }
+
+    let descendants: Vec<String> = sqlx::query_scalar(
+        "SELECT c.oid::regclass::text FROM pg_inherits i \
+           JOIN pg_class c ON c.oid = i.inhrelid \
+          WHERE i.inhparent = 'public._migrations'::regclass \
+          ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to inspect the migration ledger for descendant tables")?;
+    if !descendants.is_empty() {
+        anyhow::bail!(
+            "the migration ledger `public._migrations` has descendant table(s) {}. \
+             Rows of a descendant are returned by every scan of the ledger while being \
+             governed by the descendant's own constraints, so they can carry a \
+             provenance the ledger's CHECK forbids. The ledger is a single authority: \
+             detach or drop the descendant(s) before migrating",
+            descendants.join(", ")
+        );
+    }
+
+    let noinherit: Option<bool> = sqlx::query_scalar(
+        "SELECT connoinherit FROM pg_constraint \
+          WHERE conname = '_migrations_digest_origin_check' \
+            AND conrelid = 'public._migrations'::regclass AND contype = 'c'",
+    )
+    .fetch_optional(pool)
+    .await
+    .context("failed to inspect the inheritability of the ledger provenance CHECK")?;
+    if noinherit == Some(true) {
+        anyhow::bail!(
+            "the migration ledger's `_migrations_digest_origin_check` is declared \
+             NO INHERIT, so any table created with `INHERITS (public._migrations)` \
+             would contribute rows to the ledger without being bound by it. Recreate \
+             the constraint without NO INHERIT before migrating"
+        );
+    }
+
+    Ok(())
+}
+
+/// Assert that every provenance already in the ledger is one this migrator writes,
+/// compared BYTEWISE.
+///
+/// Separate from [`assert_ledger_provenance_authority`] because it runs AFTER the
+/// constraint gate: a ledger whose CHECK is forged or unvalidated must be reported
+/// as a forged CHECK — that is the defect the operator has to reconcile — and only
+/// once the predicate is known to be the canonical one does the content of the rows
+/// become the remaining question. `convert_to` yields `bytea`, whose equality is
+/// byte equality by definition, so this answers the same way under every collation
+/// (REV-102-F01) and it reads through the parent, so it also covers rows a
+/// descendant would contribute (REV-102-F02) had one been permitted at all.
+async fn assert_ledger_provenance_values(pool: &PgPool) -> Result<()> {
+    let illegal: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, digest_origin FROM public._migrations \
+          WHERE digest_origin IS NOT NULL \
+            AND convert_to(digest_origin, 'UTF8') \
+                <> ALL (SELECT convert_to(v, 'UTF8') FROM unnest($1::text[]) AS v) \
+          ORDER BY name",
+    )
+    .bind(LEGAL_DIGEST_ORIGINS.to_vec())
+    .fetch_all(pool)
+    .await
+    .context("failed to scan the migration ledger for out-of-domain provenance values")?;
+    if !illegal.is_empty() {
+        let listed = illegal
+            .iter()
+            .map(|(name, origin)| format!("`{name}` = `{origin}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "the migration ledger carries provenance value(s) outside its trust model: \
+             {listed}. Only `applied` and `baseline` (byte-exact) describe how a digest \
+             was obtained; anything else was written by something other than this \
+             migrator and must be reconciled deliberately"
+        );
+    }
+
+    Ok(())
+}
+
 /// Apply an already-VALIDATED [`MigrationBundle`].
 ///
 /// REV-087 item 7: tests used to point the migrator at a reduced migration set by
@@ -1158,6 +1293,12 @@ pub async fn migrate_bundle_with(
     sqlx::query("ALTER TABLE public._migrations ADD COLUMN IF NOT EXISTS digest_origin text")
         .execute(pool)
         .await?;
+    // REV-102-F01/F02: the CHECK is only authority over the values it can
+    // actually distinguish, on the rows it actually covers. Both assumptions were
+    // false, and both are catalog properties the expression comparison below
+    // cannot see. Verified before the constraint gate so the diagnosis names the
+    // real defect instead of a bare 23514 from `ADD CONSTRAINT`.
+    assert_ledger_provenance_authority(pool).await?;
     // REV-093-F03: this used to be an unconditional
     // `DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` on EVERY migrate pass. Two
     // consequences, both real:
@@ -1193,6 +1334,10 @@ pub async fn migrate_bundle_with(
         .await?;
         match existing {
             None => {
+                // Before installing it: `ADD CONSTRAINT` over an out-of-domain row
+                // fails with a bare `23514 ... is violated by some row`, which names
+                // neither the row nor the value. Diagnose first.
+                assert_ledger_provenance_values(pool).await?;
                 sqlx::raw_sql(&format!(
                     "ALTER TABLE public._migrations \
                        ADD CONSTRAINT {DIGEST_ORIGIN_CHECK} {DIGEST_ORIGIN_EXPR}"
@@ -1221,6 +1366,11 @@ pub async fn migrate_bundle_with(
                          would silently widen the ledger's trust model; reconcile deliberately"
                     );
                 }
+                // Only once the predicate is known canonical does the content of
+                // the rows become the remaining question (REV-102-F01): a
+                // nondeterministic collation admitted values that are byte-distinct
+                // from every provenance this migrator writes.
+                assert_ledger_provenance_values(pool).await?;
             }
         }
         tx.commit().await?;

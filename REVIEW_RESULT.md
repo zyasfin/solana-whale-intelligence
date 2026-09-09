@@ -115,6 +115,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-100 | 2026-09-09 | independent verification of REV-099 | CHANGES REQUIRED / NOT APPROVED | F01/F03/F04 accepted; F02 CHECK NOT VALID bypass reproduced; fresh PG/manifest gates pass |
 | REV-101 | 2026-09-09 | implementasi corrective REV-100 F01-F02 | READY FOR REVIEW | default 369/369; pg_tests 518/518; RED->GREEN 2/2; focused 6/6; readback 54\|54\|54; residu 0 |
 | REV-102 | 2026-09-09 | independent verification of REV-101 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 518/518; collation + NO INHERIT bypass reproduced |
+| REV-103 | 2026-09-09 | implementasi corrective REV-102 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 523/523; RED->GREEN 3/3 + 2 counterpart; pred 28e477d rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane 54\|54; residu 0 |
 
 ---
 
@@ -16155,3 +16156,236 @@ tracked diff                             empty
 ```
 
 **Verdict: CHANGES REQUIRED / NOT APPROVED.**
+
+## REV-103 — Implementasi corrective atas independent review REV-102
+
+**Tanggal:** 2026-09-09
+**Mode:** OMP corrective session; satu integration owner, dua scout read-only paralel
+**Base:** `73156210bad89ca1eabf8b4c95ea7debe49c2b88` (REV-102)
+**Implementasi yang direview:** `28e477d38fe42d7d9ff87018de14667118c43719` (REV-101)
+**Tree saat mulai:** tracked clean; hanya `WORKER_COMMAND_REV094.md` untracked
+
+### Temuan yang belum diimplementasikan saat mulai
+
+Keduanya OPEN, dikonfirmasi dari source, bukan dari verdict line: grep
+`pg_inherits|attcollation|pg_collation|connoinherit|COLLATE` di `src/`, `tests/`,
+`migrations/`, `build.rs` mengembalikan NOL match. Seluruh permukaan katalog yang
+dituntut REV-102 memang belum ada.
+
+### REV-102-F01 — semantik provenance bergantung collation
+
+**Lokasi:** `src/db.rs`, `assert_ledger_provenance_authority` (baru) dan
+`assert_ledger_provenance_values` (baru).
+
+**Perilaku lama:** `digest_origin_check_is_canonical` membandingkan deparse
+`pg_get_expr` dan mensyaratkan `convalidated`. Keduanya benar tetapi keduanya
+adalah pernyataan tentang EKSPRESI. `digest_origin IN ('applied','baseline')`
+adalah uji kesetaraan, dan kesetaraan di PostgreSQL didefinisikan oleh COLLATION
+kolom, bukan oleh byte. Dengan kolom bercollation ICU nondeterministik
+(`provider = icu, locale = 'und-u-ks-level2', deterministic = false`), nilai
+`APPLIED` memenuhi predikat kanonik, lolos VALIDATE, dan kemudian dibaca kembali
+oleh setiap scan ledger sebagai provenance yang biner ini tidak pernah tulis.
+Perbedaannya hidup di `pg_attribute.attcollation`; deparse kedua sisi identik,
+jadi perbandingan ekspresi buta terhadapnya secara struktural.
+
+**Perilaku baru:** dua mekanisme, keduanya sebelum SQL migrasi apa pun.
+
+1. Gate collation: `pg_attribute` JOIN `pg_collation` pada kolom `digest_origin`
+   relasi `public._migrations`; bila `NOT collisdeterministic` → `bail!` yang
+   menyebut nama collation dan memberi perintah remediasi.
+2. Scan baris BYTEWISE: `convert_to(digest_origin,'UTF8') <> ALL (SELECT
+   convert_to(v,'UTF8') FROM unnest($1::text[]) AS v)` dengan
+   `LEGAL_DIGEST_ORIGINS = ["applied","baseline"]`. `convert_to` menghasilkan
+   `bytea`, yang kesetaraannya adalah kesetaraan byte menurut definisi — jawaban
+   query ini sama di bawah setiap collation, termasuk collation yang belum ada.
+
+**Mengapa otoritatif:** gate (1) menutup bentuk yang masih bisa dipasang; scan (2)
+menutup baris yang SUDAH terlanjur masuk — operator yang mengembalikan kolom ke
+collation deterministik tetap menyimpan baris yang diterima saat collation itu
+belum deterministik. Satu saja tidak cukup; itulah sebabnya keduanya ada, dan
+masing-masing punya test yang gagal tanpa mekanismenya.
+
+**Urutan:** scan baris dipanggil DI DALAM constraint gate, bukan sebelumnya. Pada
+cabang `None` ia mendahului `ADD CONSTRAINT` (kalau tidak, PostgreSQL menjawab
+dengan `23514 ... is violated by some row` yang tidak menyebut baris maupun
+nilai); pada cabang `Some` ia menyusul verdict kanonikalitas, sehingga ledger
+dengan CHECK palsu tetap dilaporkan sebagai CHECK palsu. Percobaan pertama
+menempatkan scan sebelum gate dan itu MEMATAHKAN
+`rev101::a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator`
+(`the failure must name the ledger CHECK, got: ... outside its trust model`) —
+regresi diagnosis yang nyata, tertangkap oleh lane PG penuh, lalu diperbaiki.
+
+### REV-102-F02 — NO INHERIT / baris turunan melewati otoritas ledger
+
+**Lokasi:** `src/db.rs`, `assert_ledger_provenance_authority`.
+
+**Perilaku lama:** CHECK membatasi SATU relasi. `ADD CONSTRAINT ... NO INHERIT`
+tidak menurunkan predikat ke anak, dan tabel yang dibuat dengan
+`INHERITS (public._migrations)` menyumbang barisnya ke SETIAP scan tak-terkualifikasi
+atas induk — termasuk scan migrator ini dan `ensure_schema_current`
+(`src/db.rs:1533`, `:1537`, `baseline_migrations` `:1675-1679`). Provenance `rogue`
+karena itu sekaligus merupakan kebenaran ledger dan berada di luar constraint yang
+seharusnya mendefinisikan kebenaran ledger.
+
+**Perilaku baru:** dua syarat katalog, keduanya sebelum SQL migrasi apa pun.
+
+1. `pg_inherits` di-scan untuk `inhparent = 'public._migrations'::regclass`; setiap
+   descendant → `bail!` yang menyebut nama relasi turunannya.
+2. `connoinherit` dibaca dari `pg_constraint` untuk
+   `_migrations_digest_origin_check`; `true` → `bail!`.
+
+**Mengapa keduanya:** (1) menolak keadaan yang sudah terbentuk, (2) menolak bentuk
+constraint yang memungkinkan keadaan itu dibuat SETELAH migrasi lewat. Ledger
+adalah otoritas tunggal secara konstruksi; tidak ada kasus sah di mana ia punya
+turunan.
+
+### Bukti RED→GREEN
+
+Test baru: `src/rev103_ledger_provenance_authority_pg_tests.rs` (5 test), didaftarkan
+di `src/main.rs:83-85`.
+
+RED — dijalankan terhadap `src/db.rs` REV-101 apa adanya, sebelum satu baris fix
+ditulis (`cargo +1.89.0 test --locked --features pg_tests --bin
+solana-whale-intelligence rev103 -- --test-threads=1`):
+
+```text
+test a_byte_distinct_provenance_row_fails_the_migrator ... FAILED
+test a_deterministic_provenance_column_is_still_accepted ... ok
+test a_no_inherit_check_with_a_rogue_child_fails_the_migrator ... FAILED
+test an_icu_case_insensitive_provenance_column_fails_the_migrator ... FAILED
+test an_inheritable_check_over_a_childless_ledger_is_accepted ... ok
+
+panicked at src\rev103_ledger_provenance_authority_pg_tests.rs:99:10:
+a nondeterministic provenance column must fail the migration closed: ()
+panicked at src\rev103_ledger_provenance_authority_pg_tests.rs:231:10:
+an inheritance-escaped ledger must fail the migration closed: ()
+panicked at src\rev103_ledger_provenance_authority_pg_tests.rs:143:5:
+the failure must name the offending row and value, got: error returned from
+database: check constraint "_migrations_digest_origin_check" of relation
+"_migrations" is violated by some row
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 286 filtered out; in 14.24s
+```
+
+Ketiganya kegagalan ASSERTION, bukan compile error (ada baris `test result:`, dan
+`expect_err` menerima `Ok(())` — migrasi REV-101 memang SUKSES atas ledger yang
+dibajak). Dua yang `ok` adalah counterpart non-vakuitas: tanpa keduanya, ketiga
+test di atas juga akan lulus seandainya migrator sekadar menolak setiap ledger yang
+sudah punya constraint.
+
+GREEN — setelah fix:
+
+```text
+test result: ok. 5 passed; 0 failed; 0 ignored; 286 filtered out; in 7.11s
+```
+
+Bersama REV-101 (bukti tidak ada regresi diagnosis):
+
+```text
+test rev101::a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator ... ok
+test rev101::a_validated_canonical_check_is_still_accepted ... ok
+test rev101::an_ambient_dotenv_cannot_choose_the_migration_source ... ok
+test rev103::... (5) ... ok
+test result: ok. 8 passed; 0 failed; 283 filtered out; in 15.50s
+```
+
+### Reproduksi reviewer, biner produksi, PostgreSQL 17.11 nyata
+
+Lane dibangun persis seperti REV-102 mendeskripsikannya, lalu dijalankan dua kali:
+dengan biner predecessor `28e477d` (worktree terpisah, dibangun sendiri) dan
+dengan biner HEAD.
+
+```text
+                          PRED 28e477d          HEAD (REV-103)
+F01 ICU ci + 'APPLIED'    rc=0                  rc=1
+  workspaces                 created               absent
+  ledger rows                55 (54 applied)       1 (baris rogue saja)
+F02 NO INHERIT + child    rc=0                  rc=1
+  workspaces                 created               absent
+  ledger rows (ONLY parent)  54                    0
+```
+
+Pesan HEAD, verbatim:
+
+```text
+Error: the migration ledger's `digest_origin` column uses the nondeterministic
+collation `ci`. Equality under a nondeterministic collation is a locale match,
+not a byte match, so values such as `APPLIED` satisfy the canonical provenance
+CHECK while being provenances this binary never writes. ...
+
+Error: the migration ledger `public._migrations` has descendant table(s)
+_migrations_rogue. Rows of a descendant are returned by every scan of the ledger
+while being governed by the descendant's own constraints, so they can carry a
+provenance the ledger's CHECK forbids. ...
+```
+
+### Upgrade lane terautentikasi dari predecessor
+
+```text
+pred 28e477d db migrate           rc=0; 54 rows, 54 sha256
+HEAD db migrate (database sama)   rc=0
+HEAD db status                    schema current; every applied migration is digest-verified
+sesudah                           54 rows, 54 sha256; digest_origin: applied=54
+constraint                        convalidated=t, connoinherit=f
+```
+
+Tidak ada baris yang ditulis ulang, tidak ada constraint yang dibuat ulang: pass
+kedua adalah no-op sebagaimana REV-093-F03 mensyaratkan.
+
+### Biner direlokasi + hostile dotenv (REV-101 dipertahankan)
+
+```text
+ambient .env menunjuk hostile-migrations   rc=0; applied=54; _hostile_marker absent
+SWI_MIGRATIONS_DIR eksplisit dari launcher rc=0; applied=1
+```
+
+### Gates (Rust 1.89.0, dua kali untuk cargo check dan default suite)
+
+```text
+cargo check --locked --all-targets                        PASS x2, 0 warning
+cargo check --locked --features pg_tests --all-targets    PASS x2, 0 warning
+cargo test  --locked                                      369/369 x2
+cargo test  --locked --features pg_tests -- --test-threads=1
+                                                          181 + 291 + 7 + 3 + 3 + 5
+                                                          + 20 + 4 + 6 + 3 + 0 = 523/523
+rev103 fokus                                              5/5
+rev101 + rev103 fokus                                     8/8
+db migrate DB disposable bersih                           rc=0; 54 applied, 54 sha256
+```
+
+Lane PG penuh 523 (bukan 518 REV-102) = 518 + 5 test baru.
+
+### Manifest / ledger / residu
+
+```text
+migrations/*.sql                    54
+MANIFEST.sha256 entri               54
+simetric difference file<->manifest kosong
+digest mismatch (LF-normalized)     0
+git diff 28e477d -- migrations/     kosong (1041/1042 tidak tersentuh)
+git diff --stat 28e477d             3 file, 246 insertions(+), 0 deletions(-)
+tracked selain src/db.rs, src/main.rs, REVIEW_RESULT.md   tidak ada
+untracked                           WORKER_COMMAND_REV094.md (pre-existing), file test REV-103
+```
+
+### Yang TIDAK saya kerjakan / batasan
+
+- Tidak ada migrasi baru. Kedua temuan adalah otoritas biner atas keadaan katalog
+  yang bermusuhan; menaruhnya di file SQL akan berarti ia hanya berlaku pada
+  database yang sudah bersedia menjalankannya.
+- Kolom `digest_origin` TIDAK dipaksa ke `COLLATE "C"` lewat DDL. Migrator menolak
+  collation nondeterministik dan menyuruh operator mengonversi; mengonversi sendiri
+  berarti menulis DDL diam-diam ke ledger yang sedang dicurigai — persis kesalahan
+  "silently replacing a ledger CHECK" yang REV-093-F03 larang. Ini keputusan sadar,
+  bukan kelalaian; reviewer boleh menolaknya.
+- `ensure_schema_current` tidak diubah. Ia read-only dan berjalan sebagai role
+  runtime; menambahkan scan katalog di sana akan menuntut privilege yang sengaja
+  tidak dimiliki role itu. Otoritas ditegakkan di jalur migrate, yang adalah satu-
+  satunya jalur yang boleh menerima keadaan ledger.
+- Kekurangan yang saya temukan sendiri dan saya perbaiki: penempatan scan baris
+  sebelum constraint gate mengubah pesan diagnosis untuk ledger ber-CHECK palsu
+  (mematahkan test REV-101). Sudah diperbaiki dan dibuktikan oleh lane PG penuh.
+- 10 test `#[sqlx::test]` lama yang rusak sejak sebelum ronde ini tetap dibiarkan;
+  tidak dalam lingkup REV-102.
+
+**Verdict: READY FOR REVIEW.**

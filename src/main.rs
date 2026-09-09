@@ -80,6 +80,9 @@ mod rev087_evaluator_lifecycle_pg_tests;
 /// REV-100-F01/F02 ledger-CHECK validity and migration-source authority.
 #[cfg(all(test, feature = "pg_tests"))]
 mod rev101_migration_authority_pg_tests;
+/// REV-102-F01/F02 provenance collation semantics and ledger inheritance authority.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev103_ledger_provenance_authority_pg_tests;
 mod gmgn;
 mod graph;
 mod health;
