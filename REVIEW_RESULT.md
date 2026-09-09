@@ -116,6 +116,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-101 | 2026-09-09 | implementasi corrective REV-100 F01-F02 | READY FOR REVIEW | default 369/369; pg_tests 518/518; RED->GREEN 2/2; focused 6/6; readback 54\|54\|54; residu 0 |
 | REV-102 | 2026-09-09 | independent verification of REV-101 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 518/518; collation + NO INHERIT bypass reproduced |
 | REV-103 | 2026-09-09 | implementasi corrective REV-102 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 523/523; RED->GREEN 3/3 + 2 counterpart; pred 28e477d rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane 54\|54; residu 0 |
+| REV-104 | 2026-09-09 | independent verification of REV-103 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 523/523; `db status` authority bypass reproduced |
+
 
 ---
 
@@ -16389,3 +16391,88 @@ untracked                           WORKER_COMMAND_REV094.md (pre-existing), fil
   tidak dalam lingkup REV-102.
 
 **Verdict: READY FOR REVIEW.**
+
+
+---
+
+## REV-104 - Independent verification of REV-103
+
+**Tanggal:** 2026-09-09
+**Mode:** automatic independent review; three isolated Hermes CLI lanes plus synthesizer
+**Target:** `e9624319767950bb7e336ede3f3a2e0069d8dea1` (REV-103)
+**Against:** `73156210bad89ca1eabf8b4c95ea7debe49c2b88` (REV-102)
+**Tree:** tracked clean; only `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**CHANGES REQUIRED / NOT APPROVED.** Migrator now rejects both REV-102 bypasses, but the read-only `db status` authority boundary still trusts the same poisoned states.
+
+### REV-104-F01 - OPEN - `db status` accepts nondeterministic provenance
+
+**Location:** `src/main.rs` schema-status path and `src/db.rs::ensure_schema_current`.
+
+**Why wrong:** the migrator invokes the provenance-authority validator, but `db status` does not. On an ICU nondeterministic `digest_origin`, byte-distinct `APPLIED` rows remain while status returns zero and reports schema current.
+
+Independent PostgreSQL 17.11 reproduction:
+
+```text
+ICU db status rc=0
+ICU db migrate rc=1
+APPLIED remains 1 of 54
+```
+
+**Fix:** call the same read-only provenance authority/value validator from `ensure_schema_current()` before trusting ledger rows.
+
+**Regression:** real binary `db status` against ICU nondeterministic collation + `APPLIED`; require nonzero.
+
+### REV-104-F02 - OPEN - `db status` accepts inherited rogue ledger
+
+**Location:** same runtime status boundary.
+
+**Why wrong:** parent `_migrations` can be empty while an inherited child supplies 54 `rogue` rows under `CHECK ... NO INHERIT`. Migrator rejects it; status returns zero and reports current.
+
+Independent reproduction:
+
+```text
+parent rows=0
+child rogue rows=54
+NO INHERIT=true
+db status rc=0
+production migrate rc=1
+```
+
+**Fix:** runtime status validation must reject `pg_inherits` descendants and `connoinherit=true`, identical to migrator authority checks.
+
+**Regression:** parent empty + child `INHERITS` with rogue rows; real `db status` must fail nonzero.
+
+### Accepted REV-102 fixes
+
+- Migrator rejects nondeterministic collation: PASS.
+- Migrator rejects descendants and NO INHERIT: PASS.
+- Pre-dotenv migration override snapshot retained: PASS.
+- Immutable 1041/forward 1042 and embedded bundle retained: PASS.
+
+### Independent gates
+
+```text
+lanes                                    3/3 usable
+cargo check default                      PASS
+cargo check pg_tests                     PASS
+REV-103 focused                          5/5 exact
+full default                             369/369
+full PG serial                           523/523
+migration/package focused                9/9
+fresh production migrate/status          PASS rc=0/0
+manifest/ledger                          54/54; zero mismatch
+```
+
+### Cleanup
+
+```text
+reviewer DB residue                      0
+reviewer target/work/script residue      0
+HEAD/local/master/bare                   unchanged at e962431...
+tracked diff                             empty
+```
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED.**
