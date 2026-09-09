@@ -45,14 +45,7 @@ async fn scratch_through_1036(_label: &str) -> (PgPool, crate::pg_test_support::
     let scratch = scratch_guard.name().to_string();
 
     let red_dir = scratch_guard.temp_dir("r87f03");
-    for entry in std::fs::read_dir(migrations_dir()).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        if n.ends_with(".sql") && n.as_str() >= "1037_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
-    }
+    crate::pg_test_support::reduced_bundle(&migrations_dir(), &red_dir, "1037_");
 
     let url = format!(
         "{}/{}",

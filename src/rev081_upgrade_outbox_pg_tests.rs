@@ -69,22 +69,14 @@ async fn scratch_1033_with_pending(name: &str) -> (PgPool, crate::pg_test_suppor
     let mut scratch_guard = crate::pg_test_support::ScratchDb::create(name).await;
     let scratch = scratch_guard.name().to_string();
 
-    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations");
+    // REV-098-F03: the REVIEWED bundle versioned inside this crate, not the
+    // unversioned `../swi-deploy/migrations` sibling, which can drift from it.
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
     let red_dir = scratch_guard.temp_dir("f01");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // Lexicographic cutoff, not a prefix denylist (which rots as migrations
-        // are added: 1039, then 1040).
-        if n.ends_with(".sql") && n.as_str() >= "1034_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
-    }
+    // Lexicographic cutoff, not a prefix denylist (which rots as migrations are
+    // added: 1039, then 1040). REV-098-F03: the manifest is filtered with the SQL.
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, "1034_");
     let url = format!(
         "{}/{}",
         crate::pg_test_support::require_live_url().rsplitn(2, '/').nth(1).expect("db url"),

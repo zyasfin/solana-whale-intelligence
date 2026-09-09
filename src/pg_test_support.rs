@@ -28,16 +28,61 @@
 
 use sqlx::PgPool;
 
-/// Apply the canonical migration set to a scratch database from `#[sqlx::test]`.
+/// A guard-owned scratch database with the canonical migration set applied.
 ///
-/// `accept_legacy_baseline = true` because a scratch database has no ledger history at
-/// all: every migration is applied fresh and recorded with `digest_origin = 'applied'`,
-/// so the flag never actually accepts an unverified row here. It is passed for the case
-/// where a developer points `DATABASE_URL` at a pre-existing database.
-pub async fn migrate_scratch(pool: &PgPool) {
-    crate::db::migrate_with(pool, true)
+/// REV-098-F04: ten fixtures used `#[sqlx::test(migrations = false)]`, which
+/// provisions its own `_sqlx_test_*` database. SQLx drops that database only after
+/// the test body RETURNS, so a panicking or failing fixture leaks one — and the
+/// residue scans in this repo look for `swi*` names, so those leaks were invisible
+/// to the gate as well as unowned. `ScratchDb` cleans up on `Drop`, which runs
+/// during unwind, so ownership and the residue namespace are the same thing again.
+///
+/// `accept_legacy_baseline = true` because a scratch database has no ledger history
+/// at all: every migration is applied fresh and recorded with
+/// `digest_origin = 'applied'`, so the flag never accepts an unverified row here.
+pub async fn migrated_scratch(label: &str) -> (ScratchDb, PgPool) {
+    let guard = ScratchDb::create(label).await;
+    let pool = guard.pool().await;
+    crate::db::migrate_with(&pool, true)
         .await
         .expect("apply the canonical migration set to the scratch database");
+    (guard, pool)
+}
+
+/// Materialize a REDUCED migration bundle: every `.sql` from `src` whose filename
+/// sorts before `cutoff`, plus a MANIFEST filtered to exactly those files.
+///
+/// REV-098-F03: production now validates a bundle before executing any of it —
+/// manifest/file bijection and a digest per file. Every reduced-lane fixture used to
+/// copy the FULL manifest next to a SUBSET of the SQL, which production tolerated
+/// only because the manifest was consulted on the backfill path alone. Filtering the
+/// manifest is what makes a reduced lane a real bundle rather than a broken one, and
+/// it belongs in ONE place: seven fixtures had their own copy of this loop, and a
+/// rule enforced in seven copies is a rule that will be enforced in six.
+pub fn reduced_bundle(src: &std::path::Path, dest: &std::path::Path, cutoff: &str) {
+    let mut kept: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(src).expect("read migrations") {
+        let entry = entry.expect("dir entry");
+        let n = entry.file_name().to_string_lossy().to_string();
+        if n.ends_with(".sql") {
+            if n.as_str() >= cutoff {
+                continue;
+            }
+            kept.insert(n.clone());
+        } else if n == crate::db::MIGRATION_MANIFEST {
+            continue; // written below, filtered to what this lane ships
+        }
+        std::fs::copy(entry.path(), dest.join(&n)).expect("copy migration");
+    }
+    let full = std::fs::read_to_string(src.join(crate::db::MIGRATION_MANIFEST))
+        .expect("read the source manifest");
+    let reduced: String = full
+        .lines()
+        .filter(|l| l.split_whitespace().nth(1).map(|n| kept.contains(n)).unwrap_or(false))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(dest.join(crate::db::MIGRATION_MANIFEST), &reduced)
+        .expect("write the reduced manifest");
 }
 
 /// The live database URL for a `pg_tests` run, or PANIC (REV-056-F06).

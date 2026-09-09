@@ -168,22 +168,14 @@ async fn legacy_nonnumeric_dedup_key_upgrade_succeeds() {
     // REV-093-F06: guard-owned teardown, also on unwind.
     let mut admin = crate::pg_test_support::ScratchDb::create("f02up").await;
     let scratch = admin.name().to_string();
-    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations");
+    // REV-098-F03: the REVIEWED bundle versioned inside this crate, not the
+    // unversioned `../swi-deploy/migrations` sibling, which can drift from it.
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
     let red_dir = admin.temp_dir("f02");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // Migrate through 1035; a lexicographic cutoff, not a prefix denylist that
-        // rots as migrations are added (1039, then 1040).
-        if n.ends_with(".sql") && n.as_str() >= "1036_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
-    }
+    // Migrate through 1035; a lexicographic cutoff, not a prefix denylist that rots
+    // as migrations are added (1039, then 1040).
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, "1036_");
     let url = format!(
         "{}/{}",
         crate::pg_test_support::require_live_url()
@@ -263,20 +255,12 @@ async fn pre_1033_alerts_table_survives_preflight() {
     // REV-093-F06: guard-owned teardown, also on unwind.
     let mut admin = crate::pg_test_support::ScratchDb::create("f03up").await;
     let scratch = admin.name().to_string();
-    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations");
+    // REV-098-F03: the REVIEWED bundle versioned inside this crate, not the
+    // unversioned `../swi-deploy/migrations` sibling, which can drift from it.
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     let red_dir = admin.temp_dir("f03");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // Migrate through 1032 only: alerts exists, no state column.
-        if n.ends_with(".sql") && n.as_str() >= "1033_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
-    }
+    // Migrate through 1032 only: alerts exists, no state column.
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, "1033_");
     let url = format!(
         "{}/{}",
         crate::pg_test_support::require_live_url()

@@ -111,6 +111,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 | REV-097 | 2026-09-09 | corrective for the independent review REV-096 (F02 table-qualified + definition-exact 1041 guards; F03 advisory lock held for the ENTIRE migration run and semantic allowed-set validation of the ledger CHECK; F04 resolver proven through the production binary with divergent directories; F05 dual-table invalid-ID diagnostics; F06 RAII temp dirs and a residue scan over every naming family) | READY FOR REVIEW | 369/369 default + 508/508 pg_tests (181 lib + 279 bin + 48 integration); check gates 0 warning; disposable DB 53\|53\|53 applied, 2 validated positive-id CHECKs, ledger CHECK admits exactly {NULL,applied,baseline}; residue after the full lane = 0 DBs, 0 temp dirs; 6 new focused tests; 5 RED→GREEN, each RED an assertion failure; 2 defects found by me and fixed (advisory lock never released -> 30-minute migrator deadlock; `CARGO_MANIFEST_DIR` read at RUNTIME so the shipped binary silently fell back to the unversioned legacy sibling) |
 | REV-098 | 2026-09-09 | independent verification of REV-097 | CHANGES REQUIRED / NOT APPROVED | Rust 369/369; pg_tests 511/511; focused 6/6; e1e0403-to-REV-097 upgrade FAIL |
+| REV-099 | 2026-09-09 | implementasi corrective REV-098 F01-F04 | READY FOR REVIEW | default 369/369; pg_tests 515/515; RED->GREEN 4/4; readback 54\|54\|54\|0\|0; residu 0 |
 
 ---
 
@@ -15618,3 +15619,220 @@ reviewer DB/target cleanup                 PASS, residue 0
 Green fresh-install gates do not cover the reproduced predecessor-upgrade failure or the forged CHECK bypass.
 
 **Verdict: CHANGES REQUIRED / NOT APPROVED.**
+
+
+---
+
+## REV-099 — Implementasi corrective atas independent review REV-098
+
+**Tanggal:** 2026-09-09
+**Basis commit:** `6f1530c` (REV-098), implementasi di atas `30d2e19` (REV-097)
+**Scope:** REV-098 F01, F02, F03, F04.
+**Verdict:** **READY FOR REVIEW** (bukan APPROVED; review independen Hermes menyusul).
+
+### Yang belum terimplementasi saat round ini dimulai
+
+Keempat temuan REV-098 masih OPEN persis seperti dilaporkan. Saya memverifikasi ulang,
+bukan mempercayai baris verdict:
+
+- `migrations/1041_...sql` di HEAD adalah blob REV-097 (`b24b9cbc…`), bukan blob yang
+  dikirim REV-096 (`d7a8984d…`), dan barisnya di `MANIFEST.sha256` DIGANTI, bukan
+  ditambah. Migrasi yang sudah applied benar-benar diedit di tempat.
+- `db.rs::digest_origin_check_admits_exactly` masih memakai enam probe hingga.
+- `migration_dir_candidates()` masih menempatkan `./migrations` (cwd) di atas bundle
+  packaged, dan bundle packaged itu sendiri `env!("CARGO_MANIFEST_DIR")` — path source
+  host build, bukan artefak yang ikut terkirim.
+- Sepuluh fixture `#[sqlx::test(migrations = false)]` masih ada di
+  `funding_radar_pg_tests.rs` (7) dan `recent_store_pg_tests.rs` (3).
+
+### F01 — 1041 dipulihkan byte-for-byte, koreksi pindah ke 1042
+
+`migrations/1041_rev093_positive_id_invariant.sql` dikembalikan dari `e1e0403`
+(sha256 LF-normalized `d7a8984db0c30eecc42421c6209fe126ab3baa7315dd310afa19d21dd3da7db4`),
+dan baris manifestnya dikembalikan ke digest itu.
+
+`migrations/1042_rev098_positive_id_invariant_repair.sql` (baru) memuat perbaikan yang
+REV-097 tulis ke dalam 1041: lookup constraint di-key oleh `(conname, conrelid)`, dan
+constraint yang sudah ada harus persis `CHECK ((id > 0))` menurut rendering server
+sendiri (`pg_get_constraintdef`, whitespace dinormalisasi) — kalau tidak, `RAISE`.
+Deteksi data untuk KEDUA tabel berjalan sebelum DDL apa pun, jadi database yang
+melanggar di dua tabel tidak berakhir setengah ter-constraint. Manifest ditambah satu
+baris (`b9ebdf36…`), tidak ada baris lama yang disentuh.
+
+Kenapa mekanisme ini otoritatif: 1041 sudah applied di database nyata, jadi satu-satunya
+tempat koreksi bisa MENJANGKAU database itu adalah file forward. Mengedit 1041 membuat
+digest ledger tidak cocok dengan disk, dan itu bukan sekadar kosmetik — migrator menolak
+seluruh run.
+
+### F02 — perbandingan ekspresi kanonis, bukan sampel hingga
+
+`db.rs::digest_origin_check_is_canonical` menggantikan
+`digest_origin_check_admits_exactly`. CHECK kanonis dipasang pada temp table
+(`ON COMMIT DROP`, di dalam transaksi pemanggil) yang punya kolom `digest_origin text`,
+lalu `pg_get_expr(conbin, conrelid)` dari constraint terpasang dibandingkan dengan
+`pg_get_expr` dari constraint kanonis itu.
+
+Kenapa ini menutup kelasnya, bukan satu nilai: kedua sisi adalah DEPARSE server atas
+pohon ekspresi yang sudah di-parse dan di-analyze. Spasi, kapitalisasi, kutip, `IN`
+versus `= ANY`, tanda kurung berlebih, cast implisit — semuanya dinormalisasi identik,
+karena rendering adalah fungsi dari pohon, bukan dari teks yang diketik. Rendering sama
+berarti pohon sama; disjunct tambahan apa pun mengubah pohon dan mengubah rendering.
+Tidak ada lagi "nilai yang tidak saya tebak".
+
+### F03 — bundle migrasi DITANAM di dalam binary
+
+`build.rs` (baru) meng-`include_str!` setiap `.sql` beserta `MANIFEST.sha256` ke dalam
+binary. `db.rs::MigrationBundle` menggantikan `resolve_migration_dir` /
+`migration_dir_candidates` sepenuhnya:
+
+- `MigrationBundle::resolve()` — HANYA `SWI_MIGRATIONS_DIR` (override operator yang
+  eksplisit) yang bisa menggeser bundle tertanam. Tidak ada lagi kandidat implisit dari
+  lokasi: tidak `./migrations`, tidak sibling legacy.
+- `MigrationBundle::build()` — parse manifest ketat, BIJEKSI manifest↔file, dan digest
+  per file, semuanya SEBELUM satu statement SQL pun dieksekusi. Sebelumnya manifest hanya
+  dibaca pada jalur backfill row pra-checksum, jadi database FRESH mengeksekusi SQL yang
+  tidak pernah divouch siapa pun lalu mencatat digest byte-byte itu sendiri sebagai
+  `applied`.
+- `ensure_schema_current` memverifikasi ledger terhadap bundle yang dibawa binary, bukan
+  terhadap direktori yang kebetulan ada di cwd.
+
+Kenapa embedding, bukan "executable-relative": path relatif-executable masih sebuah
+direktori — bisa dihapus, ditukar, atau di-copy setengah. Byte yang ikut di dalam
+executable tidak bisa kalah peringkat oleh direktori, tidak bisa tertinggal saat binary
+disalin, dan tidak bisa melenceng dari source yang direview.
+
+Konsekuensi yang saya rapikan sekalian: tujuh fixture punya salinan sendiri dari loop
+"copy migrasi sampai cutoff" dan semuanya menyalin manifest PENUH di sebelah SUBSET file.
+Itu bukan bundle. Sekarang satu helper `pg_test_support::reduced_bundle` memfilter
+manifest bersama SQL-nya, dan tiga lane yang membaca `../swi-deploy/migrations`
+(unversioned) dipindah ke bundle yang direview.
+
+### F04 — sepuluh fixture `#[sqlx::test]` pindah ke `ScratchDb`
+
+`funding_radar_pg_tests.rs` (7) dan `recent_store_pg_tests.rs` (3) sekarang
+`#[tokio::test]` + `pg_test_support::migrated_scratch(label)`, yang mengembalikan guard
+pemilik. SQLx menghapus `_sqlx_test_*` hanya SETELAH body test return, jadi fixture yang
+panik membocorkannya — dan sapuan residu repo ini mencari nama `swi*`, sehingga kebocoran
+itu tak terlihat oleh gate maupun tak berpemilik. `Drop` berjalan saat unwind.
+
+### Bukti RED→GREEN (verbatim; semuanya assertion failure, bukan compile error)
+
+RED F01 — 1041 dikembalikan ke bentuk REV-097 (diedit di tempat) dan 1042 dihapus:
+```
+thread '...a_rev096_database_upgrades_through_1042_without_rewriting_1041' panicked at
+src\rev087_migration_integrity_pg_tests.rs:895:5:
+expected the named wrong-definition refusal, got: applied migration
+`1041_rev093_positive_id_invariant.sql` no longer matches the file on disk
+(ledger d7a8984db0c3, disk b24b9cbcce78). Migrations are immutable once applied;
+restore the reviewed bytes or ship a forward migration instead of editing this one
+test result: FAILED. 0 passed; 1 failed
+```
+Itu persis kegagalan yang direproduksi REV-098, sekarang di dalam suite.
+
+RED F02 — validator dikembalikan ke enam probe REV-097:
+```
+thread '...a_forged_ledger_check_with_an_unprobed_extra_value_is_refused' panicked at
+src\rev087_migration_integrity_pg_tests.rs:2387:10:
+a CHECK with an unprobed extra value must be refused: ()
+test result: FAILED. 0 passed; 1 failed
+```
+Test itu lebih dulu MEMBUKTIKAN preconditionnya: `rogue` benar-benar diterima oleh CHECK
+palsu (INSERT-nya berhasil), dan keenam probe REV-097 semuanya menjawab persis seperti
+CHECK kanonis.
+
+RED F03 — resolver dikembalikan ke urutan cwd-first:
+```
+thread '...the_relocated_binary_uses_only_its_embedded_bundle' panicked at
+src\rev087_migration_integrity_pg_tests.rs:2561:5:
+assertion `left == right` failed: the relocated binary must apply its embedded bundle
+(54 migrations)
+  left: 1
+ right: 54
+test result: FAILED. 0 passed; 1 failed
+```
+Binary yang direlokasi benar-benar menerapkan bundle CWD yang bermusuhan.
+
+RED F04 — child probe dikembalikan ke `#[sqlx::test(migrations = false)]`:
+```
+thread '...a_failing_child_test_process_leaves_no_residue_anywhere' panicked at
+src\rev087_migration_integrity_pg_tests.rs:2045:5:
+no `#[sqlx::test]` scratch database may exist after this suite:
+["_sqlx_test_agPGgrjZxiKO2KuGRXmX_tJBSPHwFseK7NgbTNbozWKY2IxuCDY0"]
+test result: FAILED. 0 passed; 1 failed
+```
+Kebocoran nyata, dari proses anak yang benar-benar gagal, terdeteksi setelah proses itu
+keluar. Database itu saya hapus manual sesudahnya.
+
+GREEN setelah semua fix dipulihkan (modul integritas penuh):
+```
+test rev087_migration_integrity_pg_tests::a_rev096_database_upgrades_through_1042_without_rewriting_1041 ... ok
+test rev087_migration_integrity_pg_tests::a_forged_ledger_check_with_an_unprobed_extra_value_is_refused ... ok
+test rev087_migration_integrity_pg_tests::a_forged_ledger_check_containing_both_values_is_refused ... ok
+test rev087_migration_integrity_pg_tests::the_relocated_binary_uses_only_its_embedded_bundle ... ok
+test rev087_migration_integrity_pg_tests::the_embedded_bundle_is_the_reviewed_bundle ... ok
+test rev087_migration_integrity_pg_tests::a_failing_child_test_process_leaves_no_residue_anywhere ... ok
+test rev087_migration_integrity_pg_tests::an_edited_shipped_migration_is_refused_by_the_migrator ... ok
+```
+
+### Satu defect yang SAYA temukan sendiri
+
+`an_edited_shipped_migration_is_refused_by_the_migrator` mulai gagal setelah F03, karena
+bundle ditolak oleh manifest sebelum ledger sempat bicara. Itu bukan regresi, tapi test
+lama jadi membuktikan lapisan yang salah. Sekarang test itu membuktikan KEDUANYA: (1)
+byte yang diedit ditolak oleh manifest sebelum eksekusi; (2) setelah manifest DIARAHKAN
+ULANG ke byte yang diedit — sehingga bundle konsisten dengan dirinya sendiri dan lapisan
+manifest tidak punya keberatan — ledger tetap menolak drift nama-sama. Tanpa paruh kedua,
+siapa pun yang mengedit migrasi shipped lalu menjalankan ulang generator manifest akan
+lolos.
+
+### Gate
+
+```
+cargo +1.89.0 check --locked --all-targets                     -> Finished, 0 warning
+cargo +1.89.0 check --locked --features pg_tests --all-targets -> Finished, 0 warning
+cargo +1.89.0 test  --locked                                   -> 369 passed, 0 failed
+   (173 + 145 + 7 + 3 + 3 + 5 + 20 + 4 + 6 + 3 + 0)
+cargo +1.89.0 test --locked --features pg_tests --lib   -- --test-threads=1 -> 181 passed, 0 failed
+cargo +1.89.0 test --locked --features pg_tests --bin … -- --test-threads=1 -> 283 passed, 0 failed
+cargo +1.89.0 test --locked --features pg_tests --tests -- --test-threads=1 ->  51 passed, 0 failed
+                                                                pg total    -> 515 passed, 0 failed
+```
+
+Readback database sekali pakai (`swi_readback`, dibuat baru, `db migrate` lewat binary
+produksi, dijalankan dari `C:\temp` — cwd tanpa `migrations/`):
+
+```
+_migrations                       : 54 | 54 | 54 | 0 | 0
+                                    (count | sha256 | applied | baseline | NULL-origin)
+workspaces_id_positive_check      : CHECK ((id > 0))
+funding_radar_cases_id_positive_check : CHECK ((id > 0))
+_migrations_digest_origin_check   : CHECK (((digest_origin IS NULL) OR
+                                    (digest_origin = ANY (ARRAY['applied'::text,'baseline'::text]))))
+schema_cutover_events             : positive_id_invariant, positive_id_invariant_repair
+db status                         : schema current; every applied migration is digest-verified
+migrations/*.sql                  : 54;  MANIFEST.sha256 : 74 baris (54 entri + header)
+```
+
+Residu setelah lane penuh: `pg_database LIKE 'swi%' OR LIKE '\_sqlx\_test%'` → hanya
+`swi_test`; `%TEMP%\swi*` → 0 entri.
+
+### Yang TIDAK saya kerjakan / batasan
+
+- **Tidak ada self-approval.** Verdict READY FOR REVIEW.
+- `cargo +1.89.0 fmt --check` tetap gagal pra-ada, sama seperti base. Tidak diminta round
+  ini dan tidak diubah.
+- `SWI_MIGRATIONS_DIR` masih bisa mengarahkan migrator ke direktori mana pun. Itu memang
+  jalur operator yang eksplisit dan tetap divalidasi manifest/bijeksi/digest, tapi ia
+  bukan pertahanan terhadap operator yang sengaja menunjuk bundle lain.
+- Bundle tertanam mengunci SQL ke binary. Konsekuensinya menambah migrasi berarti build
+  ulang; itu memang trade-off yang dipilih, bukan sesuatu yang bisa dihindari sambil tetap
+  menutup F03.
+- `Drop` tetap tidak berjalan pada SIGKILL/abort. Gate F04 menutup kegagalan dan panic,
+  bukan pembunuhan paksa — batasan yang sama seperti REV-096/097.
+- Sapuan residu di dalam suite menyaring nama yang memuat PID; proses lain yang berjalan
+  bersamaan tidak diperiksa. Probe `_sqlx_test%` global karena namanya acak.
+- Dua rekomendasi REV-090 masih terbuka: regression dual-error CLI dan regression cabang
+  penolakan F06-REV-090 sebelum wiring produksi.
+- Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
+
+**Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**

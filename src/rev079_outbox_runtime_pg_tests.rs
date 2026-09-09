@@ -66,22 +66,15 @@ async fn scratch_through_1033_with_alert_history(name: &str) -> (PgPool, crate::
     let scratch = scratch_guard.name().to_string();
 
     // Migrations dir minus 1034 and 1035: the pre-upgrade state.
-    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("parent")
-        .join("swi-deploy/migrations");
+    // REV-098-F03: the REVIEWED bundle versioned inside this crate, not the
+    // unversioned `../swi-deploy/migrations` sibling, which can drift from it.
+    let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
     // REV-087 item 7: per-fixture temp dir (pid alone collides across fixtures).
     let red_dir = scratch_guard.temp_dir("upg");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Lexicographic cutoff, not a prefix denylist: a denylist silently leaks
-        // every migration added after it was written (1039, then 1040).
-        if name.ends_with(".sql") && name.as_str() >= "1034_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&name)).expect("copy");
-    }
+    // Lexicographic cutoff, not a prefix denylist: a denylist silently leaks every
+    // migration added after it was written (1039, then 1040). REV-098-F03: the
+    // manifest is filtered with the SQL, so the reduced lane is a valid bundle.
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, "1034_");
     let url = format!(
         "{}/{}",
         crate::pg_test_support::require_live_url().rsplitn(2, '/').nth(1).expect("db url"),

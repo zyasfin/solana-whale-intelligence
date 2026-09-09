@@ -57,16 +57,11 @@ async fn scratch_through(name: &str, last_kept: &str) -> (PgPool, crate::pg_test
 
     let src_dir = migrations_dir();
     let red_dir = scratch_guard.temp_dir("r85");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("dir entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // MANIFEST.sha256 must travel with the SQL: the migrator fails closed
-        // without it. Everything newer than the cutoff is withheld.
-        if n.ends_with(".sql") && n.as_str() > last_kept {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy migration");
-    }
+    // A filtered MANIFEST.sha256 travels with the SQL: the migrator fails closed
+    // without one, and REV-098-F03 makes it reject a manifest that describes files
+    // the bundle does not have. `last_kept` is inclusive, so the cutoff is the next
+    // representable name.
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, &format!("{last_kept}\u{0}"));
 
     let url = format!(
         "{}/{}",

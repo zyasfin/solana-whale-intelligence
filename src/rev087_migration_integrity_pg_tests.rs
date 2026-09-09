@@ -53,16 +53,12 @@ async fn scratch_before(
     // drops them on unwind too, so a failing assertion no longer strands them.
     let mut scratch = crate::pg_test_support::ScratchDb::create(label).await;
     let red_dir = scratch.temp_dir("mig");
-    for entry in std::fs::read_dir(migrations_dir()).expect("read migrations") {
-        let entry = entry.expect("dir entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // MANIFEST.sha256 must travel with the SQL: the migrator fails closed
-        // without it.
-        if n.ends_with(".sql") && n.as_str() >= cutoff {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy migration");
-    }
+    // REV-098-F03: the manifest is reduced ALONGSIDE the SQL. This used to copy the
+    // full manifest next to a SUBSET of the files, which production now refuses:
+    // `MigrationBundle::from_dir` requires an exact manifest/file bijection before
+    // any SQL executes. A lane shipping a manifest that describes files it does not
+    // have is not a bundle; the fixture was relying on production being lax.
+    crate::pg_test_support::reduced_bundle(&migrations_dir(), &red_dir, cutoff);
     let pool = scratch.pool().await;
     crate::db::migrate_dir_with(&pool, &red_dir, true)
         .await
@@ -76,6 +72,12 @@ async fn scratch_before(
 /// commit recorded — something a copy of the working tree can never establish.
 const PREDECESSOR_COMMIT: &str = "a60647dac892afad18b03671bea0638b695c0cdf";
 
+/// The last commit whose `migrations/` shipped the ORIGINAL 1041 (REV-098-F01).
+///
+/// A database migrated by this commit records 1041 with digest `d7a8984d…`; that is
+/// the real predecessor state REV-097 could not upgrade.
+const REV096_COMMIT: &str = "e1e0403ad9eff15766676c647e427ac2307db097";
+
 /// Materialize the migration bundle AS OF `PREDECESSOR_COMMIT`, straight out of
 /// the object database.
 ///
@@ -87,11 +89,11 @@ const PREDECESSOR_COMMIT: &str = "a60647dac892afad18b03671bea0638b695c0cdf";
 ///
 /// Returns `None` when the commit is unreachable (a shallow or exported checkout),
 /// so the caller can report the gap honestly instead of fabricating a pass.
-fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
+fn bundle_at_commit(commit: &str, dest: &std::path::Path) -> Option<usize> {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let listing = std::process::Command::new("git")
         .args(["-C", root.to_str()?, "ls-tree", "--name-only",
-               &format!("{PREDECESSOR_COMMIT}:migrations")])
+               &format!("{commit}:migrations")])
         .output()
         .ok()?;
     if !listing.status.success() {
@@ -110,7 +112,7 @@ fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
     for name in &names {
         let blob = std::process::Command::new("git")
             .args(["-C", root.to_str()?, "cat-file", "blob",
-                   &format!("{PREDECESSOR_COMMIT}:migrations/{name}")])
+                   &format!("{commit}:migrations/{name}")])
             .output()
             .ok()?;
         assert!(blob.status.success(), "cat-file failed for {name}");
@@ -131,6 +133,11 @@ fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
         .collect();
     verify_manifest_bijection(&manifest, &sql_names, dest);
     Some(written)
+}
+
+/// The bundle as of [`PREDECESSOR_COMMIT`].
+fn predecessor_bundle(dest: &std::path::Path) -> Option<usize> {
+    bundle_at_commit(PREDECESSOR_COMMIT, dest)
 }
 
 /// Parse a `MANIFEST.sha256` STRICTLY and prove it is an exact bijection with
@@ -225,9 +232,42 @@ async fn an_edited_shipped_migration_is_refused_by_the_migrator() {
     tampered.extend_from_slice(b"\n-- REV-087 drift probe\n");
     std::fs::write(&victim, &tampered).expect("write tampered migration");
 
+    // Layer 1 (REV-098-F03): the bundle no longer matches its own reviewed manifest,
+    // so it is refused BEFORE any SQL executes and before the ledger is consulted.
     let err = crate::db::migrate_dir_with(&pool, &dir, true)
         .await
         .expect_err("an edited applied migration must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("not the reviewed bytes"),
+        "expected a manifest refusal, got: {msg}"
+    );
+
+    // Layer 2 (REV-087-F01): re-point the MANIFEST at the tampered bytes, so the
+    // bundle is internally self-consistent and layer 1 has nothing to say. The
+    // ledger must still refuse the same-name drift — otherwise anyone who edits a
+    // shipped migration and re-runs the manifest generator would be blessed.
+    let manifest_path = dir.join(crate::db::MIGRATION_MANIFEST);
+    let manifest = std::fs::read_to_string(&manifest_path).expect("read manifest");
+    let tampered_digest = crate::db::migration_sha256_for_tests(
+        &String::from_utf8_lossy(&tampered),
+    );
+    let victim_name = "1033_rev074_signal_uniqueness_and_alert_outbox.sql";
+    let rewritten: String = manifest
+        .lines()
+        .map(|l| {
+            if l.split_whitespace().nth(1) == Some(victim_name) {
+                format!("{tampered_digest}  {victim_name}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&manifest_path, &rewritten).expect("write re-pointed manifest");
+
+    let err = crate::db::migrate_dir_with(&pool, &dir, true)
+        .await
+        .expect_err("a self-consistent but drifted bundle must still be refused");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("no longer matches the file on disk"),
@@ -237,6 +277,7 @@ async fn an_edited_shipped_migration_is_refused_by_the_migrator() {
     // Restoring the bytes restores the lane: the refusal is about the CONTENT, not
     // about having run twice.
     std::fs::write(&victim, &original).expect("restore migration");
+    std::fs::write(&manifest_path, &manifest).expect("restore manifest");
     crate::db::migrate_dir_with(&pool, &dir, true)
         .await
         .expect("the restored set verifies again");
@@ -775,6 +816,189 @@ async fn an_authenticated_predecessor_bundle_converges_to_current() {
     assert_eq!(applied, total, "every row is digest-verified as applied");
 
     // REV-097-F06: guard-owned teardown, also on unwind.
+    pool.close().await;
+    drop(guard);
+}
+
+// ---------------------------------------------------------------------------
+// REV-098-F01 — a REV-096 database must upgrade to current
+// ---------------------------------------------------------------------------
+
+/// The exact predecessor lane REV-097 broke: apply the AUTHENTICATED `e1e0403`
+/// bundle (whose 1041 is the original `d7a8984d…`), then upgrade with the bundle
+/// this binary carries.
+///
+/// REV-097 edited 1041 IN PLACE, so this lane died with
+/// `applied migration 1041… no longer matches the file on disk`, and no database
+/// that had ever run REV-095/096 could be upgraded. The correction had to move to
+/// forward migration 1042; this fixture is what makes that a rule rather than an
+/// intention. It asserts four things a "just restore the file" fix could each fail:
+///
+///   1. the upgrade SUCCEEDS from the real predecessor state;
+///   2. 1041's ledger digest is STILL `d7a8984d…` afterwards — the shipped bytes
+///      were never rewritten;
+///   3. 1042 ran, and the invariant is installed correctly on BOTH tables;
+///   4. a second pass is an exact no-op.
+///
+/// The decoy is the other half: before upgrading, a same-named constraint is
+/// planted on an unrelated table and the REAL `workspaces` constraint is replaced
+/// with a WRONG definition. That is precisely the state original-1041 could produce
+/// and could not detect (`conname` alone, existence only), so 1042 must refuse it —
+/// and then accept the lane once the operator reconciles.
+#[tokio::test]
+async fn a_rev096_database_upgrades_through_1042_without_rewriting_1041() {
+    let mut guard = crate::pg_test_support::ScratchDb::create("f01upg").await;
+    let pred_dir = guard.temp_dir("rev096");
+    let sql_count = bundle_at_commit(REV096_COMMIT, &pred_dir).unwrap_or_else(|| {
+        panic!(
+            "commit {REV096_COMMIT} must be reachable: this lane is the whole point of \
+             the fixture and a working-tree copy cannot substitute for it"
+        )
+    });
+    let pool = guard.pool().await;
+
+    // Phase 1: the predecessor bundle, applied by the production migrator.
+    crate::db::migrate_dir_with(&pool, &pred_dir, true)
+        .await
+        .expect("the authenticated REV-096 bundle must apply");
+
+    const ORIGINAL_1041: &str =
+        "d7a8984db0c30eecc42421c6209fe126ab3baa7315dd310afa19d21dd3da7db4";
+    let recorded: String = sqlx::query_scalar(
+        "SELECT sha256 FROM public._migrations \
+          WHERE name = '1041_rev093_positive_id_invariant.sql'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("1041 must be applied by the predecessor bundle");
+    assert_eq!(
+        recorded, ORIGINAL_1041,
+        "the predecessor lane must record the ORIGINAL 1041 digest, or this fixture \
+         is not standing on the state REV-098-F01 describes"
+    );
+
+    // The decoy state original-1041 could produce: the real constraint replaced by a
+    // plausible-but-wrong one, and a same-named constraint on another table.
+    sqlx::raw_sql(
+        "ALTER TABLE public.workspaces DROP CONSTRAINT workspaces_id_positive_check; \
+         ALTER TABLE public.workspaces ADD CONSTRAINT workspaces_id_positive_check \
+           CHECK (id >= 0); \
+         CREATE TABLE public._decoy_ws (id bigint); \
+         ALTER TABLE public._decoy_ws ADD CONSTRAINT funding_radar_cases_id_positive_check \
+           CHECK (id > 0);",
+    )
+    .execute(&pool)
+    .await
+    .expect("plant the decoy / wrong-definition state");
+
+    // Phase 2a: the upgrade must FAIL CLOSED on the wrong definition rather than
+    // accept a constraint that does not enforce the invariant.
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("1042 must refuse a wrong `workspaces_id_positive_check`");
+    let err = format!("{err:#}");
+    assert!(
+        err.contains("unexpected definition") && err.contains("workspaces"),
+        "expected the named wrong-definition refusal, got: {err}"
+    );
+
+    // Reconcile exactly what the operator would: remove the wrong constraint. The
+    // decoy on `_decoy_ws` STAYS — a same-named constraint on another table must not
+    // stand in for the real one, which is the other half of the finding.
+    sqlx::raw_sql("ALTER TABLE public.workspaces DROP CONSTRAINT workspaces_id_positive_check")
+        .execute(&pool)
+        .await
+        .expect("reconcile the wrong constraint");
+
+    // Phase 2b: the real upgrade.
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a REV-096 database must upgrade to current");
+
+    // 1041's applied bytes were never rewritten.
+    let after: String = sqlx::query_scalar(
+        "SELECT sha256 FROM public._migrations \
+          WHERE name = '1041_rev093_positive_id_invariant.sql'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("1041 ledger row after the upgrade");
+    assert_eq!(
+        after, ORIGINAL_1041,
+        "the shipped 1041 must still be the bytes that were applied; a correction \
+         belongs in a forward migration"
+    );
+
+    // 1042 ran, and the invariant is installed on BOTH tables with the exact
+    // definition — the decoy on `_decoy_ws` did not satisfy it.
+    let repaired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public._migrations \
+          WHERE name = '1042_rev098_positive_id_invariant_repair.sql' \
+            AND digest_origin = 'applied'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("1042 ledger probe");
+    assert_eq!(repaired, 1, "the forward repair migration must have been applied");
+    for (table, conname) in [
+        ("public.workspaces", "workspaces_id_positive_check"),
+        ("public.funding_radar_cases", "funding_radar_cases_id_positive_check"),
+    ] {
+        let def: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+              WHERE conname = $1 AND conrelid = $2::regclass",
+        )
+        .bind(conname)
+        .bind(table)
+        .fetch_optional(&pool)
+        .await
+        .expect("constraint probe");
+        assert_eq!(
+            def.as_deref(),
+            Some("CHECK ((id > 0))"),
+            "{conname} must be installed on {table} with the exact definition"
+        );
+    }
+
+    // The whole current bundle is present and verified.
+    let (total, applied): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE digest_origin = 'applied') \
+           FROM public._migrations",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("ledger fingerprint");
+    let current =
+        crate::db::MigrationBundle::embedded().expect("embedded bundle").entries().len() as i64;
+    assert_eq!(total, current, "the upgraded lane holds every current migration");
+    assert_eq!(applied, total, "every row is digest-verified as applied");
+    assert!(
+        (sql_count as i64) < current,
+        "the predecessor bundle must be strictly older than current ({sql_count} vs {current})"
+    );
+
+    // Second pass: an exact no-op.
+    let before: Vec<(String, Option<String>, Option<String>, chrono::DateTime<Utc>)> =
+        sqlx::query_as(
+            "SELECT name, sha256, digest_origin, applied_at \
+               FROM public._migrations ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("ledger before the second pass");
+    crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect("a second pass must converge");
+    let after_rows: Vec<(String, Option<String>, Option<String>, chrono::DateTime<Utc>)> =
+        sqlx::query_as(
+            "SELECT name, sha256, digest_origin, applied_at \
+               FROM public._migrations ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("ledger after the second pass");
+    assert_eq!(before, after_rows, "the second pass must not touch the ledger");
+
     pool.close().await;
     drop(guard);
 }
@@ -1547,39 +1771,29 @@ async fn production_migration_refuses_every_malformed_manifest_class() {
 }
 
 // ---------------------------------------------------------------------------
-// REV-093-F05 — the packaged bundle beats a divergent legacy sibling
+// REV-098-F03 — the bundle is EMBEDDED; no directory can outrank it
 // ---------------------------------------------------------------------------
 
-/// Exercise the RESOLVER, with the override unset, from a cwd that has no
-/// `./migrations` and a deliberately divergent legacy sibling in place.
+/// The embedded bundle self-validates and equals the reviewed source bundle.
+///
+/// REV-095/REV-097 asserted the ORDER of a candidate Vec, which is a statement
+/// about a list, not about which bytes run. There is no candidate list any more:
+/// the SQL is compiled into the binary, so the only thing worth asserting here is
+/// that the compiled-in bundle is exactly the reviewed one and that constructing it
+/// enforces the manifest. The behavioural proof — a RELOCATED binary with hostile
+/// directories planted around it — is
+/// `the_relocated_binary_uses_only_its_embedded_bundle`.
 #[test]
-fn the_resolver_prefers_the_packaged_bundle_over_a_legacy_sibling() {
-    // The candidate list is what the resolver walks; assert the ORDER, since the
-    // defect was purely one of precedence.
-    let order = crate::db::migration_dir_candidates_for_tests();
-    let packaged = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    let legacy_cwd = std::path::PathBuf::from("../swi-deploy/migrations");
-
-    let idx_packaged = order
-        .iter()
-        .position(|p| p == &packaged)
-        .expect("the crate-relative packaged bundle must be a candidate");
-    let idx_legacy = order
-        .iter()
-        .position(|p| p == &legacy_cwd)
-        .expect("the legacy sibling must remain a fallback");
-    assert!(
-        idx_packaged < idx_legacy,
-        "the packaged bundle must be tried BEFORE the legacy sibling (REV-093-F05); \
-         order was {order:?}"
+fn the_embedded_bundle_is_the_reviewed_bundle() {
+    let embedded = crate::db::MigrationBundle::embedded()
+        .expect("the embedded bundle must satisfy its own manifest");
+    let from_source = crate::db::MigrationBundle::from_dir(&migrations_dir())
+        .expect("the reviewed source bundle must satisfy its manifest");
+    assert_eq!(
+        embedded.entries(),
+        from_source.entries(),
+        "the compiled-in bundle must be byte-identical to the reviewed migrations/"
     );
-
-    // And the cwd-local packaged spelling must precede both.
-    let idx_cwd = order
-        .iter()
-        .position(|p| p == &std::path::PathBuf::from("migrations"))
-        .expect("cwd-local packaged bundle must be a candidate");
-    assert!(idx_cwd < idx_packaged, "./migrations comes first");
 }
 
 // ---------------------------------------------------------------------------
@@ -1737,6 +1951,127 @@ async fn no_scratch_database_outlives_the_fixtures_that_made_it() {
 }
 
 // ---------------------------------------------------------------------------
+// REV-098-F04 — a FAILING test PROCESS leaves nothing behind, in any namespace
+// ---------------------------------------------------------------------------
+
+/// The fixture the gate below runs in a CHILD PROCESS. It creates exactly what a
+/// real live fixture creates — a migrated scratch database and a temp directory —
+/// and then FAILS.
+///
+/// Inert unless `SWI_F04_FAIL_PROBE=1`, so a normal run passes; the parent gate is
+/// what sets the variable. A test that fails only when asked is the only way to
+/// observe process-exit cleanup without failing the suite.
+#[tokio::test]
+async fn f04_failure_probe_child() {
+    if std::env::var("SWI_F04_FAIL_PROBE").as_deref() != Ok("1") {
+        return;
+    }
+    let (_guard, pool) = crate::pg_test_support::migrated_scratch("f04child").await;
+    let mut owner = crate::pg_test_support::ScratchDb::create("f04childdir").await;
+    let dir = owner.temp_dir("probe");
+    std::fs::write(dir.join("marker.txt"), b"probe").expect("write marker");
+    let _ = pool;
+    panic!("SWI_F04_FAIL_PROBE: deliberate failure with live resources held");
+}
+
+/// Run a REAL failing test in a CHILD PROCESS and require zero residue after it
+/// exits — across every namespace a fixture in this repo can create.
+///
+/// REV-098-F04: the in-band scan above measures THIS process at THIS instant, so it
+/// cannot see what a crashed or panicking process leaves behind, and it looked only
+/// at `swi%`. Ten fixtures used `#[sqlx::test]`, whose `_sqlx_test_*` databases are
+/// dropped only after a test body RETURNS — a failing one leaked outside both the
+/// naming family and the timing window of the gate. Those fixtures now own a
+/// `ScratchDb`; this gate is what keeps that true, and it still scans `_sqlx_test_%`
+/// so a reintroduced `#[sqlx::test]` cannot leak unnoticed.
+///
+/// The child's PID scopes the probes, so a concurrent harness is never blamed.
+#[tokio::test]
+async fn a_failing_child_test_process_leaves_no_residue_anywhere() {
+    let admin_url = crate::pg_test_support::require_live_url();
+    let exe = std::env::current_exe().expect("test exe path");
+
+    let child = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "rev087_migration_integrity_pg_tests::f04_failure_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("SWI_F04_FAIL_PROBE", "1")
+        .env("TEST_DATABASE_URL", &admin_url)
+        .env("DATABASE_URL", &admin_url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the failing child test process");
+    let child_pid = child.id().to_string();
+    let out = child.wait_with_output().expect("await the child test process");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "the child must actually FAIL, or this gate proves nothing: {combined}"
+    );
+    assert!(
+        combined.contains("SWI_F04_FAIL_PROBE"),
+        "the child must have failed in the probe, not before reaching it: {combined}"
+    );
+    assert!(
+        combined.contains("1 failed"),
+        "the child must report exactly the probe failure: {combined}"
+    );
+
+    // The child is GONE. Anything it created that still exists is a leak by
+    // definition — no timing window, no in-band measurement.
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("admin pool");
+    let residue: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database \
+          WHERE (datname LIKE 'swi%' OR datname LIKE '\\_sqlx\\_test%') \
+            AND datname LIKE '%' || $1 || '%' ORDER BY datname",
+    )
+    .bind(&child_pid)
+    .fetch_all(&admin)
+    .await
+    .expect("child residue probe");
+    // `_sqlx_test_*` names are randomized rather than PID-tagged, so they are also
+    // counted globally: this suite creates none, so any at all is a regression.
+    let sqlx_owned: Vec<String> = sqlx::query_scalar(
+        "SELECT datname FROM pg_database WHERE datname LIKE '\\_sqlx\\_test%' ORDER BY datname",
+    )
+    .fetch_all(&admin)
+    .await
+    .expect("sqlx residue probe");
+    admin.close().await;
+    assert!(
+        residue.is_empty(),
+        "the failing child left these databases behind: {residue:?}"
+    );
+    assert!(
+        sqlx_owned.is_empty(),
+        "no `#[sqlx::test]` scratch database may exist after this suite: {sqlx_owned:?}"
+    );
+
+    let dir_residue: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .expect("read temp dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("swi") && n.contains(&child_pid))
+        .collect();
+    assert!(
+        dir_residue.is_empty(),
+        "the failing child left these temp directories behind: {dir_residue:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // REV-096-F02 — 1041's constraint guards are table-qualified and definition-exact
 // ---------------------------------------------------------------------------
 
@@ -1808,6 +2143,11 @@ async fn a_same_named_constraint_on_another_table_does_not_satisfy_1041() {
 
 /// A constraint of the right NAME on the right TABLE but with the wrong definition
 /// must fail closed, even when that definition mentions the expected column.
+///
+/// REV-098-F01: the refusal now comes from forward migration 1042. Shipped 1041
+/// looks the name up unqualified and checks EXISTENCE only, so it passes silently
+/// here — which is the defect. 1041 is applied and immutable, so the guard belongs
+/// in the forward file, and this fixture drives the whole bundle.
 #[tokio::test]
 async fn a_wrong_but_plausible_1041_constraint_definition_fails_closed() {
     let (pool, admin, scratch, dir) = scratch_before("f02def", "1041_").await;
@@ -1842,12 +2182,21 @@ async fn a_wrong_but_plausible_1041_constraint_definition_fails_closed() {
     .expect("constraint still present");
     assert!(still.contains(">="), "the operator's constraint must be left as it was");
     let cutover: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM schema_cutover_events WHERE cutover = 'positive_id_invariant'",
+        "SELECT count(*) FROM schema_cutover_events \
+          WHERE cutover = 'positive_id_invariant_repair'",
     )
     .fetch_one(&pool)
     .await
     .unwrap_or(0);
     assert_eq!(cutover, 0, "no cutover may be recorded for a migration that aborted");
+    let repaired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public._migrations \
+          WHERE name = '1042_rev098_positive_id_invariant_repair.sql'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    assert_eq!(repaired, 0, "the aborted migration must not be recorded as applied");
 
     drop_scratch(&admin, pool, &scratch, &dir).await;
 }
@@ -1974,8 +2323,81 @@ async fn a_forged_ledger_check_containing_both_values_is_refused() {
         .await
         .expect_err("a widened provenance CHECK must be refused");
     assert!(
-        format!("{err:#}").contains("does not admit exactly"),
-        "expected the allowed-set refusal, got: {err:#}"
+        format!("{err:#}").contains("is not the canonical"),
+        "expected the canonical-expression refusal, got: {err:#}"
+    );
+
+    drop_scratch(&admin, pool, &scratch, &dir).await;
+}
+
+/// REV-098-F02: a forged CHECK that answers every finite probe correctly and STILL
+/// widens the admitted set must be refused before any migration work happens.
+///
+/// `canonical OR digest_origin = 'rogue'` is the exact bypass the reviewer
+/// reproduced: `NULL`, `applied`, `baseline` are admitted (correct); `forged`, `''`
+/// and `APPLIED` are rejected (correct) — and `rogue` is admitted, which no probe
+/// set that did not already guess the word `rogue` can see. The migrator must not
+/// depend on having guessed.
+#[tokio::test]
+async fn a_forged_ledger_check_with_an_unprobed_extra_value_is_refused() {
+    let (pool, admin, scratch, dir) = scratch_before("f02rogue", "9999_").await;
+
+    sqlx::query("ALTER TABLE public._migrations DROP CONSTRAINT _migrations_digest_origin_check")
+        .execute(&pool)
+        .await
+        .expect("drop the real constraint");
+    sqlx::query(
+        "ALTER TABLE public._migrations ADD CONSTRAINT _migrations_digest_origin_check \
+           CHECK ((digest_origin IS NULL OR digest_origin IN ('applied', 'baseline')) \
+                  OR digest_origin = 'rogue')",
+    )
+    .execute(&pool)
+    .await
+    .expect("plant the rogue-disjunct constraint");
+
+    // Precondition A: the forgery really does admit an extra value. Without this the
+    // refusal below could be about something else entirely.
+    sqlx::query(
+        "INSERT INTO public._migrations (name, sha256, digest_origin) \
+         VALUES ('9999_probe.sql', 'x', 'rogue')",
+    )
+    .execute(&pool)
+    .await
+    .expect("the forged CHECK must admit `rogue`, or this test proves nothing");
+    sqlx::query("DELETE FROM public._migrations WHERE name = '9999_probe.sql'")
+        .execute(&pool)
+        .await
+        .expect("remove the probe row");
+
+    // Precondition B: the REV-097 finite-probe validator would have PASSED this
+    // constraint — each of its six probes gets the canonical answer.
+    for (literal, want) in [
+        ("NULL::text", true),
+        ("'applied'::text", true),
+        ("'baseline'::text", true),
+        ("'forged'::text", false),
+        ("''::text", false),
+        ("'APPLIED'::text", false),
+    ] {
+        let admitted: bool = sqlx::query_scalar(&format!(
+            "SELECT COALESCE((({literal} IS NULL OR {literal} IN ('applied','baseline')) \
+                              OR {literal} = 'rogue'), true)"
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("probe evaluation");
+        assert_eq!(
+            admitted, want,
+            "the forgery must answer probe {literal} exactly as the canonical CHECK does"
+        );
+    }
+
+    let err = crate::db::migrate_dir_with(&pool, &migrations_dir(), true)
+        .await
+        .expect_err("a CHECK with an unprobed extra value must be refused");
+    assert!(
+        format!("{err:#}").contains("is not the canonical"),
+        "expected the canonical-expression refusal, got: {err:#}"
     );
 
     drop_scratch(&admin, pool, &scratch, &dir).await;
@@ -2053,47 +2475,24 @@ async fn two_concurrent_migrators_on_an_empty_database_both_succeed() {
 }
 
 // ---------------------------------------------------------------------------
-// REV-096-F04 — resolver precedence proven through the PRODUCTION resolver
+// REV-098-F03 — a RELOCATED binary applies only its embedded bundle
 // ---------------------------------------------------------------------------
 
-/// Run the real resolver against DIVERGENT directories and prove the packaged
-/// bundle wins.
+/// Copy ONLY the built binary to an isolated directory, plant every hostile
+/// directory the old resolver would have preferred, and prove the real CLI applies
+/// the embedded bundle regardless.
 ///
-/// REV-095 asserted only the ORDER of the candidate list, which is a statement about
-/// a Vec, not about what the migrator would load. This builds a legacy sibling whose
-/// contents differ from the packaged bundle and then checks which one production
-/// actually resolves and applies.
+/// Why this shape and not the REV-097 one: that fixture built a fake crate root
+/// containing a COPY of the canonical `migrations/`, and ran with the real source
+/// tree still present, so "the packaged bundle won" could be satisfied by the very
+/// path the finding says is not shippable (`env!("CARGO_MANIFEST_DIR")`). Here the
+/// binary lives somewhere else entirely, the cwd holds a DIVERGENT `./migrations`
+/// complete with its own internally valid manifest, and both legacy sibling
+/// spellings exist and diverge too. The old resolver would have chosen the cwd copy
+/// first; the embedded bundle has no such option.
 #[tokio::test]
-async fn the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibling() {
-    // A divergent "legacy sibling" next to a fake crate root, plus a packaged
-    // `migrations/` under that same root. Only the packaged one is legitimate.
-    let root = crate::pg_test_support::ScratchDir::create("resolverroot");
-    let packaged = root.path().join("crate_root").join("migrations");
-    let sibling = root.path().join("swi-deploy").join("migrations");
-    std::fs::create_dir_all(&packaged).expect("packaged dir");
-    std::fs::create_dir_all(&sibling).expect("sibling dir");
-
-    // Packaged: the canonical bundle. Sibling: deliberately DIFFERENT content.
-    for entry in std::fs::read_dir(migrations_dir()).expect("read canonical") {
-        let entry = entry.expect("entry");
-        std::fs::copy(entry.path(), packaged.join(entry.file_name())).expect("copy packaged");
-    }
-    // The marker filename must NOT collide with any canonical file, or "did a sibling
-    // file get applied?" is unanswerable from the ledger.
-    std::fs::write(
-        sibling.join("9998_divergent_sibling.sql"),
-        "-- DIVERGENT LEGACY SIBLING: this must never be chosen\nSELECT 1;\n",
-    )
-    .expect("write sibling");
-
-    // ------------------------------------------------------------------
-    // The behavioural proof: run the PRODUCTION BINARY with its cwd inside the fake
-    // root, so `resolve_migration_dir` sees BOTH a packaged `./migrations` and a
-    // DIVERGENT `../swi-deploy/migrations`, and observe which one it applied.
-    // Asserting on the candidate Vec (REV-095) is a statement about a list; this is
-    // a statement about what ran.
-    // ------------------------------------------------------------------
-    let exe = {
+async fn the_relocated_binary_uses_only_its_embedded_bundle() {
+    let built = {
         let mut p = std::env::current_exe().expect("test exe path");
         p.pop(); // deps/
         p.pop(); // debug/
@@ -2103,26 +2502,64 @@ async fn the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibli
             "solana-whale-intelligence"
         })
     };
-    assert!(exe.exists(), "the production binary must be built at {}", exe.display());
+    assert!(built.exists(), "the production binary must be built at {}", built.display());
 
-    let scratch = crate::pg_test_support::ScratchDb::create("f04resolve").await;
+    let root = crate::pg_test_support::ScratchDir::create("relocated");
+    let bindir = root.path().join("opt").join("swi").join("bin");
+    std::fs::create_dir_all(&bindir).expect("bin dir");
+    let exe = bindir.join(built.file_name().expect("exe name"));
+    std::fs::copy(&built, &exe).expect("relocate the binary");
+
+    // A divergent bundle in the CWD, with a manifest that is internally valid — so
+    // if it were chosen it would be ACCEPTED, and the only thing keeping it out is
+    // that the binary never looks at a directory.
+    let cwd = root.path().join("workdir");
+    let hostile = cwd.join("migrations");
+    std::fs::create_dir_all(&hostile).expect("hostile dir");
+    let hostile_sql = "-- HOSTILE CWD BUNDLE: this must never be applied\n\
+                       CREATE TABLE public._hostile_cwd_marker (id int);\n";
+    std::fs::write(hostile.join("0001_hostile_cwd.sql"), hostile_sql).expect("hostile sql");
+    std::fs::write(
+        hostile.join(crate::db::MIGRATION_MANIFEST),
+        format!(
+            "{}  0001_hostile_cwd.sql\r\n",
+            crate::db::migration_sha256_for_tests(hostile_sql)
+        ),
+    )
+    .expect("hostile manifest");
+
+    // Both legacy sibling spellings the old resolver knew: cwd-relative and
+    // binary-relative.
+    for sibling in [
+        root.path().join("swi-deploy").join("migrations"),
+        bindir.join("..").join("..").join("swi-deploy").join("migrations"),
+    ] {
+        std::fs::create_dir_all(&sibling).expect("sibling dir");
+        std::fs::write(
+            sibling.join("9998_divergent_sibling.sql"),
+            "-- DIVERGENT LEGACY SIBLING: this must never be chosen\nSELECT 1;\n",
+        )
+        .expect("write sibling");
+    }
+
+    let scratch = crate::pg_test_support::ScratchDb::create("f03reloc").await;
     let out = std::process::Command::new(&exe)
         .args(["db", "migrate", "--accept-legacy-baseline"])
-        .current_dir(root.path().join("crate_root"))
+        .current_dir(&cwd)
         .env("DATABASE_URL", scratch.scratch_url())
         .env("MIGRATION_DATABASE_URL", scratch.scratch_url())
         .env_remove("SWI_MIGRATIONS_DIR")
         .output()
-        .expect("spawn the production migrator");
+        .expect("spawn the relocated migrator");
     assert!(
         out.status.success(),
-        "db migrate failed: {}{}",
+        "relocated db migrate failed: {}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 
     let pool = scratch.pool().await;
-    let on_disk = std::fs::read_dir(migrations_dir())
+    let canonical = std::fs::read_dir(migrations_dir())
         .expect("read canonical")
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".sql"))
@@ -2132,19 +2569,25 @@ async fn the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibli
         .await
         .expect("ledger count");
     assert_eq!(
-        applied, on_disk,
-        "the resolver must have loaded the packaged bundle ({on_disk} migrations), not the \
-         one-file divergent sibling"
+        applied, canonical,
+        "the relocated binary must apply its embedded bundle ({canonical} migrations)"
     );
-    let sibling_row: i64 =
-        sqlx::query_scalar(
-            "SELECT count(*) FROM public._migrations WHERE name = '9998_divergent_sibling.sql'",
-        )
-            .fetch_one(&pool)
-            .await
-            .expect("sibling probe");
-    assert_eq!(sibling_row, 0, "no file from the divergent sibling may have been applied");
-    // A sibling-sourced lane could not have produced the invariant 1041 installs.
+    let intruders: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public._migrations \
+          WHERE name IN ('0001_hostile_cwd.sql', '9998_divergent_sibling.sql')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("intruder probe");
+    assert_eq!(intruders, 0, "no file from a planted directory may have been applied");
+    let hostile_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+          WHERE table_schema = 'public' AND table_name = '_hostile_cwd_marker')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("hostile table probe");
+    assert!(!hostile_table, "the hostile cwd bundle must not have executed");
     let invariant: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_constraint \
            WHERE conname = 'workspaces_id_positive_check' \
@@ -2154,50 +2597,34 @@ async fn the_production_resolver_loads_the_packaged_bundle_not_a_divergent_sibli
     .await
     .expect("invariant probe");
     assert!(invariant, "the applied bundle must be the canonical one");
-    pool.close().await;
 
-    // ------------------------------------------------------------------
-    // Second half — the real precedence question. With no cwd-local `./migrations`,
-    // the crate-relative PACKAGED bundle and the cwd-relative DIVERGENT SIBLING are
-    // both reachable, so whichever the binary applies is decided by precedence alone
-    // (REV-093-F05). Without this half the first assertion could hold merely because
-    // the sibling was never reachable.
-    // ------------------------------------------------------------------
-    let bare = root.path().join("bare_root");
-    std::fs::create_dir_all(&bare).expect("bare root");
-    assert!(
-        !bare.join("migrations").exists(),
-        "the cwd-local candidate must be absent, or precedence is not what decides"
-    );
-    assert!(
-        bare.join("../swi-deploy/migrations").is_dir(),
-        "the divergent sibling must be REACHABLE from this cwd: {}",
-        bare.display()
-    );
-    let scratch2 = crate::pg_test_support::ScratchDb::create("f04fallback").await;
+    // And the explicit operator override — the ONE thing that may displace the
+    // embedded bundle — is still honoured, so this is precedence, not a hard-wire.
+    let scratch2 = crate::pg_test_support::ScratchDb::create("f03override").await;
     let out2 = std::process::Command::new(&exe)
         .args(["db", "migrate", "--accept-legacy-baseline"])
-        .current_dir(&bare)
+        .current_dir(&cwd)
         .env("DATABASE_URL", scratch2.scratch_url())
         .env("MIGRATION_DATABASE_URL", scratch2.scratch_url())
-        .env_remove("SWI_MIGRATIONS_DIR")
+        .env("SWI_MIGRATIONS_DIR", &hostile)
         .output()
-        .expect("spawn the production migrator");
+        .expect("spawn the overridden migrator");
     assert!(
         out2.status.success(),
-        "fallback db migrate failed: {}{}",
+        "overridden db migrate failed: {}{}",
         String::from_utf8_lossy(&out2.stdout),
         String::from_utf8_lossy(&out2.stderr)
     );
     let pool2 = scratch2.pool().await;
-    let applied2: i64 = sqlx::query_scalar("SELECT count(*) FROM public._migrations")
+    let overridden: i64 = sqlx::query_scalar("SELECT count(*) FROM public._migrations")
         .fetch_one(&pool2)
         .await
-        .expect("fallback ledger count");
+        .expect("override ledger count");
     assert_eq!(
-        applied2, on_disk,
-        "with no cwd-local bundle the crate-relative PACKAGED bundle must still win over \
-         `../swi-deploy/migrations`"
+        overridden, 1,
+        "SWI_MIGRATIONS_DIR must remain the explicit operator override"
     );
+
+    pool.close().await;
     pool2.close().await;
 }

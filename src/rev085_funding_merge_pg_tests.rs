@@ -42,17 +42,10 @@ async fn scratch_through_1036(
     let mut scratch = crate::pg_test_support::ScratchDb::create(name).await;
     let red_dir = scratch.temp_dir("mig");
     let src_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations");
-    for entry in std::fs::read_dir(&src_dir).expect("read migrations") {
-        let entry = entry.expect("entry");
-        let n = entry.file_name().to_string_lossy().to_string();
-        // Everything from 1037 up is what this test is about; hold it back. A
-        // lexicographic cutoff, not a prefix denylist: REV-087 added 1040, and a
-        // denylist silently leaks every migration added after it was written.
-        if n.ends_with(".sql") && n.as_str() >= "1037_" {
-            continue;
-        }
-        std::fs::copy(entry.path(), red_dir.join(&n)).expect("copy");
-    }
+    // Everything from 1037 up is what this test is about; hold it back. A
+    // lexicographic cutoff, not a prefix denylist: REV-087 added 1040, and a
+    // denylist silently leaks every migration added after it was written.
+    crate::pg_test_support::reduced_bundle(&src_dir, &red_dir, "1037_");
     let pool = scratch.pool().await;
     crate::db::migrate_dir_with(&pool, &red_dir, true)
         .await

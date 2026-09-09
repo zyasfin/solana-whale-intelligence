@@ -10,7 +10,6 @@
 #![cfg(test)]
 
 use chrono::{TimeZone, Utc};
-use sqlx::PgPool;
 
 use solana_whale_intelligence::sf::core::TruthStatus;
 use solana_whale_intelligence::sf::recent::{
@@ -50,9 +49,9 @@ fn event(
 }
 
 /// Typed round-trip: a non-null relation + timestamptz bind directly.
-#[sqlx::test(migrations = false)]
-async fn insert_and_fetch_typed_event(pool: PgPool) {
-    crate::pg_test_support::migrate_scratch(&pool).await;
+#[tokio::test]
+async fn insert_and_fetch_typed_event() {
+    let (_scratch, pool) = crate::pg_test_support::migrated_scratch("rsinsert_and_fetch_t").await;
     let e = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
     assert!(
         append_recent_event_if_absent(&pool, 1, &e).await.expect("insert"),
@@ -67,9 +66,9 @@ async fn insert_and_fetch_typed_event(pool: PgPool) {
 }
 
 /// Workspace isolation: the same token in a different workspace is not leaked.
-#[sqlx::test(migrations = false)]
-async fn workspace_isolation(pool: PgPool) {
-    crate::pg_test_support::migrate_scratch(&pool).await;
+#[tokio::test]
+async fn workspace_isolation() {
+    let (_scratch, pool) = crate::pg_test_support::migrated_scratch("rsworkspace_isolatio").await;
     let e = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
     append_recent_event_if_absent(&pool, 1, &e).await.expect("insert ws1");
 
@@ -79,9 +78,9 @@ async fn workspace_isolation(pool: PgPool) {
 
 /// Relation projection: multiple targets under the same relation all survive,
 /// and the stored confidence is preserved (not hard-coded `Estimated`).
-#[sqlx::test(migrations = false)]
-async fn relation_projection_preserves_confidence_and_targets(pool: PgPool) {
-    crate::pg_test_support::migrate_scratch(&pool).await;
+#[tokio::test]
+async fn relation_projection_preserves_confidence_and_targets() {
+    let (_scratch, pool) = crate::pg_test_support::migrated_scratch("rsrelation_projectio").await;
     let mut e1 = event("e1", "sol:AAA", Some(RecentRelation::SameDeployer), RecentConfidence::Exact);
     e1.related_identities = vec![solana_whale_intelligence::sf::recent::IdentityKey {
         kind: solana_whale_intelligence::sf::recent::IdentityKind::Token,

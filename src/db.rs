@@ -101,84 +101,197 @@ pub fn pool_size(scale_workers: usize) -> u32 {
     (scale_workers as u32 * 2).clamp(2, 16)
 }
 
-/// Candidate migration directories, in resolution order.
+/// The canonical migration bundle: the reviewed SQL plus the reviewed manifest.
 ///
-/// REV-090 (LOW): the canonical SQL now ships INSIDE this crate at `migrations/`,
-/// versioned alongside the source that applies it. The sibling deploy path is a
-/// legacy fallback for checkouts that predate that packaging, not the canonical
-/// location — the previous comment said the opposite, and listed the candidates in
-/// an order the code does not use.
+/// REV-098-F03: migrations used to be RESOLVED from the filesystem by walking a
+/// candidate list — `$SWI_MIGRATIONS_DIR`, then cwd-relative `./migrations`, then
+/// `CARGO_MANIFEST_DIR/migrations`, then two legacy siblings. Every part of that
+/// was a defect:
 ///
-/// The order below matches the code exactly:
-///   1. `$SWI_MIGRATIONS_DIR` — explicit operator override (deployment lane).
-///   2. `./migrations` — cwd-local packaged bundle; CANONICAL for a normal run.
-///   3. `<crate>/migrations` — the SAME packaged bundle, crate-relative (compile-time
-///      `CARGO_MANIFEST_DIR`), for runs whose cwd is not the crate root.
-///   4. `../swi-deploy/migrations` — legacy sibling checkout, cwd-relative.
-///   5. `<crate>/../swi-deploy/migrations` — legacy sibling, crate-relative.
+///   * `./migrations` is whatever directory the operator happened to be standing
+///     in. An unreviewed folder outranked the reviewed bundle by accident of cwd;
+///   * `CARGO_MANIFEST_DIR` is the BUILD HOST's source path, not a shipped
+///     artifact. A binary copied to a deployment host silently lost that candidate
+///     and fell through to `../swi-deploy/migrations`, an unversioned copy that can
+///     drift from the SQL that was reviewed;
+///   * nothing verified the manifest before executing SQL, so a fresh database was
+///     migrated from files no digest ever vouched for. The manifest was consulted
+///     only on the pre-checksum backfill path.
 ///
-/// REV-093-F05: candidates 3 and 4 used to be the other way round, so a run whose
-/// cwd lacked `./migrations` picked the LEGACY sibling over the packaged bundle the
-/// documentation calls canonical. The sibling is unversioned and can drift, so that
-/// ordering let a stale copy silently beat the reviewed one. Both packaged spellings
-/// now precede every legacy fallback.
-///
-/// REV-097-F04: the crate-relative spellings are resolved from `env!` (COMPILE time),
-/// not `std::env::var` (RUN time). `CARGO_MANIFEST_DIR` is only set in the
-/// environment while cargo is driving the process, so the runtime lookup silently
-/// dropped candidates 3 and 5 from every real invocation of the shipped binary —
-/// exactly the lane where the packaged bundle is supposed to beat the legacy sibling.
-/// Running `swi db migrate` from any directory without `./migrations` therefore
-/// applied `../swi-deploy/migrations`, the unversioned copy. A compile-time constant
-/// is the same path under cargo and stable everywhere else.
-///
-/// Resolution is fail-closed: if none exists, `migrate()` reports every path tried
-/// rather than applying zero files (REV-027-F10 / REV-028-F08).
-fn migration_dir_candidates() -> Vec<std::path::PathBuf> {
-    const CRATE_DIR: &str = env!("CARGO_MANIFEST_DIR");
-    let mut candidates = Vec::new();
-    if let Ok(explicit) = std::env::var("SWI_MIGRATIONS_DIR") {
-        if !explicit.trim().is_empty() {
-            candidates.push(std::path::PathBuf::from(explicit.trim()));
-        }
-    }
-    candidates.push(std::path::PathBuf::from("migrations"));
-    candidates.push(std::path::Path::new(CRATE_DIR).join("migrations"));
-    candidates.push(std::path::PathBuf::from("../swi-deploy/migrations"));
-    if let Some(parent) = std::path::Path::new(CRATE_DIR).parent() {
-        candidates.push(parent.join("swi-deploy").join("migrations"));
-    }
-    candidates
+/// The bundle is therefore COMPILED IN (see `build.rs`): the bytes travel inside
+/// the executable, so they cannot be outranked by a directory, cannot be left
+/// behind by a copy, and cannot drift from the reviewed source. The single
+/// remaining override is the explicit operator variable `SWI_MIGRATIONS_DIR`,
+/// which is a deliberate statement, not an accident of location — and it is held
+/// to exactly the same manifest/digest rules as the embedded bundle.
+pub struct MigrationBundle {
+    /// Human-readable provenance, for logs and diagnostics.
+    source: String,
+    /// `(filename, sql)` in filename order.
+    entries: Vec<(String, String)>,
+    /// The reviewed digest for every entry, from this bundle's own manifest.
+    manifest: std::collections::BTreeMap<String, String>,
 }
 
-/// Test-only accessor for [`migration_dir_candidates`] (REV-093-F05), so the
-/// precedence regression exercises the production resolver rather than a copy.
-#[cfg(all(test, feature = "pg_tests"))]
-pub fn migration_dir_candidates_for_tests() -> Vec<std::path::PathBuf> {
-    migration_dir_candidates()
-}
+include!(concat!(env!("OUT_DIR"), "/embedded_migrations.rs"));
 
-/// Resolve the first candidate directory that exists, or report every path tried
-/// (fail-closed: never silently apply zero migrations).
-fn resolve_migration_dir() -> Result<std::path::PathBuf> {
-    let candidates = migration_dir_candidates();
-    for candidate in &candidates {
-        if candidate.is_dir() {
-            return Ok(candidate.clone());
-        }
-    }
-    anyhow::bail!(
-        "no migrations directory found; tried: {}. The canonical bundle is the \
-         packaged `migrations/` directory versioned inside this crate (see \
-         CARGO_MANIFEST_DIR/migrations); `../swi-deploy/migrations` is a legacy \
-         fallback for checkouts that predate packaging. Set SWI_MIGRATIONS_DIR only \
-         to override both.",
-        candidates
+/// The environment variable an operator sets to migrate from a directory instead
+/// of the embedded bundle.
+pub const MIGRATIONS_DIR_OVERRIDE: &str = "SWI_MIGRATIONS_DIR";
+
+impl MigrationBundle {
+    /// The bundle compiled into this binary.
+    pub fn embedded() -> Result<Self> {
+        let entries: Vec<(String, String)> = EMBEDDED_MIGRATIONS
             .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+            .map(|(n, s)| ((*n).to_string(), (*s).to_string()))
+            .collect();
+        Self::build("the migration bundle embedded in this binary", entries, EMBEDDED_MANIFEST)
+    }
+
+    /// A bundle read from an explicit directory (`SWI_MIGRATIONS_DIR`, and the
+    /// reduced lanes tests build).
+    ///
+    /// Every failure here is fatal. REV-039-F04: this enumeration used to be
+    /// `filter_map(|p| read_to_string(&p).ok()?)`, which DROPPED any file it could
+    /// not read — a migration directory that cannot be fully read is not a verified
+    /// migration set.
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("failed to read migrations dir {}", dir.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read an entry in {}", dir.display()))?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().map(|e| e != "sql").unwrap_or(true) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("migration filename is not valid UTF-8: {}", path.display())
+                })?
+                .to_string();
+            let sql = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "failed to read migration {}; a migration directory that \
+                     cannot be fully read is not a verified migration set",
+                    path.display()
+                )
+            })?;
+            if !seen.insert(name.clone()) {
+                anyhow::bail!("duplicate migration filename `{name}` in {}", dir.display());
+            }
+            entries.push((name, sql));
+        }
+        let manifest_path = dir.join(MIGRATION_MANIFEST);
+        if !manifest_path.is_file() {
+            anyhow::bail!(
+                "the reviewed digest manifest {} is missing from {}; it must ship with the \
+                 migrations, because it is what says which bytes were reviewed",
+                MIGRATION_MANIFEST,
+                dir.display()
+            );
+        }
+        let body = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        Self::build(&dir.display().to_string(), entries, &body)
+    }
+
+    /// The bundle this process must apply.
+    ///
+    /// Only the explicit operator override displaces the embedded bundle. There is
+    /// no implicit, location-derived candidate any more.
+    pub fn resolve() -> Result<Self> {
+        match std::env::var(MIGRATIONS_DIR_OVERRIDE) {
+            Ok(explicit) if !explicit.trim().is_empty() => {
+                let dir = std::path::PathBuf::from(explicit.trim());
+                if !dir.is_dir() {
+                    anyhow::bail!(
+                        "{MIGRATIONS_DIR_OVERRIDE} points at {}, which is not a directory. \
+                         Unset it to use the migration bundle embedded in this binary",
+                        dir.display()
+                    );
+                }
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "{MIGRATIONS_DIR_OVERRIDE} overrides the embedded migration bundle"
+                );
+                Self::from_dir(&dir)
+            }
+            _ => Self::embedded(),
+        }
+    }
+
+    /// Validate a candidate bundle: strict manifest parse, exact manifest/file
+    /// BIJECTION, and a digest check on every file — before a single statement of
+    /// SQL is executed.
+    ///
+    /// REV-098-F03: the manifest used to be consulted only when backfilling a
+    /// pre-checksum ledger row, so a FRESH database executed whatever SQL happened
+    /// to be present and recorded the digests of those same unreviewed bytes as
+    /// `applied`. A manifest that is not checked before execution is not an
+    /// authority; it is a comment.
+    fn build(source: &str, mut entries: Vec<(String, String)>, manifest_body: &str) -> Result<Self> {
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let manifest = parse_migration_manifest(manifest_body, source)?;
+        let present: std::collections::BTreeSet<&str> =
+            entries.iter().map(|(n, _)| n.as_str()).collect();
+        let listed: std::collections::BTreeSet<&str> =
+            manifest.keys().map(|s| s.as_str()).collect();
+        let unlisted: Vec<&&str> = present.difference(&listed).collect();
+        if !unlisted.is_empty() {
+            anyhow::bail!(
+                "{source}: {} migration file(s) have no entry in {MIGRATION_MANIFEST} \
+                 ({unlisted:?}); unreviewed SQL must never be executed",
+                unlisted.len()
+            );
+        }
+        let absent: Vec<&&str> = listed.difference(&present).collect();
+        if !absent.is_empty() {
+            anyhow::bail!(
+                "{source}: {MIGRATION_MANIFEST} lists {} migration(s) that are not present \
+                 ({absent:?}); a bundle missing reviewed SQL is not the reviewed bundle",
+                absent.len()
+            );
+        }
+        for (name, sql) in &entries {
+            let want = &manifest[name.as_str()];
+            let got = migration_sha256(sql);
+            if &got != want {
+                anyhow::bail!(
+                    "{source}: migration `{name}` hashes to {} but {MIGRATION_MANIFEST} \
+                     records {}; these are not the reviewed bytes",
+                    short_digest(&got),
+                    short_digest(want)
+                );
+            }
+        }
+        Ok(Self { source: source.to_string(), entries, manifest })
+    }
+
+    /// `(filename, sql)` in filename order.
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.entries
+    }
+
+    /// Where this bundle came from, for logs and diagnostics.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// The reviewed digest for `name`, or `None` when the manifest has no entry.
+    ///
+    /// This is the authority that makes backfilling an already-applied row safe.
+    /// The alternative — hashing whatever is on disk and storing that — would
+    /// accept an edited file as "what was applied", which is precisely the property
+    /// the checksum exists to detect.
+    fn manifest_digest(&self, name: &str) -> Option<&str> {
+        self.manifest.get(name).map(|s| s.as_str())
+    }
 }
 
 /// Apply migrations by executing SQL files from the resolved migrations
@@ -804,13 +917,26 @@ async fn preflight_repair_funding_case_identity(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-/// Apply migrations from the directory resolved by [`resolve_migration_dir`].
+/// Apply the migration bundle this binary must apply (see [`MigrationBundle::resolve`]).
 ///
 /// `accept_legacy_baseline` permits recording pre-checksum rows as
 /// `baseline:<digest>` (see [`BASELINE_PREFIX`]).
 pub async fn migrate_with(pool: &PgPool, accept_legacy_baseline: bool) -> Result<()> {
-    let dir = resolve_migration_dir()?;
-    migrate_dir_with(pool, &dir, accept_legacy_baseline).await
+    let bundle = MigrationBundle::resolve()?;
+    migrate_bundle_with(pool, &bundle, accept_legacy_baseline).await
+}
+
+/// Apply migrations from an EXPLICIT directory. Test lanes and the operator
+/// override reach the same validation as the embedded bundle: the directory is
+/// loaded through [`MigrationBundle::from_dir`], so its manifest must be a strict
+/// bijection with its SQL and every digest must match before anything executes.
+pub async fn migrate_dir_with(
+    pool: &PgPool,
+    dir: &std::path::Path,
+    accept_legacy_baseline: bool,
+) -> Result<()> {
+    let bundle = MigrationBundle::from_dir(dir)?;
+    migrate_bundle_with(pool, &bundle, accept_legacy_baseline).await
 }
 
 /// Owns the connection that holds the migration advisory lock for the whole run.
@@ -835,76 +961,91 @@ impl Drop for MigrationLock {
     }
 }
 
-/// Whether the ledger's provenance CHECK admits EXACTLY `{NULL, 'applied', 'baseline'}`.
+/// Whether the ledger's provenance CHECK is EXACTLY the canonical predicate.
 ///
-/// REV-096-F03: the previous test was `def.contains("applied") && def.contains("baseline")`,
-/// which a forged predicate passes trivially — `digest_origin IN ('applied','baseline','forged')`
-/// contains both words and admits a third value, and `true OR digest_origin IN (...)`
-/// admits everything. Substring matching cannot answer a question about a SET.
+/// REV-096-F03 replaced a substring test with a finite probe set: six values were
+/// evaluated against the constraint's own expression and the answers had to match.
+/// REV-098-F02 broke it in one line — a forged
+/// `CHECK (canonical_predicate OR digest_origin = 'rogue')` answers all six probes
+/// correctly and still admits `rogue`. Any FINITE sample of an infinite domain is
+/// bypassable by construction; the only question a sample can answer is "is it
+/// wrong in one of the ways I guessed".
 ///
-/// So the set is measured, not read: each candidate value is evaluated against the
-/// constraint's own expression via `pg_get_expr`, and the accepted set must equal the
-/// defined one exactly. `forged` and `APPLIED` are probed specifically because they are
-/// what a widened or case-folded predicate would let through.
-async fn digest_origin_check_admits_exactly(
+/// So the predicate is compared as an EXPRESSION, not sampled as a function. The
+/// canonical CHECK is installed on a throwaway temp table with a column of the same
+/// name and type, and the server's own rendering (`pg_get_expr(conbin, conrelid)`,
+/// produced by deparsing the stored parse tree) is compared with the rendering of
+/// the constraint actually present.
+///
+/// Why that is authoritative rather than another string test:
+///
+///   * both sides are deparsed by THIS server from a parsed, analyzed expression
+///     tree, so spacing, casing, quoting, operator spelling, `IN` vs `= ANY`,
+///     redundant parentheses and implicit casts are all normalized identically —
+///     the rendering is a function of the tree, not of the text someone typed;
+///   * therefore equal renderings mean equal trees, and any added disjunct,
+///     widened list, or case-folding wrapper changes the tree and changes the
+///     rendering. There is nothing left to "not have guessed".
+///
+/// The temp table is created inside the caller's transaction and dropped on commit,
+/// so this leaves nothing behind and cannot collide with a concurrent migrator.
+async fn digest_origin_check_is_canonical(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     conname: &str,
+    canonical_check: &str,
 ) -> Result<bool> {
-    let expr: String = sqlx::query_scalar(
+    let installed: String = sqlx::query_scalar(
         "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint \
           WHERE conname = $1 AND conrelid = 'public._migrations'::regclass",
     )
     .bind(conname)
     .fetch_one(&mut **tx)
-    .await?;
-    // Evaluate the real predicate against each probe value by substituting the column
-    // reference. The expression is the SERVER's own rendering of the constraint.
-    let probes: [(Option<&str>, bool); 6] = [
-        (None, true),
-        (Some("applied"), true),
-        (Some("baseline"), true),
-        (Some("forged"), false),
-        (Some(""), false),
-        (Some("APPLIED"), false),
-    ];
-    for (value, want) in probes {
-        let literal = match value {
-            None => "NULL::text".to_string(),
-            Some(v) => format!("{}::text", quote_sql_literal(v)),
-        };
-        let rendered = expr.replace("digest_origin", &literal);
-        // A CHECK passes when the predicate is TRUE or NULL (unknown).
-        let admitted: bool =
-            sqlx::query_scalar(&format!("SELECT COALESCE(({rendered}), true)"))
-                .fetch_one(&mut **tx)
-                .await
-                .with_context(|| {
-                    format!("failed to evaluate the ledger CHECK against probe {value:?}")
-                })?;
-        if admitted != want {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    .await
+    .context("failed to read the installed ledger CHECK expression")?;
+
+    // A uniquely named probe table: a temp table from an earlier statement in this
+    // same session would otherwise be reused with a stale constraint.
+    let probe = format!("_swi_digest_origin_canon_{}", std::process::id());
+    sqlx::raw_sql(&format!(
+        "CREATE TEMP TABLE {probe} (digest_origin text) ON COMMIT DROP"
+    ))
+    .execute(&mut **tx)
+    .await
+    .context("failed to create the canonical-CHECK probe table")?;
+    sqlx::raw_sql(&format!(
+        "ALTER TABLE {probe} ADD CONSTRAINT {probe}_canon {canonical_check}"
+    ))
+    .execute(&mut **tx)
+    .await
+    .context("failed to install the canonical ledger CHECK on the probe table")?;
+    let canonical: String = sqlx::query_scalar(
+        "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint WHERE conname = $1",
+    )
+    .bind(format!("{probe}_canon"))
+    .fetch_one(&mut **tx)
+    .await
+    .context("failed to read the canonical CHECK expression")?;
+
+    Ok(installed == canonical)
 }
 
-/// Single-quote a string for inline SQL. Only used on the fixed probe values above.
-fn quote_sql_literal(v: &str) -> String {
-    format!("'{}'", v.replace('\'', "''"))
-}
-
-/// Apply migrations from an EXPLICIT directory.
+/// Apply an already-VALIDATED [`MigrationBundle`].
 ///
 /// REV-087 item 7: tests used to point the migrator at a reduced migration set by
 /// mutating the process-global `SWI_MIGRATIONS_DIR`. `cargo test --features
 /// pg_tests` runs two harness processes (lib + bin) and the bin harness is
 /// multi-threaded, so one fixture's `remove_var` could land inside another
 /// fixture's migration run — the lifecycle defect behind the reviewer's
-/// `3D000: database ... does not exist` full-suite failures. The directory is a
+/// `3D000: database ... does not exist` full-suite failures. The bundle is a
 /// parameter now; nothing global is touched.
-pub async fn migrate_dir_with(
+///
+/// REV-098-F03: constructing the bundle is what enforces manifest/file bijection
+/// and per-file digests, and construction happens before this function is entered.
+/// So no SQL can execute from a bundle the reviewed manifest does not vouch for —
+/// on a FRESH database as much as on an upgrade.
+pub async fn migrate_bundle_with(
     pool: &PgPool,
-    dir: &std::path::Path,
+    bundle: &MigrationBundle,
     accept_legacy_baseline: bool,
 ) -> Result<()> {
     // REV-097-F03: the advisory lock is taken FIRST, before a single statement of
@@ -1014,17 +1155,22 @@ pub async fn migrate_dir_with(
                 .await?;
             }
             Some(def) => {
-                // REV-096-F03: "contains the words applied and baseline" is not a
-                // definition check — a forged CHECK such as
-                // `digest_origin IN ('applied','baseline','forged')` or one that is
-                // always true would pass it while admitting values the ledger's
-                // provenance model does not define. Validate the ALLOWED SET by
-                // asking the server which values the predicate actually accepts.
-                let ok = digest_origin_check_admits_exactly(&mut tx, DIGEST_ORIGIN_CHECK).await?;
+                // REV-098-F02: a finite probe set cannot prove which values a
+                // predicate admits — `canonical OR digest_origin = 'rogue'` answers
+                // every probe correctly and still widens the ledger's trust model.
+                // Compare the EXPRESSION instead: the server's deparse of the
+                // installed constraint must be identical to its deparse of the
+                // canonical one.
+                let ok = digest_origin_check_is_canonical(
+                    &mut tx,
+                    DIGEST_ORIGIN_CHECK,
+                    DIGEST_ORIGIN_EXPR,
+                )
+                .await?;
                 if !ok {
                     anyhow::bail!(
-                        "the migration ledger's `{DIGEST_ORIGIN_CHECK}` constraint does not admit \
-                         exactly {{NULL, 'applied', 'baseline'}} (found `{def}`). It defines which \
+                        "the migration ledger's `{DIGEST_ORIGIN_CHECK}` constraint is not the \
+                         canonical `{DIGEST_ORIGIN_EXPR}` (found `{def}`). It defines which \
                          digest provenances are representable, so accepting a different predicate \
                          would silently widen the ledger's trust model; reconcile deliberately"
                     );
@@ -1083,23 +1229,10 @@ pub async fn migrate_dir_with(
     // order — the repair must precede the loop entirely.
     preflight_repair_funding_case_identity(pool).await?;
 
-    tracing::info!(migrations_dir = %dir.display(), "applying migrations");
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .with_context(|| format!("failed to read migrations dir {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "sql").unwrap_or(false))
-        .collect();
-    entries.sort();
-    for path in entries {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow::anyhow!("invalid migration filename"))?
-            .to_string();
-        let sql = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read migration {}", path.display()))?;
-        let digest = migration_sha256(&sql);
+    tracing::info!(bundle = %bundle.source(), "applying migrations");
+    for (name, sql) in bundle.entries() {
+        let name = name.clone();
+        let digest = migration_sha256(sql);
 
         let applied: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT name, sha256, digest_origin FROM public._migrations WHERE name = $1",
@@ -1152,7 +1285,7 @@ pub async fn migrate_dir_with(
             // checksum. The digest is accepted only when it matches the reviewed,
             // version-controlled manifest that ships beside the SQL.
             if recorded.is_none() {
-                match manifest_digest(dir, &name)? {
+                match bundle.manifest_digest(&name) {
                     Some(expected) if expected == digest => {
                         // REV-041-F01: matching the CURRENT manifest does not make
                         // this a verified row. The manifest describes the files as
@@ -1198,7 +1331,7 @@ pub async fn migrate_dir_with(
                              The file changed after it was applied; resolve this \
                              deliberately rather than blessing the current contents",
                             short_digest(&digest),
-                            short_digest(&expected)
+                            short_digest(expected)
                         );
                     }
                     None => {
@@ -1238,7 +1371,7 @@ pub async fn migrate_dir_with(
         let mut tx = pool.begin().await?;
         // Pin `public` so DDL never lands in the legacy archive schema.
         sqlx::raw_sql(MIGRATION_SEARCH_PATH).execute(&mut *tx).await?;
-        sqlx::raw_sql(&sql).execute(&mut *tx).await?;
+        sqlx::raw_sql(sql.as_str()).execute(&mut *tx).await?;
         // `applied`: this binary executed exactly these bytes in this transaction.
         sqlx::query(
             "INSERT INTO public._migrations (name, sha256, digest_origin) \
@@ -1281,54 +1414,19 @@ pub async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
         );
     }
 
-    let dir = resolve_migration_dir()?;
-    // REV-039-F04: this used to be `.filter_map(|p| ... read_to_string(&p).ok()?)`,
-    // which DROPPED any file it could not read. The reviewer added a `.sql` file
-    // with invalid UTF-8 and schema verification passed while silently ignoring it
-    // (`UNREADABLE_SQL_IGNORED=yes`). A migration directory that cannot be fully
-    // read is not a verified migration set, so every failure below is fatal:
-    // unreadable bytes, a non-UTF-8 filename, a directory entry that errors, and a
-    // duplicate name.
-    let mut on_disk: Vec<(String, String)> = Vec::new();
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("failed to read migrations dir {}", dir.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!("failed to read an entry in {}", dir.display())
-        })?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().map(|e| e != "sql").unwrap_or(true) {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "migration filename is not valid UTF-8: {}",
-                    path.display()
-                )
-            })?
-            .to_string();
-        let body = std::fs::read_to_string(&path).with_context(|| {
-            format!(
-                "failed to read migration {} while verifying the schema; a migration \
-                 directory that cannot be fully read is not a verified migration set",
-                path.display()
-            )
-        })?;
-        if !seen_names.insert(name.clone()) {
-            anyhow::bail!(
-                "duplicate migration filename `{name}` in {}",
-                dir.display()
-            );
-        }
-        on_disk.push((name, migration_sha256(&body)));
-    }
+    // REV-098-F03: the verifier compares the ledger against the BUNDLE this binary
+    // carries, not against whatever directory the cwd happens to offer. The bundle
+    // has already proven manifest/file bijection and per-file digests at
+    // construction, so "the schema is current" is a statement about reviewed bytes.
+    // (`MigrationBundle::from_dir` keeps the REV-039-F04 rule that every read
+    // failure is fatal: an unreadable directory cannot be fully read and is
+    // therefore not a verified migration set.)
+    let bundle = MigrationBundle::resolve()?;
+    let mut on_disk: Vec<(String, String)> = bundle
+        .entries()
+        .iter()
+        .map(|(name, sql)| (name.clone(), migration_sha256(sql)))
+        .collect();
     on_disk.sort();
 
     // REV-037-F01: a recorded FILENAME is not evidence. The reviewer inserted a
@@ -1607,29 +1705,6 @@ pub fn parse_migration_manifest_for_tests(
     source: &str,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     parse_migration_manifest(body, source)
-}
-
-/// The digest the reviewed manifest records for `name`, or `None` when the
-/// manifest has no entry for it.
-///
-/// This is the authority that makes backfilling an already-applied row safe. The
-/// alternative — hashing whatever is on disk and storing that — would accept an
-/// edited file as "what was applied", which is precisely the property the checksum
-/// exists to detect.
-fn manifest_digest(dir: &std::path::Path, name: &str) -> Result<Option<String>> {
-    let path = dir.join(MIGRATION_MANIFEST);
-    if !path.exists() {
-        anyhow::bail!(
-            "the reviewed digest manifest {} is missing from {}; it must ship with the \
-             migrations so pre-checksum ledger rows can be verified",
-            MIGRATION_MANIFEST,
-            dir.display()
-        );
-    }
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let recorded = parse_migration_manifest(&body, &path.display().to_string())?;
-    Ok(recorded.get(name).cloned())
 }
 
 /// SHA-256 of a migration file body, hex-encoded.
@@ -2362,14 +2437,9 @@ mod tests {
             .expect("drop probe table");
 
         // A real digest for a real file, so the "all good" case is meaningful.
-        let dir = resolve_migration_dir().expect("resolve migrations dir");
-        let sample = std::fs::read_dir(&dir)
-            .expect("read migrations")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().map(|x| x == "sql").unwrap_or(false))
-            .expect("at least one migration file");
-        let sample_body = std::fs::read_to_string(&sample).expect("read sample");
+        let bundle = MigrationBundle::resolve().expect("resolve migration bundle");
+        let (_, sample_body) =
+            bundle.entries().first().cloned().expect("at least one migration");
         let real_digest = migration_sha256(&sample_body);
 
         // Digest of the same file with one character changed: what an edited file
