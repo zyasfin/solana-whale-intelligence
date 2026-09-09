@@ -137,7 +137,35 @@ include!(concat!(env!("OUT_DIR"), "/embedded_migrations.rs"));
 
 /// The environment variable an operator sets to migrate from a directory instead
 /// of the embedded bundle.
+///
+/// REV-100-F02: this is read from the PROCESS environment as it existed at entry
+/// to `main`, captured by [`capture_process_migrations_override`] BEFORE
+/// `dotenvy::dotenv()` runs (`EnvConfig::load`). `.env` discovery walks the
+/// current directory and its parents, so a plain `std::env::var` here would let
+/// whatever `.env` file the operator happened to be standing next to choose which
+/// SQL this binary executes — exactly the ambient-location authority REV-098-F03
+/// removed from the resolver. An override must be a deliberate statement by
+/// whoever launched the process.
 pub const MIGRATIONS_DIR_OVERRIDE: &str = "SWI_MIGRATIONS_DIR";
+
+/// The value of [`MIGRATIONS_DIR_OVERRIDE`] in the launching process environment.
+///
+/// `None` until captured, and `Some(None)` when the launcher did not set it. A
+/// process that never captures gets NO override at all — fail-closed: an
+/// uncaptured override is indistinguishable from an ambient one.
+static PROCESS_MIGRATIONS_OVERRIDE: std::sync::OnceLock<Option<String>> =
+    std::sync::OnceLock::new();
+
+/// Record the launching process's [`MIGRATIONS_DIR_OVERRIDE`].
+///
+/// MUST be called before anything loads `.env` (i.e. as the first thing `main`
+/// does). Idempotent; only the first call is kept, so a later `set_var` cannot
+/// re-authorize the override either.
+pub fn capture_process_migrations_override() {
+    let _ = PROCESS_MIGRATIONS_OVERRIDE.get_or_init(|| {
+        std::env::var(MIGRATIONS_DIR_OVERRIDE).ok().filter(|v| !v.trim().is_empty())
+    });
+}
 
 impl MigrationBundle {
     /// The bundle compiled into this binary.
@@ -203,11 +231,13 @@ impl MigrationBundle {
 
     /// The bundle this process must apply.
     ///
-    /// Only the explicit operator override displaces the embedded bundle. There is
-    /// no implicit, location-derived candidate any more.
+    /// Only the explicit operator override displaces the embedded bundle, and only
+    /// when it came from the LAUNCHING process environment (REV-100-F02): the
+    /// captured value, never a live `std::env::var`, which by then may be whatever
+    /// an ambient `.env` in the cwd or one of its parents put there.
     pub fn resolve() -> Result<Self> {
-        match std::env::var(MIGRATIONS_DIR_OVERRIDE) {
-            Ok(explicit) if !explicit.trim().is_empty() => {
+        match PROCESS_MIGRATIONS_OVERRIDE.get().and_then(|v| v.as_deref()) {
+            Some(explicit) => {
                 let dir = std::path::PathBuf::from(explicit.trim());
                 if !dir.is_dir() {
                     anyhow::bail!(
@@ -222,7 +252,7 @@ impl MigrationBundle {
                 );
                 Self::from_dir(&dir)
             }
-            _ => Self::embedded(),
+            None => Self::embedded(),
         }
     }
 
@@ -986,6 +1016,13 @@ impl Drop for MigrationLock {
 ///   * therefore equal renderings mean equal trees, and any added disjunct,
 ///     widened list, or case-folding wrapper changes the tree and changes the
 ///     rendering. There is nothing left to "not have guessed".
+///   * a CHECK that is `NOT VALID` is not an enforced statement about the table's
+///     current contents at all: PostgreSQL accepts an expression-identical
+///     `CHECK ... NOT VALID` while pre-existing out-of-domain rows survive
+///     (REV-100-F01, reproduced on 17.11). Canonicality therefore also requires
+///     the catalog row to be a CHECK (`contype = 'c'`) on the ledger relation and
+///     to be `convalidated` — an unvalidated constraint is a promise about future
+///     writes only.
 ///
 /// The temp table is created inside the caller's transaction and dropped on commit,
 /// so this leaves nothing behind and cannot collide with a concurrent migrator.
@@ -994,14 +1031,23 @@ async fn digest_origin_check_is_canonical(
     conname: &str,
     canonical_check: &str,
 ) -> Result<bool> {
-    let installed: String = sqlx::query_scalar(
-        "SELECT pg_get_expr(conbin, conrelid) FROM pg_constraint \
-          WHERE conname = $1 AND conrelid = 'public._migrations'::regclass",
+    let found: Option<(bool, String)> = sqlx::query_as(
+        "SELECT convalidated, pg_get_expr(conbin, conrelid) FROM pg_constraint \
+          WHERE conname = $1 AND conrelid = 'public._migrations'::regclass \
+            AND contype = 'c'",
     )
     .bind(conname)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
     .context("failed to read the installed ledger CHECK expression")?;
+    let Some((convalidated, installed)) = found else {
+        // A constraint of some other kind, or on some other relation, with this
+        // name is not the ledger's provenance CHECK.
+        return Ok(false);
+    };
+    if !convalidated {
+        return Ok(false);
+    }
 
     // A uniquely named probe table: a temp table from an earlier statement in this
     // same session would otherwise be reused with a stale constraint.

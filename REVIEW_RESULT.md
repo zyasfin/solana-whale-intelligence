@@ -113,6 +113,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-098 | 2026-09-09 | independent verification of REV-097 | CHANGES REQUIRED / NOT APPROVED | Rust 369/369; pg_tests 511/511; focused 6/6; e1e0403-to-REV-097 upgrade FAIL |
 | REV-099 | 2026-09-09 | implementasi corrective REV-098 F01-F04 | READY FOR REVIEW | default 369/369; pg_tests 515/515; RED->GREEN 4/4; readback 54\|54\|54\|0\|0; residu 0 |
 | REV-100 | 2026-09-09 | independent verification of REV-099 | CHANGES REQUIRED / NOT APPROVED | F01/F03/F04 accepted; F02 CHECK NOT VALID bypass reproduced; fresh PG/manifest gates pass |
+| REV-101 | 2026-09-09 | implementasi corrective REV-100 F01-F02 | READY FOR REVIEW | default 369/369; pg_tests 518/518; RED->GREEN 2/2; focused 6/6; readback 54\|54\|54; residu 0 |
 
 ---
 
@@ -15914,3 +15915,150 @@ reviewer cleanup                        owned DB/targets residue 0
 One independent full rerun was interrupted by reviewer harness/tool-budget limits; no inherited count is promoted beyond the retained complete artifacts and fresh migration/readback evidence.
 
 **Verdict: CHANGES REQUIRED / NOT APPROVED.**
+
+## REV-101 — Implementasi corrective atas independent review REV-100
+
+**Tanggal:** 2026-09-09
+**Mode:** fresh OMP corrective session
+**Under review:** `72f9ced` (REV-099); ledger head `d0763785ba095c27ece7cc5924c2f1cf39e53d5a` (REV-100)
+**Scope:** REV-100-F01 dan REV-100-F02 saja. REV-098-F01/F04 tidak dibuka kembali; regresinya dipertahankan dan dijalankan ulang.
+
+### Keadaan awal
+
+Kedua temuan REV-100 belum diimplementasi di `72f9ced`:
+
+* `digest_origin_check_is_canonical` (`src/db.rs`) hanya membandingkan `pg_get_expr(conbin, conrelid)` — tidak ada `convalidated`, tidak ada `contype`;
+* `MigrationBundle::resolve` membaca `std::env::var(SWI_MIGRATIONS_DIR)` langsung, dan `Settings::load` → `EnvConfig::load` memanggil `dotenvy::dotenv()` sebelum resolusi. Nilai yang dibaca resolver bisa berasal dari `.env` di cwd atau salah satu parent-nya.
+
+### REV-100-F01 — CHECK kanonik yang `NOT VALID` diterima
+
+**File:** `src/db.rs`, `digest_origin_check_is_canonical`.
+
+**Perilaku lama:** satu `query_scalar` mengambil `pg_get_expr(conbin, conrelid)` untuk `conname` pada `public._migrations` dan mengembalikan `installed == canonical`. PostgreSQL menerima `CHECK <ekspresi kanonik> NOT VALID` tanpa memeriksa baris yang sudah ada, jadi ekspresi identik tetapi baris `digest_origin = 'rogue'` bertahan. Preflight migrasi hanya menolak `digest_origin IS NULL`, sehingga provenance non-NULL sembarang lolos.
+
+**Perilaku baru:** katalog dibaca dengan `query_as` sebagai `(convalidated, pg_get_expr(conbin, conrelid))`, difilter `conname = $1 AND conrelid = 'public._migrations'::regclass AND contype = 'c'`, `fetch_optional`. Tidak ada baris → `false` (constraint dengan nama itu bukan CHECK ledger, atau ada pada relasi lain). `convalidated = false` → `false`. Baru setelah itu ekspresi dibandingkan dengan deparse kanonik dari temp table.
+
+**Mengapa mekanisme ini otoritatif:** `convalidated` adalah satu-satunya pernyataan katalog tentang BARIS YANG SUDAH ADA. Ekspresi yang sama persis adalah janji tentang tulisan berikutnya; `convalidated = true` adalah bukti server sudah memindai tabel dan tidak menemukan pelanggar. `contype = 'c'` + `conrelid` menutup kelas yang sama pada arah lain: nama yang sama pada constraint jenis lain atau relasi lain. Ketiganya properti katalog, bukan sampel — tidak ada nilai yang bisa "tidak tertebak".
+
+Perbaikan berada di jalur canonicality yang sudah dipanggil SEBELUM loop migrasi dan sebelum preflight apa pun, jadi kegagalan terjadi sebelum satu pun statement migrasi dieksekusi.
+
+### REV-100-F02 — override migrasi bisa disuntik `.env` ambient
+
+**File:** `src/db.rs` (`PROCESS_MIGRATIONS_OVERRIDE`, `capture_process_migrations_override`, `MigrationBundle::resolve`), `src/main.rs`.
+
+**Perilaku lama:** `resolve()` membaca variabel proses saat dipanggil. `dotenvy::dotenv()` sudah berjalan lebih dulu di `Settings::load`, dan pencariannya menaiki cwd beserta parent-nya, jadi `.env` milik direktori tempat operator kebetulan berdiri dapat memilih SQL mana yang dieksekusi binary ini — otoritas lokasi ambient yang persis dihapus REV-098-F03 dari daftar kandidat, masuk lagi lewat pintu belakang.
+
+**Perilaku baru:** `main()` memanggil `db::capture_process_migrations_override()` sebagai statement pertama, sebelum `tracing_subscriber` dan sebelum `Settings::load`. Fungsi itu menyimpan `SWI_MIGRATIONS_DIR` dari environment proses peluncur ke `OnceLock<Option<String>>`. `resolve()` sekarang hanya membaca snapshot itu; `std::env::var` tidak lagi dipanggil di sana.
+
+**Mengapa fail-closed:** proses yang tidak pernah memanggil capture mendapat `None` — tidak ada override sama sekali. Override yang tidak tercatat tidak bisa dibedakan dari override ambient, jadi ia tidak diberi kepercayaan. `OnceLock` juga berarti `set_var` yang terjadi belakangan tidak bisa mengotorisasi ulang override.
+
+Override eksplisit dari peluncur tetap didukung penuh, dengan aturan manifest/digest yang sama seperti bundle tertanam.
+
+### RED → GREEN
+
+Kedua RED dibuat dengan mengembalikan BENTUK kode pra-perbaikan, bukan tautologi, dan keduanya gagal sebagai ASSERTION (ada baris `test result:`), bukan compile error.
+
+F01 — `digest_origin_check_is_canonical` dikembalikan ke `query_scalar` tanpa `convalidated`/`contype`:
+
+```text
+test rev101_migration_authority_pg_tests::a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator ... FAILED
+thread '...' panicked at src\rev101_migration_authority_pg_tests.rs:71:10:
+an unvalidated ledger CHECK must fail the migration closed: ()
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 285 filtered out; finished in 2.43s
+```
+
+F02 — `resolve()` dikembalikan ke `std::env::var(MIGRATIONS_DIR_OVERRIDE)`:
+
+```text
+test rev101_migration_authority_pg_tests::an_ambient_dotenv_cannot_choose_the_migration_source ... FAILED
+assertion `left == right` failed: the embedded bundle must win over an ambient .env (54 migrations)
+  left: 1
+ right: 54
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 285 filtered out; finished in 1.50s
+```
+
+`left: 1` adalah satu-satunya file bundle bermusuhan: `.env` benar-benar mengambil alih sumber migrasi.
+
+GREEN setelah pemulihan byte-identik:
+
+```text
+running 3 tests
+test rev101_migration_authority_pg_tests::a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator ... ok
+test rev101_migration_authority_pg_tests::a_validated_canonical_check_is_still_accepted ... ok
+test rev101_migration_authority_pg_tests::an_ambient_dotenv_cannot_choose_the_migration_source ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 283 filtered out; finished in 7.18s
+```
+
+### Mengapa tesnya tidak vacuous
+
+* `a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator` memasang ekspresi kanonik PERSIS — hanya `NOT VALID` yang membedakan — di atas baris `digest_origin = 'rogue'`, lalu menjalankan `migrate_with` produksi. Ia menuntut kegagalan yang menyebut nama constraint DAN membuktikan tidak ada kerja migrasi yang terjadi: `count(*) = 1` di ledger dan `public.workspaces` tidak ada.
+* `a_validated_canonical_check_is_still_accepted` adalah pasangannya: ekspresi yang sama, VALIDATED, harus tetap diterima dan menerapkan 54 migrasi. Tanpa tes ini, tes pertama juga akan lulus jika migrator sekadar menolak setiap constraint yang sudah ada.
+* `an_ambient_dotenv_cannot_choose_the_migration_source` menyalin HANYA binary ke direktori lain, menanam bundle bermusuhan yang manifest-nya konsisten sendiri (jadi kalau terpilih ia akan DITERIMA — hanya provenance yang menahannya), menulis `.env` berisi `SWI_MIGRATIONS_DIR=<hostile>`, dan menjalankan dengan `env_remove` pada variabel itu. Paruh keduanya menjalankan binary yang sama dari cwd bermusuhan yang sama dengan override dari peluncur, dan menuntut override tetap menang (`overridden == 1`) — jadi ini batas kepercayaan, bukan hard-wire.
+
+### Probe binary produksi (di luar harness tes)
+
+Database sekali pakai, ledger di-bootstrap manual, baris rogue, CHECK kanonik `NOT VALID`, lalu `solana-whale-intelligence.exe db migrate --accept-legacy-baseline`:
+
+```text
+constraint = false|((digest_origin IS NULL) OR (digest_origin = ANY (ARRAY['applied'::text, 'baseline'::text])))
+rogue_before = 1
+migrate_rc = 1
+stderr: the migration ledger's `_migrations_digest_origin_check` constraint is not the canonical
+        `CHECK (digest_origin IS NULL OR digest_origin IN ('applied', 'baseline'))`
+        (found `CHECK (((digest_origin IS NULL) OR (digest_origin = ANY (ARRAY['applied'::text, 'baseline'::text])))) NOT VALID`)
+rows_after = 1
+workspaces_exists = f
+```
+
+Bandingkan dengan reproduksi REV-100 pada kode lama: `migrate_rc=0`. Sekarang `1`, dan tidak ada state migrasi yang berubah.
+
+### Gates
+
+```text
+Rust/Cargo                                      1.89.0
+PostgreSQL                                      17.11
+cargo check --locked --all-targets              clean, 0 warning
+cargo check --locked --features pg_tests --all-targets  clean, 0 warning
+cargo test --locked                             369 passed / 0 failed
+cargo test --locked --features pg_tests -- --test-threads=1
+                                                518 passed / 0 failed
+                                                (181 lib + 286 bin + 51 integration)
+```
+
+Rincian lane pg: 181, 286, 7, 3, 3, 5, 20, 4, 6, 3, 0 — semuanya `ok`, 0 failed.
+
+Focused exact (`-- --exact`), masing-masing 1 passed:
+
+```text
+rev101_migration_authority_pg_tests::a_not_valid_canonical_check_over_a_rogue_row_fails_the_migrator   1 passed
+rev101_migration_authority_pg_tests::a_validated_canonical_check_is_still_accepted                     1 passed
+rev101_migration_authority_pg_tests::an_ambient_dotenv_cannot_choose_the_migration_source              1 passed
+rev087_migration_integrity_pg_tests::the_relocated_binary_uses_only_its_embedded_bundle                1 passed
+rev087_migration_integrity_pg_tests::an_authenticated_predecessor_bundle_converges_to_current          1 passed
+rev087_migration_integrity_pg_tests::the_embedded_bundle_is_the_reviewed_bundle                        1 passed
+```
+
+Upgrade terautentikasi dari `e1e0403` (REV-096) berjalan dari object database, bukan salinan working tree, dan konvergen ke bundle saat ini.
+
+### Schema / ledger / manifest / residu
+
+```text
+migrations/*.sql                    54
+MANIFEST.sha256 entri file          54 (0 mismatch, digest atas byte LF-normalized)
+_migrations                         54 baris | 54 sha256 | 54 digest_origin='applied'
+1041_rev093_positive_id_invariant.sql            d7a8984db0c30eecc42421c6209fe126ab3baa7315dd310afa19d21dd3da7db4 (tidak tersentuh)
+1042_rev098_positive_id_invariant_repair.sql     b9ebdf36e55322d02d20ecc384cbe79872de02501a2e0bc5deb3606913995804 (tidak tersentuh)
+migrasi baru pada ronde ini         tidak ada
+database residu milik ronde ini     0 (yang tersisa hanya swi_test dan dua DB reviewer terdahulu: rev063_audit, rev086_fullpg_20260907)
+```
+
+Tidak ada file migrasi yang diedit dan tidak ada baris MANIFEST yang diubah pada ronde ini — perbaikan seluruhnya di Rust.
+
+### Yang TIDAK saya kerjakan / batasan
+
+* `rev063_audit` dan `rev086_fullpg_20260907` adalah database peninggalan ronde reviewer terdahulu, bukan milik ronde ini; keduanya tidak saya hapus.
+* REV-100 mencatat bahwa kata-kata regresi lama REV-098-F04 (kegagalan child SQLx) sudah tidak berlaku setelah konversi ke `migrated_scratch`. Itu penilaian yang saya terima; tidak ada `#[sqlx::test]` aktif untuk dipulihkan, jadi tidak ada kerja yang saya lakukan di sana.
+* `capture_process_migrations_override` sengaja tidak dipanggil dari harness tes. Tes yang butuh bundle direktori memanggil `migrate_dir_with` secara eksplisit, dan tes relokasi/`.env` menjalankan binary produksi sungguhan — jalur itulah yang menjadi bukti.
+* Tidak ada sumber otoritas CLI baru (`--migrations-dir`) yang ditambahkan: environment proses peluncur sudah merupakan otoritas eksplisit yang dituntut temuan, dan flag baru akan menjadi permukaan kedua untuk keputusan yang sama.
+
+**Verdict: READY FOR REVIEW.**

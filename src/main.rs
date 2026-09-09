@@ -77,6 +77,9 @@ mod rev087_alert_ownership_pg_tests;
 /// REV-086-F05 evaluator claim release and failure accounting.
 #[cfg(all(test, feature = "pg_tests"))]
 mod rev087_evaluator_lifecycle_pg_tests;
+/// REV-100-F01/F02 ledger-CHECK validity and migration-source authority.
+#[cfg(all(test, feature = "pg_tests"))]
+mod rev101_migration_authority_pg_tests;
 mod gmgn;
 mod graph;
 mod health;
@@ -400,6 +403,11 @@ enum WatchAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // REV-100-F02: snapshot the migration override from the LAUNCHING process
+    // environment before anything can load a `.env`. `Settings::load` calls
+    // `dotenvy::dotenv()`, which searches the cwd and its parents — after that
+    // point `SWI_MIGRATIONS_DIR` may be ambient rather than operator-supplied.
+    db::capture_process_migrations_override();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
