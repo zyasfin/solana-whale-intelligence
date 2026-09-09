@@ -16708,3 +16708,162 @@ tracked diff                           empty
 Run a bounded migration/provenance lane only, with mandatory `finally` cleanup, no cold full rebuild, and a strict timeout. Approval requires complete runtime predecessor upgrade evidence plus residue zero.
 
 **Verdict: CHANGES REQUIRED / BLOCKED.**
+
+---
+
+## REV-107 — Remediasi bukti atas independent review REV-106
+
+**Tanggal:** 2026-09-09
+**Base:** `03ebf5e97e1584cffccf9b153f9a213b571af98a` (REV-106)
+**Implementasi yang direview:** `a97db646f67ea8f878c1fbf5693010c6c7c6bb46` (REV-105)
+**Scope:** hanya lane bukti yang REV-106 nyatakan UNAVAILABLE. Tidak ada perubahan sumber.
+
+### Kenapa ronde ini ada
+
+REV-106 memblokir bukan karena cacat produk: F01/F02 dan seluruh gate exact hijau di lane
+source/runtime. Yang gagal adalah lane migration/provenance — habis budget eksekusi dan
+meninggalkan cluster PostgreSQL kustom. Jadi ronde ini adalah lane bounded, dengan cleanup
+wajib, dan pembuktian bahwa tidak ada bug migration/provenance yang perlu diperbaiki.
+
+### Keadaan awal yang ditemukan
+
+Residu nyata dari lane REV-106 masih hidup di host:
+
+```text
+postgres.exe pid 596100  -D "C:/temp/rev102_mig_pgdata" -p 55432   LISTENING 127.0.0.1:55432
+```
+
+Bukan port 55461 seperti dicatat REV-106, dan bukan "recovered" — cluster kustom itu masih
+berjalan saat ronde ini dimulai. Dihentikan `pg_ctl -m fast stop` (rc=0) lalu direktori data
+dihapus; verifikasi akhir ada di bagian Residu.
+
+### 1. Migration tree tidak berubah dari predecessor
+
+```text
+git diff --stat 580198a 03ebf5e -- migrations/     (kosong)
+git diff --stat 580198a 03ebf5e                    REVIEW_RESULT.md | src/db.rs | src/main.rs
+                                                   | src/rev105_status_ledger_authority_pg_tests.rs
+                                                   4 files changed, 439 insertions(+), 0 deletions(-)
+```
+
+Nol deletion di seluruh diff, dan `migrations/` tidak tersentuh — immutability 1041 serta
+forward-only 1042 (REV-099/103) utuh tanpa perlu argumen tambahan.
+
+Manifest in-repo, digest atas byte ter-normalisasi LF:
+
+```text
+migrations/*.sql          54 file
+MANIFEST.sha256           54 entry
+mismatch                  0
+orphan                    0
+```
+
+### 2. Lane runtime bounded terhadap target
+
+Semua dijalankan dengan binary yang dibangun ulang lebih dulu (`cargo build --locked`;
+pelajaran REV-105: `cargo test --bin` tidak membangun ulang binary produksi). Binary
+predecessor `580198a` dibangun dari worktree terpisah dengan `CARGO_TARGET_DIR` diarahkan ke
+cache yang sama, jadi tidak ada full rebuild dingin: 30s, bukan cold build.
+
+Fresh production lane, database baru pada PostgreSQL 17.11 port 5432:
+
+```text
+HEAD db migrate                    rc=0   applied s.d. 1042_rev098_positive_id_invariant_repair.sql
+HEAD db status                     rc=0   "schema current; every applied migration is digest-verified"
+HEAD db migrate (kedua, idempoten) rc=0
+HEAD db status                     rc=0
+readback count | sha256 | applied  54 | 54 | 54
+```
+
+Predecessor-upgrade lane, database dimigrasikan binary LAMA lalu diserahkan ke binary baru:
+
+```text
+PRED 580198a db migrate            rc=0
+PRED 580198a db status             rc=0
+HEAD db status                     rc=0
+HEAD db migrate (idempoten)        rc=0
+HEAD db status                     rc=0
+readback count | sha256 | applied  54 | 54 | 54
+```
+
+### 3. Provenance: cacat REV-104 direproduksi pada predecessor, ditolak pada target
+
+Dua database terpisah, masing-masing dimigrasikan penuh dan diassert sehat (`db status` rc=0)
+SEBELUM diracuni — jadi separuh "harus gagal" tidak vacuous.
+
+Racun A — collation ICU nondeterministic + nilai `APPLIED`
+(`CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)`,
+kolom `digest_origin` dialihkan ke `ci`, satu baris di-set `APPLIED`; premis bypass diassert:
+`digest_origin = 'APPLIED' COLLATE "C"` menghasilkan 1 baris):
+
+```text
+                     status rc   migrate rc
+PRED 580198a            0            -        "schema current; every applied migration is digest-verified"
+HEAD                    1            1        menamai collation `ci` dan menjelaskan kesetaraan locale
+```
+
+Racun B — CHECK dilepas dan dipasang ulang `NO INHERIT`, lalu
+`CREATE TABLE _migrations_shadow () INHERITS (public._migrations)`, 54 baris dipindahkan ke
+anak dan di-set `rogue`, induk dikosongkan (premis diassert: `ONLY` induk 0 baris, anak `rogue`
+54, scan tak-terkualifikasi 54):
+
+```text
+                     status rc   migrate rc
+PRED 580198a            0            -        "schema current; every applied migration is digest-verified"
+HEAD                    1            1        "has descendant table(s) _migrations_shadow"
+```
+
+Temuan sampingan yang memperkuat gate `connoinherit = false`: percobaan pertama racun B TANPA
+melepas CHECK asli GAGAL di PostgreSQL — `INSERT`/`UPDATE` ke anak ditolak
+`violates check constraint "_migrations_digest_origin_check"`. Artinya CHECK yang inheritable
+memang mewarisi ke descendant, dan `NO INHERIT` adalah satu-satunya jalan memasukkan baris
+`rogue` lewat descendant. Gate `connoinherit = false` di `assert_ledger_provenance_authority`
+karena itu tepat sasaran, bukan defensif berlebih.
+
+### Perubahan sumber
+
+**Nol.** Tidak ada bug migration/provenance yang ditemukan pada target. `git diff` terhadap
+`03ebf5e` kosong selain entry ledger ini.
+
+### Gate
+
+Sumber tidak berubah terhadap `a97db64`/`03ebf5e`, jadi suite yang sudah hijau tidak dijalankan
+ulang — menjalankan ulang tanpa perubahan sumber tidak menambah informasi. Nilai di bawah
+dikutip dari lane independen REV-106 (bukan klaim baru ronde ini), kecuali dua baris terakhir
+yang memang dieksekusi di ronde ini:
+
+```text
+dikutip REV-106:  cargo check default / pg_tests            PASS / PASS
+dikutip REV-106:  default suite                             369/369
+dikutip REV-106:  pg lib | bin | total                      181 | 293 | 525
+dikutip REV-106:  focused REV-105                           2/2 exact, non-vacuous
+dijalankan REV-107: build --locked (HEAD & PRED)            rc=0, cache dipakai bersama
+dijalankan REV-107: manifest migrations/ (in-repo)          54 file | 54 entry | 0 mismatch | 0 orphan
+```
+
+### Yang TIDAK saya kerjakan
+
+* Tidak menyentuh `src/`, `migrations/`, `MANIFEST.sha256`, `Cargo.lock`.
+* Tidak menyelaraskan `../swi-deploy/migrations` (52 file, artefak deploy di luar git; bundle
+  tertanam yang dieksekusi binary). Sama seperti REV-105, di luar scope.
+* Tidak memperbaiki urutan `baseline_migrations` sebelum `ensure_schema_current` yang dicatat
+  REV-105 sebagai janggal-tapi-tak-berbahaya. Bukan bagian REV-106.
+* Tidak membangun cluster PostgreSQL kustom di ronde ini — seluruh lane memakai instance 5432
+  yang sudah ada dengan database scratch, sehingga kelas residu yang memblokir REV-106 tidak
+  bisa muncul lagi.
+
+### Residu (diverifikasi setelah cleanup)
+
+```text
+proses postgres non-standar (bukan -D "Program Files/PostgreSQL/17/data")   0
+port LISTENING 54xxx / 55xxx                                               0  (hanya 5432 pid 6392)
+C:/temp/rev102_mig_pgdata                                                  dihapus
+database swi% / _sqlx_test%                                                0
+worktree predecessor C:/temp/rev107_pred                                   dihapus (worktree remove rc=0)
+binary scratch rev107_head.exe / rev107_pred.exe                           dihapus
+HEAD/local/master                                                          03ebf5e (tidak berubah)
+tracked diff                                                               hanya REVIEW_RESULT.md
+untracked                                                                  WORKER_COMMAND_REV094.md (pra-ada)
+```
+
+**Verdict: READY FOR REVIEW.**
