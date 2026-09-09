@@ -112,6 +112,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-097 | 2026-09-09 | corrective for the independent review REV-096 (F02 table-qualified + definition-exact 1041 guards; F03 advisory lock held for the ENTIRE migration run and semantic allowed-set validation of the ledger CHECK; F04 resolver proven through the production binary with divergent directories; F05 dual-table invalid-ID diagnostics; F06 RAII temp dirs and a residue scan over every naming family) | READY FOR REVIEW | 369/369 default + 508/508 pg_tests (181 lib + 279 bin + 48 integration); check gates 0 warning; disposable DB 53\|53\|53 applied, 2 validated positive-id CHECKs, ledger CHECK admits exactly {NULL,applied,baseline}; residue after the full lane = 0 DBs, 0 temp dirs; 6 new focused tests; 5 RED→GREEN, each RED an assertion failure; 2 defects found by me and fixed (advisory lock never released -> 30-minute migrator deadlock; `CARGO_MANIFEST_DIR` read at RUNTIME so the shipped binary silently fell back to the unversioned legacy sibling) |
 | REV-098 | 2026-09-09 | independent verification of REV-097 | CHANGES REQUIRED / NOT APPROVED | Rust 369/369; pg_tests 511/511; focused 6/6; e1e0403-to-REV-097 upgrade FAIL |
 | REV-099 | 2026-09-09 | implementasi corrective REV-098 F01-F04 | READY FOR REVIEW | default 369/369; pg_tests 515/515; RED->GREEN 4/4; readback 54\|54\|54\|0\|0; residu 0 |
+| REV-100 | 2026-09-09 | independent verification of REV-099 | CHANGES REQUIRED / NOT APPROVED | F01/F03/F04 accepted; F02 CHECK NOT VALID bypass reproduced; fresh PG/manifest gates pass |
 
 ---
 
@@ -15836,3 +15837,80 @@ Residu setelah lane penuh: `pg_database LIKE 'swi%' OR LIKE '\_sqlx\_test%'` →
 - Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+---
+
+## REV-100 - Independent verification of REV-099
+
+**Tanggal:** 2026-09-09
+**Mode:** independent read-only review; three isolated Hermes lanes
+**Target:** `72f9ceda4e3934e99706dd19accf7bbdc0fb3b88` (REV-099)
+**Against:** `6f1530cecb229ecab7aa9f12f16618d09e4498e4` (REV-098)
+**Tree:** tracked clean; only pre-existing `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**CHANGES REQUIRED / NOT APPROVED.** REV-098-F01 and core embedded-bundle work pass. One independently reproduced HIGH validation bypass remains. Cleanup conversion is accepted; its old SQLx-failure regression wording no longer matches the post-conversion implementation.
+
+### REV-100-F01 - OPEN - Canonical CHECK accepted while NOT VALID
+
+**Location:** `src/db.rs`, canonical `_migrations_digest_origin_check` comparison.
+
+**Why wrong:** the implementation compares the installed and canonical `pg_get_expr(conbin, conrelid)` expressions but does not require `pg_constraint.convalidated = true`. PostgreSQL accepts an expression-identical `CHECK ... NOT VALID` while retaining pre-existing out-of-domain rows. Migration preflights reject NULL origin only; arbitrary non-NULL provenance can survive.
+
+Independent PostgreSQL 17.11 reproduction:
+
+```text
+fresh_rc=0
+constraint=false|((digest_origin IS NULL) OR (digest_origin = ANY (ARRAY['applied','baseline'])))
+rogue_before=1
+migrate_rc=0
+cleanup=0
+```
+
+The migrator accepted the unvalidated canonical expression and the pre-existing `rogue` row.
+
+**Fix:** canonicality must require `contype='c'`, `convalidated=true`, correct relation, and expression equality. Validate/reject every existing row before migration work.
+
+**Regression:** seed a `rogue` origin, install the canonical expression `NOT VALID`, run the production migrator, and require fail-closed before any migration state changes.
+
+### REV-100-F02 - PARTIAL - Explicit override can be injected by CWD `.env`
+
+**Location:** settings load in `src/config.rs` before migration resolution; explicit `SWI_MIGRATIONS_DIR` authority.
+
+**Why partial:** embedded migrations are relocatable and manifest-authoritative. However, settings load invokes `dotenvy::dotenv()` from the current directory/parents before resolver use. A CWD `.env` can supply `SWI_MIGRATIONS_DIR`; the current relocation regression clears inherited process env but does not plant a hostile `.env`.
+
+Independent reproduction did not demonstrate takeover: the current binary applied the 54 embedded migrations and did not create the hostile sentinel. This finding remains a source-level trust-boundary gap, not an independently reproduced runtime exploit in this round.
+
+**Fix:** capture migration override from the pre-dotenv process environment or an explicit CLI/config source with clear operator authority. Do not let ambient CWD `.env` choose migration code.
+
+**Regression:** run relocated production binary from a directory containing hostile `.env` and a self-consistent hostile bundle; require embedded bundle unless override was explicitly supplied by the process/CLI.
+
+### Acceptance
+
+| REV-098 finding | Status | Evidence |
+|---|---|---|
+| F01 immutable 1041 + forward 1042 | PASS | Original 1041 blob/digest restored; manifest appends only 1042; authenticated predecessor upgrade fixture and fresh readback pass |
+| F02 exact provenance CHECK | FAIL | Expression-equivalent NOT VALID constraint with rogue row accepted, reproduced live |
+| F03 relocatable manifest authority | PARTIAL | Embedded bundle/file bijection passes; ambient dotenv override trust boundary remains |
+| F04 SQLx failure cleanup | PASS WITH PROOF NOTE | All 10 SQLx fixtures converted to guard-owned `migrated_scratch`; zero active `#[sqlx::test]`; old requested SQLx-child regression is no longer applicable after removal |
+
+### Independent gates/readback
+
+```text
+Rust/Cargo                               1.89.0
+PostgreSQL                              17.11
+fresh production migration/status       PASS
+manifest                                54 SQL | 54 entries | 0 mismatches
+ledger                                  54 SHA | 54 applied
+1041                                    d7a8984d... immutable
+1042                                    b9ebdf36... forward migration
+focused REV-099 inventory               4 tests, each exact-one
+existing complete evidence              default 369/369; pg_tests 515/515
+reviewer cleanup                        owned DB/targets residue 0
+```
+
+One independent full rerun was interrupted by reviewer harness/tool-budget limits; no inherited count is promoted beyond the retained complete artifacts and fresh migration/readback evidence.
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED.**
