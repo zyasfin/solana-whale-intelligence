@@ -114,6 +114,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-099 | 2026-09-09 | implementasi corrective REV-098 F01-F04 | READY FOR REVIEW | default 369/369; pg_tests 515/515; RED->GREEN 4/4; readback 54\|54\|54\|0\|0; residu 0 |
 | REV-100 | 2026-09-09 | independent verification of REV-099 | CHANGES REQUIRED / NOT APPROVED | F01/F03/F04 accepted; F02 CHECK NOT VALID bypass reproduced; fresh PG/manifest gates pass |
 | REV-101 | 2026-09-09 | implementasi corrective REV-100 F01-F02 | READY FOR REVIEW | default 369/369; pg_tests 518/518; RED->GREEN 2/2; focused 6/6; readback 54\|54\|54; residu 0 |
+| REV-102 | 2026-09-09 | independent verification of REV-101 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 518/518; collation + NO INHERIT bypass reproduced |
 
 ---
 
@@ -16062,3 +16063,95 @@ Tidak ada file migrasi yang diedit dan tidak ada baris MANIFEST yang diubah pada
 * Tidak ada sumber otoritas CLI baru (`--migrations-dir`) yang ditambahkan: environment proses peluncur sudah merupakan otoritas eksplisit yang dituntut temuan, dan flag baru akan menjadi permukaan kedua untuk keputusan yang sama.
 
 **Verdict: READY FOR REVIEW.**
+
+
+---
+
+## REV-102 - Independent verification of REV-101
+
+**Tanggal:** 2026-09-09
+**Mode:** automatic independent review; three isolated Hermes CLI lanes plus synthesizer
+**Target:** `28e477d38fe42d7d9ff87018de14667118c43719` (REV-101)
+**Against:** `d0763785ba095c27ece7cc5924c2f1cf39e53d5a` (REV-100)
+**Tree:** tracked clean; only pre-existing `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**CHANGES REQUIRED / NOT APPROVED.** REV-100-F02 is fixed. REV-100-F01 is partial: `NOT VALID` is rejected, but two independently reproduced PostgreSQL authority bypasses remain.
+
+### REV-102-F01 - OPEN - Provenance CHECK semantics depend on collation
+
+**Location:** `src/db.rs`, canonical `_migrations_digest_origin_check` validator and existing-row preflight.
+
+**Why wrong:** an ICU case-insensitive collation makes the canonical expression accept byte-distinct `APPLIED`. Expression equality plus `convalidated=true` still passes, and migration accepts the row.
+
+Independent PostgreSQL 17.11 reproduction:
+
+```text
+installed expression = canonical
+convalidated = true
+APPLIED row before = 1
+production migrate rc = 0
+APPLIED row after = 1 of 54
+cleanup = 0
+```
+
+**Fix:** enforce deterministic/C collation semantics for `digest_origin`, or compare allowed values bytewise in both the CHECK and authoritative preflight.
+
+**Regression:** create ICU case-insensitive `digest_origin`, insert `APPLIED`, install canonical-looking CHECK, and require production migration failure before application tables are created.
+
+### REV-102-F02 - OPEN - NO INHERIT/descendant rows bypass ledger authority
+
+**Location:** `src/db.rs`, `_migrations_digest_origin_check` catalog validation and ledger scans.
+
+**Why wrong:** validator does not require `connoinherit=false` and does not reject descendant tables. A canonical `CHECK ... NO INHERIT` on parent plus inherited child carrying `rogue` passes migration.
+
+Independent reproduction:
+
+```text
+parent rows after = 54
+child rogue rows = 1
+rogue visible through parent = 1
+workspaces created = true
+production migrate rc = 0
+cleanup = 0
+```
+
+**Fix:** require `connoinherit=false`, reject descendants via `pg_inherits`, and validate all authoritative rows under byte-exact provenance semantics before migration.
+
+**Regression:** create `_migrations_rogue INHERITS (_migrations)`, insert rogue row, add canonical parent CHECK `NO INHERIT`, and require migration failure before schema writes.
+
+### Acceptance
+
+| REV-100 finding | Status | Evidence |
+|---|---|---|
+| F01 CHECK NOT VALID bypass | PARTIAL | `convalidated=true` now required; collation and inheritance bypasses remain |
+| F02 dotenv migration override | PASS | process override snapshot captured before dotenv; hostile ambient `.env` rejected; explicit process override retained |
+
+### Independent gates
+
+```text
+Lanes                                    3/3 available
+cargo check default                      PASS
+cargo check pg_tests                     PASS
+default suite                            369/369
+full PG serial                           518/518
+fresh migration lane                     286/286
+REV-101 focused                          3/3 exact
+focused migration aggregate              9/9
+production migrate/status                PASS; schema current
+manifest/ledger                          54/54; zero mismatch
+```
+
+Green fresh-install tests do not close the independently reproduced provenance-authority bypasses.
+
+### Cleanup
+
+```text
+reviewer DB residue                      0
+reviewer target/script residue           0
+HEAD/local/master/bare                   unchanged at 28e477d...
+tracked diff                             empty
+```
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED.**
