@@ -118,6 +118,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-103 | 2026-09-09 | implementasi corrective REV-102 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 523/523; RED->GREEN 3/3 + 2 counterpart; pred 28e477d rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane 54\|54; residu 0 |
 | REV-104 | 2026-09-09 | independent verification of REV-103 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 523/523; `db status` authority bypass reproduced |
 | REV-105 | 2026-09-09 | implementasi corrective REV-104 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 525/525 serial; RED->GREEN 2/2; probe real-binary 4/4; pred 580198a rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane rc=0; residu 0 |
+| REV-106 | 2026-09-09 | independent verification of REV-105 | CHANGES REQUIRED / BLOCKED | source PASS; Rust/PG gates PASS; migration lane unavailable; reviewer cleanup recovered |
+
 
 
 ---
@@ -16652,3 +16654,57 @@ untracked                          WORKER_COMMAND_REV094.md (pra-ada)
 ```
 
 **Verdict: READY FOR REVIEW.**
+
+
+---
+
+## REV-106 - Independent verification of REV-105
+
+**Tanggal:** 2026-09-09
+**Mode:** automatic independent review; three isolated Hermes lanes
+**Target:** `a97db646f67ea8f878c1fbf5693010c6c7c6bb46` (REV-105)
+**Against:** `580198a69627dbb5b2830d5eda6ba2973afa7833` (REV-104)
+**Tree:** tracked clean; only `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**CHANGES REQUIRED / BLOCKED.** Source/runtime and exact gate lanes are green. Migration/provenance lane exhausted its execution budget and left a custom PostgreSQL cluster/artifacts; cleanup was recovered by the controller, but the lane did not produce a complete independent verdict. Approval is forbidden while a required lane is unavailable.
+
+### Findings
+
+- REV-104-F01 status/collation: **PASS in source/runtime lane.** Healthy status rc=0; ICU nondeterministic + APPLIED status rc=1; least-privilege path also fails closed.
+- REV-104-F02 status/inheritance: **PASS in source/runtime lane.** Parent empty + child rogue + NO INHERIT status rc=1; least-privilege path also fails closed.
+- Migration/provenance/cleanup: **UNAVAILABLE.** Static evidence showed migration tree unchanged, 54 SQL/54 manifest, raw drift 0, but the runtime predecessor/custom-cluster lane timed out before a complete verdict and initially left port 55461/process/data artifacts.
+
+### Independent gates
+
+```text
+Rust/Cargo 1.89.0
+cargo check default                    PASS
+cargo check pg_tests                   PASS
+default suite                          369/369
+PG lib                                 181/181
+PG bin                                 293/293
+PG total                               525/525
+focused REV-105                        2/2 exact, non-vacuous
+fresh migrate/status/idempotent        PASS
+ledger                                 54 rows | 54 SHA | 54 applied
+```
+
+### Cleanup
+
+```text
+source lane residue                    0
+exact-gate lane residue                0
+migration custom cluster/artifacts     recovered by controller
+final migration process residue        0
+final migration path residue           0
+HEAD/local/master/bare                 unchanged at a97db64...
+tracked diff                           empty
+```
+
+### Next action
+
+Run a bounded migration/provenance lane only, with mandatory `finally` cleanup, no cold full rebuild, and a strict timeout. Approval requires complete runtime predecessor upgrade evidence plus residue zero.
+
+**Verdict: CHANGES REQUIRED / BLOCKED.**
