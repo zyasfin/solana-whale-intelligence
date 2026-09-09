@@ -110,6 +110,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-096 | 2026-09-08 | implementation of the remaining REV-093-F06 cleanup mechanism (ScratchDb guard owning disposable DBs and temp dirs, cleaned up in Drop on the panic/unwind path; all nine scratch-creating fixtures migrated so `CREATE DATABASE` exists only inside the guard) | READY FOR REVIEW | 369/369 + 506/506; check gates 0 warning; disposable DB 53\|53\|0, FK 1; residue after a full lane with NO manual sweeping = 0 DBs, 0 temp dirs; 3 focused tests each `--exact --list`=1 and `running 1 test`; RED reproduced `survived a panicking test`; also proven on a real fixture forced to fail; SIGKILL/abort path stated as a limitation |
 | REV-078 | 2026-09-05 | independent verification of REV-077 F02/F03/F04 + migration 1034 | CHANGES REQUIRED / PARTIAL | F04 + core signal outbox fixed; F02/F03 partial; 369/369 + 452/452 PASS; 1033-like upgrade, runtime-role DML, funding FK/retry, stale eval release independently FAIL |
 | REV-097 | 2026-09-09 | corrective for the independent review REV-096 (F02 table-qualified + definition-exact 1041 guards; F03 advisory lock held for the ENTIRE migration run and semantic allowed-set validation of the ledger CHECK; F04 resolver proven through the production binary with divergent directories; F05 dual-table invalid-ID diagnostics; F06 RAII temp dirs and a residue scan over every naming family) | READY FOR REVIEW | 369/369 default + 508/508 pg_tests (181 lib + 279 bin + 48 integration); check gates 0 warning; disposable DB 53\|53\|53 applied, 2 validated positive-id CHECKs, ledger CHECK admits exactly {NULL,applied,baseline}; residue after the full lane = 0 DBs, 0 temp dirs; 6 new focused tests; 5 RED→GREEN, each RED an assertion failure; 2 defects found by me and fixed (advisory lock never released -> 30-minute migrator deadlock; `CARGO_MANIFEST_DIR` read at RUNTIME so the shipped binary silently fell back to the unversioned legacy sibling) |
+| REV-098 | 2026-09-09 | independent verification of REV-097 | CHANGES REQUIRED / NOT APPROVED | Rust 369/369; pg_tests 511/511; focused 6/6; e1e0403-to-REV-097 upgrade FAIL |
 
 ---
 
@@ -15512,3 +15513,108 @@ Residu setelah lane penuh: `SELECT datname FROM pg_database WHERE datname LIKE '
 - Floor PostgreSQL tetap 16+ (`pg_input_is_valid`, dari REV-094).
 
 **Verdict: READY FOR REVIEW — bukan self-claim APPROVED.**
+
+
+---
+
+## REV-098 - Independent verification of REV-097
+
+**Tanggal:** 2026-09-09
+**Mode:** independent read-only review; three isolated Hermes lanes
+**Target:** `30d2e191f05566d2ce8404381ae10d9beffef3df` (REV-097)
+**Against:** `e1e0403ad9eff15766676c647e427ac2307db097` (REV-096)
+**Tree:** tracked clean; only pre-existing `WORKER_COMMAND_REV094.md` untracked
+
+### Verdict
+
+**CHANGES REQUIRED / NOT APPROVED.** F05 passes. F02, F03, F04, and F06 remain partial or failed.
+
+### REV-098-F01 - OPEN - Migration 1041 was edited in place
+
+**Location:** `migrations/1041_rev093_positive_id_invariant.sql`, `migrations/MANIFEST.sha256`, migration digest check in `src/db.rs`.
+
+**Why wrong:** REV-096 shipped blob `f2fa66402e8b675733cde6e902b5b71619178cfb` with SHA-256 `d7a8984db0c30eecc42421c6209fe126ab3baa7315dd310afa19d21dd3da7db4`. REV-097 replaces it with blob `25bd6bdf4a4f76b7fd722c4ed667c9496ec6f377` and SHA-256 `b24b9cbcce78d8068ff302b456b5a39eb3697a028953ddf0daf25d33d71b359f`. The manifest row was replaced, not extended.
+
+Independent live reproduction on PostgreSQL 17.11:
+
+```text
+old_apply_rc=0
+recorded_digest=d7a8984db0c30eecc42421c6209fe126ab3baa7315dd310afa19d21dd3da7db4
+current_file_sha256=b24b9cbcce78d8068ff302b456b5a39eb3697a028953ddf0daf25d33d71b359f
+current_upgrade_rc=1
+Error: applied migration `1041_rev093_positive_id_invariant.sql` no longer matches the file on disk
+cleanup=0
+```
+
+A database that applied REV-095/096 cannot upgrade to REV-097. The existing predecessor fixture starts before 1041, so it misses this exact lane.
+
+**Fix:** restore the original 1041 bytes and manifest digest. Put the qualified/exact repair in forward migration 1042.
+
+**Regression:** materialize authenticated `e1e0403`, apply its original 1041, then run the current bundle. Require successful 1042 repair, schema current, second no-op pass, and original 1041 ledger digest unchanged.
+
+### REV-098-F02 - OPEN - Ledger CHECK validation is finite-sample, not exact
+
+**Location:** `src/db.rs` `digest_origin_check_admits_exactly`.
+
+**Why wrong:** six probes do not prove the admitted set. A forged CHECK that also admits `rogue` passes every current sample.
+
+Independent live reproduction:
+
+```text
+fresh_rc=0
+forged_check_migrate_rc=0
+rogue_value=admitted
+cleanup=0
+```
+
+**Fix:** compare a server-normalized canonical expression or validate the PostgreSQL expression tree structurally. Do not infer exactness from a finite sample set.
+
+**Regression:** install `CHECK (canonical_predicate OR digest_origin = 'rogue')`; migrator must fail closed before migration work.
+
+### REV-098-F03 - OPEN - Packaged migration authority remains bypassable/non-relocatable
+
+**Location:** `src/db.rs` resolver order and fresh migration path; resolver regression in `src/rev087_migration_integrity_pg_tests.rs`.
+
+**Why wrong:** arbitrary CWD `./migrations` still precedes the packaged candidate. Fresh migrations execute SQL without first enforcing production manifest/file bijection. `env!("CARGO_MANIFEST_DIR")` embeds the build-host source path, so the claimed packaged path is not a relocatable shipped artifact. The regression runs while that source tree still exists.
+
+**Fix:** use embedded migrations or an executable-relative manifest-verified bundle. Keep only the explicit `SWI_MIGRATIONS_DIR` operator override ahead of it. Enforce manifest/file bijection before fresh execution too.
+
+**Regression:** copy only the built binary plus packaged bundle to an isolated directory, hide the build source, plant divergent CWD and legacy siblings, run the real CLI, and require only the packaged manifest-verified bundle to execute.
+
+### REV-098-F04 - OPEN - Failure-path cleanup excludes SQLx scratch databases
+
+**Location:** `src/funding_radar_pg_tests.rs`, `src/recent_store_pg_tests.rs`, residue scan in `src/rev087_migration_integrity_pg_tests.rs`.
+
+**Why wrong:** ten `#[sqlx::test]` fixtures create `_sqlx_test_*` databases. SQLx cleanup occurs only after successful test completion. The REV-097 scan covers PID-tagged `swi*` resources and runs in-band, so a failed/panicked SQLx fixture can leak after or outside that scan.
+
+**Fix:** move those fixtures to `ScratchDb`, or add an external post-process cleanup/residue gate covering `_sqlx_test_*` and all reviewer-owned `swi*` families.
+
+**Regression:** fail a real SQLx fixture in a child test process; after process exit require zero `_sqlx_test_*`, zero reviewer-owned `swi*` DBs, and zero temp dirs.
+
+### Acceptance
+
+| REV-097 item | Status | Evidence |
+|---|---|---|
+| F02 table-qualified/exact 1041 guards | PARTIAL | SQL logic improved; in-place 1041 edit makes the real predecessor upgrade fail |
+| F03 full-run lock + exact ledger CHECK | PARTIAL | lock lifecycle improved; forged unprobed value is accepted |
+| F04 production manifest/resolver | FAIL | fresh/CWD path bypasses manifest authority; packaged location is build-source-relative |
+| F05 dual-table invalid-ID diagnostics | PASS | both tables checked before DDL; transactional regression and live focused test pass |
+| F06 failure-path cleanup | PARTIAL | explicit scratch/temp paths guarded; SQLx-owned failure leaks remain outside residue gate |
+
+### Independent gates
+
+```text
+Rust/Cargo                                 1.89.0
+PostgreSQL                                17.11
+check --locked --all-targets              PASS rc=0, 0 warnings
+check --locked --features pg_tests        PASS rc=0, 0 warnings
+test --locked                             PASS 369/369
+full pg_tests serial                      PASS 511/511
+focused REV-097 exact tests               PASS 6/6, each listed exactly once
+fresh production migrate/status           PASS, 53|53|53|0|0
+reviewer DB/target cleanup                 PASS, residue 0
+```
+
+Green fresh-install gates do not cover the reproduced predecessor-upgrade failure or the forged CHECK bypass.
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED.**
