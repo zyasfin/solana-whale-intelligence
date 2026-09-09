@@ -117,6 +117,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-102 | 2026-09-09 | independent verification of REV-101 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 518/518; collation + NO INHERIT bypass reproduced |
 | REV-103 | 2026-09-09 | implementasi corrective REV-102 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 523/523; RED->GREEN 3/3 + 2 counterpart; pred 28e477d rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane 54\|54; residu 0 |
 | REV-104 | 2026-09-09 | independent verification of REV-103 | CHANGES REQUIRED / NOT APPROVED | 3/3 lanes; default 369/369; pg_tests 523/523; `db status` authority bypass reproduced |
+| REV-105 | 2026-09-09 | implementasi corrective REV-104 F01-F02 | READY FOR REVIEW | default 369/369 x2; pg_tests 525/525 serial; RED->GREEN 2/2; probe real-binary 4/4; pred 580198a rc=0 vs HEAD rc=1 pada kedua bypass; upgrade lane rc=0; residu 0 |
 
 
 ---
@@ -16476,3 +16477,178 @@ tracked diff                             empty
 ```
 
 **Verdict: CHANGES REQUIRED / NOT APPROVED.**
+
+## REV-105 — Implementasi corrective atas independent review REV-104
+
+**Tanggal:** 2026-09-09
+**Base:** `580198a69627dbb5b2830d5eda6ba2973afa7833` (REV-104)
+**Implementasi yang direview:** `e962431` (REV-103)
+**Scope:** REV-104-F01 dan REV-104-F02 saja. Tidak ada perubahan lain.
+
+### Keadaan saat mulai
+
+Kedua finding REV-104 **belum diimplementasikan**. Dibuktikan dari sumber, bukan dari baris verdict:
+`assert_ledger_provenance_authority` dan `assert_ledger_provenance_values` (`src/db.rs`) hanya dipanggil dari
+`migrate_bundle_with` (baris 1301, 1340, 1373). `ensure_schema_current` — satu-satunya authority yang dibaca
+`db status` dan setiap service start lewat `connect_verified` — tidak memanggil keduanya.
+
+### REV-105-F01 — `db status` menerima provenance nondeterministic (REV-104-F01)
+
+**File:** `src/db.rs::ensure_schema_current`.
+
+**Perilaku lama:** fungsi ini memverifikasi ISI ledger (nama, digest, provenance NULL, baseline) tetapi tidak
+pernah menanyakan apakah ledger itu masih berhak menjawab. Pada kolom `digest_origin` bercollation ICU
+`deterministic = false`, nilai `APPLIED` lolos CHECK kanonik (kesetaraan = pencocokan locale), lalu setiap
+scan di bawahnya membacanya sebagai provenance yang sah. `db migrate` rc=1, `db status` rc=0.
+
+**Perilaku baru:** dua pemanggilan read-only, keduanya sebelum satu pun baris dipercaya:
+
+* `assert_ledger_provenance_authority(pool)` — segera setelah gate keberadaan ledger. Menolak collation
+  nondeterministic pada `digest_origin`, menolak descendant `pg_inherits`, menolak `connoinherit = true`.
+* `assert_ledger_provenance_values(pool)` — setelah probe kolom `digest_origin`, dijaga `has_origin_column`
+  (ledger pra-`digest_origin` memang tidak punya provenance untuk keluar domain; keadaan itu sudah dilaporkan
+  terpisah sebagai `unverifiable`/`provenanceless`).
+
+**Mengapa mekanisme ini authoritative:** ini bukan cek yang ditulis ulang, melainkan fungsi yang SAMA persis
+yang dipakai migrator. Satu definisi authority, dua boundary — tidak mungkin lagi keduanya berbeda pendapat,
+yang justru adalah bentuk cacat REV-104. Gate collation menutup bentuk yang masih bisa dipasang; scan baris
+bytewise (`convert_to(..., 'UTF8')`, kesetaraan `bytea` = kesetaraan byte menurut definisi) menutup baris yang
+TERLANJUR masuk saat collation nondeterministic masih berlaku dan tetap ada setelah collation diperbaiki.
+
+Keduanya read-only: tiga query katalog dan satu scan baris terbatas. Tidak ada DDL, tidak ada tulisan — jadi
+role runtime least-privilege tetap bisa menjalankannya (pelajaran REV-036 yang mengeluarkan DDL dari jalur ini
+tetap dihormati).
+
+### REV-105-F02 — `db status` menerima ledger yang diwariskan (REV-104-F02)
+
+**File:** sama; ditutup oleh pemanggilan `assert_ledger_provenance_authority` yang sama.
+
+**Perilaku lama:** `_migrations` induk boleh kosong sementara anak `INHERITS (public._migrations)` menyumbang
+54 baris `rogue` ke setiap scan tak-terkualifikasi milik `ensure_schema_current`. Nama dan digest tiap baris
+cocok dengan bundle tertanam, sehingga skema terbaca "current" padahal authority yang membuat kata "current"
+punya arti sudah diganti. `db migrate` rc=1, `db status` rc=0.
+
+**Perilaku baru:** descendant apa pun ditolak, dan CHECK wajib inheritable (`connoinherit = false`) sehingga
+descendant tidak bisa dibuat di luar constraint SETELAH pemeriksaan lolos. Keduanya diperlukan: satu untuk
+keadaan yang sudah ada, satu untuk keadaan yang masih bisa dibuat.
+
+### Regresi baru
+
+`src/rev105_status_ledger_authority_pg_tests.rs` (2 test, keduanya menjalankan BINARY PRODUKSI, bukan fungsi
+library — cacatnya adalah tentang exit code yang dibaca operator):
+
+* `db_status_rejects_a_nondeterministic_provenance_column`
+* `db_status_rejects_an_inherited_rogue_ledger`
+
+Keduanya bermigrasi penuh lebih dulu dan **menegaskan `db status` rc=0 pada database sehat itu** sebelum
+meracuninya — jadi separuh "harus gagal" tidak vacuous: yang berubah hanya siapa yang berhak menjawab, bukan
+skemanya. Premis bypass diassert eksplisit (`APPLIED` hadir 1 baris; induk 0 baris, anak `rogue` > 0).
+
+### Bukti RED → GREEN
+
+RED — kedua pemanggilan baru dilepas dari `ensure_schema_current` (mekanismenya, bukan callsite-nya):
+
+```text
+test rev105_status_ledger_authority_pg_tests::db_status_rejects_a_nondeterministic_provenance_column ... FAILED
+test rev105_status_ledger_authority_pg_tests::db_status_rejects_an_inherited_rogue_ledger ... FAILED
+
+`db status` must exit nonzero on a nondeterministic provenance column, got rc=0: schema current; every applied migration is digest-verified
+`db status` must exit nonzero on an inherited ledger, got rc=0: schema current; every applied migration is digest-verified
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 291 filtered out; finished in 5.49s
+```
+
+Pesan RED itu identik dengan yang dilaporkan reviewer (rc=0 + "schema current"), jadi probe memang mengenai
+cacat yang dimaksud.
+
+GREEN — dikembalikan:
+
+```text
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 291 filtered out; finished in 4.99s
+```
+
+Catatan operasional yang perlu diketahui pemelihara: `cargo test --bin` TIDAK membangun ulang binary produksi
+`target/debug/solana-whale-intelligence.exe`. Test yang men-spawn binary produksi harus didahului
+`cargo build --locked`, kalau tidak yang diuji adalah binary lama dan hasilnya menyesatkan.
+
+### Probe binary produksi (adversarial, PostgreSQL 17.11)
+
+```text
+                                              status rc   migrate rc
+ICU nondeterministic + APPLIED                   1            1
+parent kosong + child INHERITS 54 rogue          1            1
+CHECK NOT VALID + baris `forged`                 1            -
+CHECK NO INHERIT tanpa descendant                1            -
+```
+
+Diagnosis yang dicetak `db status` menamai cacatnya, bukan gejalanya — mis. "the migration ledger
+`public._migrations` has descendant table(s) _migrations_shadow", dan "carries provenance value(s) outside its
+trust model: `0001_initial.sql` = `forged`".
+
+### Kontras dengan predecessor 580198a
+
+Binary predecessor dibangun dari worktree terpisah dan dijalankan pada DATABASE TERACUNI YANG SAMA:
+
+```text
+                                       PRED 580198a        HEAD (REV-105)
+db status ICU nondeterministic         rc=0 "schema current"   rc=1
+db status inherited rogue ledger       rc=0 "schema current"   rc=1
+```
+
+Ini mereproduksi persis temuan REV-104 pada kode yang direview, lalu menunjukkan perbaikannya.
+
+### Lane upgrade dari predecessor
+
+```text
+pred 580198a db migrate           rc=0
+HEAD db status                    rc=0
+HEAD db migrate (idempotent)      rc=0
+HEAD db status                    rc=0
+```
+
+Database yang dimigrasikan binary lama tetap diterima binary baru — perbaikan ini menolak keadaan yang
+diracuni, bukan keadaan yang sah.
+
+### Gate
+
+```text
+cargo +1.89.0 check --locked --all-targets                  0 warning
+cargo +1.89.0 check --locked --features pg_tests --all-targets  0 warning
+cargo +1.89.0 test  --locked                                369/369 (x2)
+cargo +1.89.0 test  --locked --features pg_tests --lib      181/181  (--test-threads=1)
+cargo +1.89.0 test  --locked --features pg_tests --bin      293/293  (--test-threads=1)
+cargo +1.89.0 test  --locked --features pg_tests --tests     51/51   (--test-threads=1)
+                                                    total   525/525
+fresh db migrate / db status                       rc=0 / rc=0
+db migrate kedua kali (idempotensi)                rc=0
+readback count/sha256/digest_origin='applied'      54|54|54
+manifest migrations/ (in-repo)                     54 file, 54 entry, 0 mismatch, 0 orphan
+manifest ../swi-deploy/migrations                  52 file, 52 entry, 0 mismatch, 0 orphan
+```
+
+### Yang TIDAK saya kerjakan / batasan
+
+* Tidak ada migrasi baru. Perbaikan ini murni pada jalur baca binary; tidak ada file `10NN_*.sql` yang
+  ditambah maupun diubah, MANIFEST tidak disentuh. Immutability 1041 dan forward-only 1042 dari REV-099/103
+  tetap utuh.
+* Snapshot override pre-dotenv (REV-101-F02) dan bundle tertanam (REV-099) tidak disentuh.
+* `../swi-deploy/migrations` (52 file) memang tertinggal di belakang set in-repo (54 file). Itu artefak deploy
+  di luar git dan bukan sumber yang dieksekusi binary — bundle tertanamlah yang dipakai — jadi saya tidak
+  menyelaraskannya di ronde ini; menyentuhnya akan melampaui scope REV-104.
+* Cacat yang saya temukan sendiri dan TIDAK saya perbaiki: `db status` masih memanggil `baseline_migrations`
+  SEBELUM `ensure_schema_current`, sehingga pada ledger teracuni query baseline berjalan lebih dulu. Tidak
+  berbahaya (read-only, dan hasilnya tidak dipakai sebelum `ensure_schema_current` lolos), tapi urutannya
+  terbalik secara logis. Bukan bagian dari REV-104 dan tidak mengubah exit code mana pun, jadi saya
+  meninggalkannya sebagai catatan.
+
+### Residu
+
+```text
+database swi%/_sqlx_test%          0
+worktree predecessor               dihapus
+file scratch                       dihapus
+tracked diff                       hanya src/db.rs, src/main.rs, + src/rev105_*.rs baru
+untracked                          WORKER_COMMAND_REV094.md (pra-ada)
+```
+
+**Verdict: READY FOR REVIEW.**

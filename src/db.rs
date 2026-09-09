@@ -1610,6 +1610,22 @@ pub async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
         );
     }
 
+    // REV-104-F01/F02: the migrator refused a poisoned provenance authority, but
+    // this read-only boundary — `db status`, every service start via
+    // `connect_verified` — went on trusting the same ledger. The reviewer showed
+    // `db migrate` rc=1 next to `db status` rc=0 on an ICU nondeterministic
+    // `digest_origin` holding `APPLIED`, and again on an empty parent with an
+    // inherited child carrying 54 `rogue` rows. Every row this function reads below
+    // comes out of that same scan, so the checks the migrator makes about WHO may
+    // answer for the ledger have to be made here too, before any answer is trusted.
+    //
+    // Both are catalog reads plus one bounded row scan: no DDL, no writes, so the
+    // least-privilege runtime role can still run them (the REV-036 lesson that put
+    // DDL out of this path).
+    assert_ledger_provenance_authority(pool)
+        .await
+        .context("the migration ledger's provenance authority is not trustworthy")?;
+
     // REV-098-F03: the verifier compares the ledger against the BUNDLE this binary
     // carries, not against whatever directory the cwd happens to offer. The bundle
     // has already proven manifest/file bijection and per-file digests at
@@ -1657,6 +1673,19 @@ pub async fn ensure_schema_current(pool: &PgPool) -> Result<()> {
     .fetch_one(pool)
     .await
     .context("failed to inspect the migration ledger for a digest_origin column")?;
+
+    // REV-104-F01: the rows themselves, compared BYTEWISE. The collation gate above
+    // closes the shapes still installable; this closes the rows already admitted
+    // while a nondeterministic collation was in force — a value such as `APPLIED`
+    // remains in the ledger after the collation is repaired, and every scan below
+    // would read it as provenance. Guarded on the column's existence: a
+    // pre-`digest_origin` ledger has no provenance to be out of domain, and that
+    // state is reported separately as `unverifiable` / `provenanceless`.
+    if has_origin_column {
+        assert_ledger_provenance_values(pool)
+            .await
+            .context("the migration ledger's recorded provenance is not trustworthy")?;
+    }
 
     let provenanceless: Vec<String> = if has_sha_column && has_origin_column {
         sqlx::query_scalar(
