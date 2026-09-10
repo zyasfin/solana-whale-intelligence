@@ -124,6 +124,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-109 | 2026-09-10 | dasbor operator Indonesia sembilan tampilan (frontend saja) | READY FOR REVIEW | RED 7/7 -> GREEN 7/7; default 376/376; check --all-targets rc=0; probe peramban 1440/760/390 + XSS inert 0 |
 | REV-110 | 2026-09-10 | independent review of REV-109 dashboard | CHANGES REQUIRED / NOT APPROVED | F01 HIGH `__omp_shell` placeholder; F02 stale banner stacking; F03 secret retained during in-flight request |
 | REV-111 | 2026-09-10 | corrective implementation of REV-110 F01-F03 | READY FOR REVIEW | RED 3/3 -> GREEN 10/10; default 379/379; check --all-targets rc=0; probe peramban F01-F03 + 9 tampilan + XSS inert 0 + 1440/760/390 |
+| REV-112 | 2026-09-10 | independent review of REV-111 dashboard corrective | source APPROVED / browser review CHANGES REQUIRED | F01 LOW axe `page-has-heading-one` pada 9/9 tampilan: dokumen tanpa `<h1>` |
+| REV-113 | 2026-09-10 | corrective atas REV-112 F01 (judul dokumen dasbor) | READY FOR REVIEW | RED 1/1 -> GREEN 11/11; default 380/380; check --all-targets rc=0; axe 9/9 tampilan 1440 + 390 nol pelanggaran; overflow 0 |
 
 
 
@@ -17202,3 +17204,123 @@ REVIEW_RESULT.md                dua baris indeks + bagian REV-110 dan REV-111
 ```
 
 **Verdict: READY FOR REVIEW.** Persetujuan dimiliki review independen berikutnya (REV-112).
+
+## REV-112 — Review independen atas REV-111 (corrective dasbor)
+
+**Tanggal:** 2026-09-10
+**Basis yang ditinjau:** `febbdc54fa25a2f2ceaae80c6933a1e82b263bb6`
+**Sifat:** review, bukan perubahan kode. Tidak ada byte sumber yang disentuh oleh ronde ini.
+
+### Hasil
+
+| Jalur review | Verdict | Catatan |
+| --- | --- | --- |
+| Source / security | **APPROVED** | Ketiga perbaikan REV-110 (F01 verdict latensi, F02 de-duplikasi spanduk usang, F03 pengosongan rahasia pra-permintaan) terverifikasi ada di sumber; tidak ada temuan keamanan baru. |
+| Peramban / aksesibilitas | **CHANGES REQUIRED** | Satu temuan tersisa, `REV-112-F01`. |
+
+### REV-112-F01 — LOW — dokumen tanpa `<h1>`
+
+Aturan axe-core `page-has-heading-one` melanggar pada **9/9 tampilan**. Dokumen tidak punya elemen `<h1>` sama sekali; merek global dirender sebagai `<div class="brand">Signal Forge</div>` dan setiap tampilan memulai hierarkinya langsung dari `<h2>`. Akibatnya pengguna pembaca layar tidak memperoleh judul tingkat satu untuk halaman, dan navigasi berdasarkan judul dimulai dari tingkat dua.
+
+Dampak dibatasi pada aksesibilitas: tidak ada konsekuensi keamanan, data, atau backend. Karena itu klasifikasinya LOW, bukan blocker rilis, tetapi tetap `CHANGES REQUIRED` karena kontraknya dapat diperiksa dan perbaikannya sepele.
+
+### Bukti yang dipertahankan
+
+Seluruh bukti REV-111 (RED 3/3 → GREEN 10/10, default 379/379, `check --all-targets` rc=0, probe peramban F01–F03 pada 1440/760/390, payload XSS inert 0) tetap berlaku dan tidak dicabut oleh temuan ini; F01 bersifat aditif terhadap struktur judul, bukan koreksi atas perbaikan sebelumnya.
+
+**Tidak ada deployment** yang dilakukan atau diizinkan oleh ronde ini.
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED** untuk jalur peramban; jalur sumber APPROVED.
+
+## REV-113 — Corrective atas REV-112 F01
+
+**Tanggal:** 2026-09-10
+**Basis terkunci:** `febbdc54fa25a2f2ceaae80c6933a1e82b263bb6`
+**Toolchain:** Rust 1.89.0, `CARGO_TARGET_DIR=C:/temp/rev113_target`
+**Lingkup:** `static/index.html`, `tests/dashboard_ui_contract.rs`, `REVIEW_RESULT.md`. Tidak ada perubahan backend, skema, migrasi, dependensi, atau deploy.
+
+### Status awal
+
+`REV-112-F01` belum terimplementasi saat ronde ini dimulai: `grep -n "<h1" static/index.html` pada `febbdc54` tidak menghasilkan baris apa pun, dan merek global masih `<div class="brand">Signal Forge</div>` di baris 186.
+
+### Perbaikan
+
+| Temuan | Berkas | Perilaku lama | Perilaku baru | Mengapa mekanisme ini otoritatif |
+| --- | --- | --- | --- | --- |
+| F01 | `static/index.html:190` | `<div class="brand">Signal Forge</div>`; dokumen tanpa `<h1>` | `<h1 class="brand">Signal Forge</h1>` | Merek global adalah satu-satunya teks yang berlaku untuk seluruh dokumen, bukan untuk satu tampilan, sehingga ia adalah judul tingkat satu yang benar secara semantik. Sembilan `<h2 id="h-*">` per tampilan tidak diubah, jadi hierarki tetap 1 → 2 tanpa tingkat yang dilompati. Tepat satu `<h1>` ada di DOM. |
+| F01 (regresi turunan) | `static/index.html:180-181` | `@media (max-width: 760px) { .brand { display: none; } }` | Merek disembunyikan secara visual (`position: absolute; width/height: 1px; overflow: hidden; clip-path: inset(50%)`) | `display: none` menghapus elemen dari pohon aksesibilitas, sehingga pada layar ≤760px dokumen kembali tanpa `<h1>` dan `page-has-heading-one` menyala lagi. Ini terbukti secara empiris (lihat bukti peramban di bawah), bukan diasumsikan. Penyembunyian visual mempertahankan judul bagi pembaca layar sambil menjaga tata letak navigasi mobile tetap sama. |
+| F01 (gaya) | `static/index.html:43-52` | — | `.brand` menambahkan `font-size: inherit; margin: 0;` | Menetralkan default UA untuk `h1` (`2em`, margin blok `0.67em`) sehingga penampilan visual identik dengan `<div>` sebelumnya. Terukur: `fontSize 14px`, `fontWeight 700`, `margin 0px 0px 0px 0px`, `padding 4px 8px 14px 8px`, `color rgb(242, 184, 75)`. |
+
+### RED → GREEN
+
+Tes baru `the_document_has_exactly_one_h1_and_it_is_the_global_brand` ditulis lebih dulu dan dijalankan terhadap `static/index.html` yang masih utuh pada `febbdc54`:
+
+```
+running 1 test
+test the_document_has_exactly_one_h1_and_it_is_the_global_brand ... FAILED
+
+---- the_document_has_exactly_one_h1_and_it_is_the_global_brand stdout ----
+thread '...' panicked at tests\dashboard_ui_contract.rs:318:5:
+assertion `left == right` failed: the document must expose exactly one <h1>
+  left: 0
+ right: 1
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out
+```
+
+Kegagalannya adalah kegagalan asersi (`left: 0`), bukan galat kompilasi, dan hanya tes baru itu yang RED — sepuluh tes kontrak lama tetap tersaring/lulus. Setelah perbaikan HTML/CSS diterapkan:
+
+```
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+Tes menegaskan empat hal sekaligus: tepat satu kemunculan `<h1`, merek global adalah `<h1 class="brand">Signal Forge</h1>`, `<div class="brand">` sudah tidak ada, sembilan `<h2 id="h-*">` per tampilan tetap utuh, dan `.brand { display: none; }` tidak boleh muncul kembali pada layout mobile.
+
+### Bukti peramban + axe-core
+
+Server tiruan deterministik (`C:/temp/rev113_mock.py`, membaca ulang `static/index.html` per permintaan, `Cache-Control: no-store`), Chromium headless, `page.setCacheEnabled(false)` + query cache-buster, axe-core 4.10.2 dengan `runOnly` = `page-has-heading-one`, `heading-order`, `empty-heading`.
+
+Sebelum perbaikan, viewport 1440×900, sembilan tampilan: `page-has-heading-one` melanggar pada 9/9 — sesuai laporan REV-112.
+
+Setelah `<h1>` dipasang tetapi masih dengan `display: none` pada mobile, viewport 390×844:
+
+```
+{ "violations": ["page-has-heading-one"], "passes": ["empty-heading", "heading-order"] }
+```
+
+Inilah regresi turunan yang memaksa penyembunyian visual. Setelah perbaikan final, sapuan sembilan tampilan pada dua viewport:
+
+| Viewport | Tampilan diuji | `h1` di DOM | Pelanggaran axe | `scrollWidth - innerWidth` |
+| --- | --- | --- | --- | --- |
+| 1440×900 | 9/9 (overview, token, wallets, funding, signals, clusters, telegram, queues, settings) | 1 pada setiap tampilan | 0 pada setiap tampilan | 0 pada setiap tampilan |
+| 390×844 | 9/9 | 1 pada setiap tampilan | 0 pada setiap tampilan | 0 pada setiap tampilan |
+
+Setiap baris juga mengonfirmasi `section[data-view].active` sama dengan tampilan yang diklik, jadi kesembilan navigasi masih berfungsi. Teks `<h1>` yang terbaca adalah `Signal Forge`, dan sembilan `<h2>` tetap ada di DOM pada setiap tampilan.
+
+### Gate
+
+```
+cargo +1.89.0 test  --locked --test dashboard_ui_contract   -> ok. 11 passed; 0 failed
+cargo +1.89.0 check --locked --all-targets                  -> Finished dev profile, rc=0
+cargo +1.89.0 test  --locked                                -> 12 binari tes, 380 passed; 0 failed, rc=0
+git diff --check                                            -> rc=0 (tidak ada whitespace error)
+```
+
+Rincian 380: 173 + 145 + 7 + 3 + 3 + 5 + 11 + 20 + 4 + 6 + 3 + 0.
+
+### Yang TIDAK diperbaiki
+
+- Lane `pg_tests` dan lane migrasi PostgreSQL tidak dijalankan: perubahan ronde ini murni frontend (satu elemen HTML + tiga deklarasi CSS) dan tidak menyentuh SQL, skema, atau jalur basis data.
+- Kesenjangan backend yang dinyatakan REV-109 (tidak ada endpoint anggota klaster, tidak ada linimasa per kasus radar, tidak ada aksi per sinyal) tetap ada; di luar lingkup.
+- Aturan axe di luar tiga aturan judul tidak dijalankan pada ronde ini; temuan REV-112 hanya satu dan lingkupnya dikunci pada temuan itu.
+- Server tiruan adalah alat probe di luar repo, bukan artefak yang dikirim. **Tidak ada deployment.**
+
+### Berkas berubah
+
+```
+static/index.html               merek global menjadi <h1>, reset default UA h1, penyembunyian visual mobile
+tests/dashboard_ui_contract.rs  satu tes kontrak baru (the_document_has_exactly_one_h1_and_it_is_the_global_brand)
+REVIEW_RESULT.md                dua baris indeks + bagian REV-112 dan REV-113
+```
+
+**Verdict: READY FOR REVIEW.** Persetujuan dimiliki review independen berikutnya (REV-114).

@@ -308,3 +308,31 @@ fn the_secret_field_is_cleared_before_the_request_is_sent() {
         "the request must send the captured local value, not a re-read of the input"
     );
 }
+
+/// REV-112-F01: axe-core `page-has-heading-one` fired on all nine views because
+/// the document had no `<h1>`. The global brand is the document heading; each
+/// view keeps its `<h2>`.
+#[test]
+fn the_document_has_exactly_one_h1_and_it_is_the_global_brand() {
+    let html = dashboard();
+    assert_eq!(html.matches("<h1").count(), 1, "the document must expose exactly one <h1>");
+    assert!(
+        html.contains("<h1 class=\"brand\">Signal Forge</h1>"),
+        "the global brand must be the document <h1>"
+    );
+    assert!(!html.contains("<div class=\"brand\">"), "the brand must no longer be a bare div");
+    // Every view still carries its own second-level heading: no skipped levels.
+    for id in [
+        "h-overview", "h-token", "h-wallets", "h-funding", "h-signals", "h-clusters",
+        "h-telegram", "h-queues", "h-settings",
+    ] {
+        assert!(html.contains(&format!("<h2 id=\"{id}\">")), "missing per-view <h2> {id}");
+    }
+    assert_eq!(html.matches("<h2 id=\"h-").count(), 9, "each of the nine views owns one <h2>");
+    // display:none would drop the only <h1> from the a11y tree under 760px,
+    // re-firing page-has-heading-one on the mobile layout.
+    assert!(
+        !html.contains(".brand { display: none; }"),
+        "the mobile layout must hide the brand visually, not remove it from the a11y tree"
+    );
+}
