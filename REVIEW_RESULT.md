@@ -122,6 +122,8 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-107 | 2026-09-09 | evidence remediation for REV-106 migration/provenance lane | READY FOR REVIEW | source unchanged; fresh/idempotent/predecessor upgrade PASS; residue 0 |
 | REV-108 | 2026-09-09 | independent verification of REV-107 | APPROVED / REV-106 BLOCKED evidence closed | 3/3 lanes; default 369/369; pg_tests 525/525; predecessor upgrade + residue PASS |
 | REV-109 | 2026-09-10 | dasbor operator Indonesia sembilan tampilan (frontend saja) | READY FOR REVIEW | RED 7/7 -> GREEN 7/7; default 376/376; check --all-targets rc=0; probe peramban 1440/760/390 + XSS inert 0 |
+| REV-110 | 2026-09-10 | independent review of REV-109 dashboard | CHANGES REQUIRED / NOT APPROVED | F01 HIGH `__omp_shell` placeholder; F02 stale banner stacking; F03 secret retained during in-flight request |
+| REV-111 | 2026-09-10 | corrective implementation of REV-110 F01-F03 | READY FOR REVIEW | RED 3/3 -> GREEN 10/10; default 379/379; check --all-targets rc=0; probe peramban F01-F03 + 9 tampilan + XSS inert 0 + 1440/760/390 |
 
 
 
@@ -17055,3 +17057,148 @@ REVIEW_RESULT.md               satu baris indeks + satu bagian REV-109
 - Tidak ada deployment yang dilakukan.
 
 **Verdict: READY FOR REVIEW.** Persetujuan dimiliki review Hermes independen (REV-110).
+
+
+## REV-110 — Review independen atas REV-109 (dasbor operator)
+
+**Tanggal:** 2026-09-10
+**Basis yang direview:** `4f8a1c315771e16f172637e9e9f88abd16d14c61` (REV-109)
+**Sifat:** review independen. Temuan direproduksi ulang di sesi ini terhadap byte commit yang belum disentuh sebelum satu baris pun diubah.
+
+### F01 HIGH — kesehatan ringkasan selalu gagal saat runtime
+
+`static/index.html:666` pada commit `4f8a1c3` berisi:
+
+```js
+const bad = __omp_shell("(lat >= 0);")
+```
+
+`__omp_shell` adalah placeholder harness, tidak terdefinisi di peramban nyata. Saat `Muat ulang otoritatif` diklik dengan `/api/health` yang sah, ekspresi ini melempar `ReferenceError` di dalam `render`, `load()` menangkapnya di blok `catch`, dan panel melaporkan `Respons tidak dikenali: bentuk data di luar kontrak.` padahal responsnya valid. Karena `load()` menelan pengecualian, tidak ada `pageerror` yang terlihat — kegagalan diam.
+
+Reproduksi (Chromium headless, server tiruan `C:/temp/rev111_probe/server.py` port 8791, `/api/health` = `{"status":"ok","database_latency_ms":3.5,...}`), byte HTML commit belum diubah:
+
+```
+{ "out": { "health": "Respons tidak dikenali: bentuk data di luar kontrak.",
+           "status": "Pembacaan selesai." },
+  "errs": [] }
+```
+
+### F02 MEDIUM — spanduk usang menumpuk
+
+`load()` menyisipkan spanduk baru di depan konten setiap kali percobaan gagal saat `node.dataset.loaded === '1'`, tanpa menghapus spanduk sebelumnya.
+
+Reproduksi: satu muatan sukses, lalu dua percobaan ulang dengan mode `server` (HTTP 500):
+
+```
+{ "before": "10 Dompet terpantau 5 Token 2 Klaster ...",
+  "banners": 2,
+  "sample": ["Data mungkin usang: pembaruan terakhir g",
+             "Data mungkin usang: pembaruan terakhir g"] }
+```
+
+### F03 MEDIUM — rahasia tidak dikosongkan "segera"
+
+Kolom rahasia baru dikosongkan setelah `await api(...)` selesai. Teks UI (`static/index.html:381`) menjanjikan "dikosongkan segera setelah permintaan dikirim", dan `api()` memberi jendela hingga 20 detik sebelum `AbortController` memutusnya.
+
+Reproduksi: endpoint rahasia ditunda 6 detik; nilai dibaca 2,5 detik setelah klik, saat permintaan masih menggantung:
+
+```
+{ "mid": { "v": "S3CRET-REV111", "pending": true },
+  "end": { "v": "", "inDom": false } }
+```
+
+**Verdict: CHANGES REQUIRED / NOT APPROVED.**
+
+## REV-111 — Corrective atas REV-110 F01–F03
+
+**Tanggal:** 2026-09-10
+**Basis terkunci:** `4f8a1c315771e16f172637e9e9f88abd16d14c61`
+**Toolchain:** Rust 1.89.0, `CARGO_TARGET_DIR=C:/temp/rev111_target`
+**Lingkup:** `static/index.html`, `tests/dashboard_ui_contract.rs`, `REVIEW_RESULT.md`. Tidak ada perubahan backend, skema, migrasi, dependensi, atau deploy.
+
+### Status awal
+
+Ketiga temuan REV-110 belum terimplementasi saat ronde ini dimulai; ketiganya direproduksi lebih dulu di peramban terhadap byte `4f8a1c3` (bukti di bagian REV-110 di atas).
+
+### Perbaikan
+
+| Temuan | Berkas | Perilaku lama | Perilaku baru | Mengapa mekanisme ini otoritatif |
+| --- | --- | --- | --- | --- |
+| F01 | `static/index.html:666` | `const bad = __omp_shell("(lat >= 0);")` — melempar di setiap peramban | `const bad = !Number.isFinite(lat) || lat < 0;` | Verdict dihitung dari nilai yang sudah di-`Number()`. `Number.isFinite` menolak `NaN`/`Infinity` (mis. `null`, string non-numerik, field hilang) dan `< 0` menolak latensi negatif; tidak ada identifier global lain yang dirujuk, sehingga jalur render tak bisa melempar lagi. |
+| F02 | `static/index.html:479-486` | Setiap kegagalan menyisipkan `note bad` baru di depan konten | Spanduk ditandai `banner.dataset.stale = '1'`; sebelum menyisipkan, `node.querySelector(':scope > [data-stale="1"]')` yang ada dihapus | Penanda + pencarian anak langsung membuat de-duplikasi bersifat struktural, bukan bergantung pada pencocokan teks; `:scope >` mencegah spanduk panel bersarang ikut terhapus. Data terakhir tidak disentuh: hanya spanduk yang diganti. |
+| F03 | `static/index.html:1174-1182, 1188-1193` | `$('sec-value').value = ''` dijalankan setelah `await api(...)` | Pengosongan dipindah ke pernyataan pertama di dalam `mutate` — setelah konfirmasi operator, sebelum `fetch` dimulai; nilai yang sudah ditangkap ke variabel lokal `value` adalah satu-satunya salinan yang dikirim | Pengosongan tidak lagi berada di belakang titik `await`, jadi tidak ada jalur (sukses, 5xx, abort 20 detik, koneksi putus) yang bisa meninggalkan plaintext di DOM. Konfirmasi tetap mendahului pengosongan, sehingga pembatalan operator tidak menghapus ketikannya. Jalur DELETE disamakan agar kedua tombol punya perilaku yang sama. |
+
+### RED → GREEN
+
+Tiga tes baru di `tests/dashboard_ui_contract.rs` ditulis lebih dulu dan dijalankan terhadap `static/index.html` yang masih utuh:
+
+```
+running 10 tests
+thread 'the_secret_field_is_cleared_before_the_request_is_sent' panicked at tests\dashboard_ui_contract.rs:301:5:
+the secret is still in the DOM while the request is in flight
+thread 'no_harness_placeholder_survives_in_the_served_page' panicked at tests\dashboard_ui_contract.rs:250:5:
+harness placeholder token `__omp_` is present in the served dashboard
+thread 'the_staleness_banner_is_replaced_not_stacked' panicked at tests\dashboard_ui_contract.rs:267:5:
+the staleness banner carries no marker, so it cannot be de-duplicated
+test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Setelah perbaikan diterapkan:
+
+```
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+Tujuh tes REV-109 tetap hijau di kedua sisi, jadi tiga kegagalan itu memang milik ketiga temuan, bukan efek kompilasi.
+
+### Bukti peramban (Chromium headless, server tiruan di luar repo)
+
+Server tiruan `C:/temp/rev111_probe/server.py` membaca ulang `static/index.html` pada setiap permintaan (mencegah byte basi) dan mengirim `cache-control: no-store`; probe juga memakai `setCacheEnabled(false)` dan query cache-buster.
+
+| Uji | Hasil |
+| --- | --- |
+| F01 latensi 3.5 ms | `note ok` — "Basis data 3.5 ms. Radar: didanai 2, persiapan 1, ter-deploy 0 · Telegram aktif 1/2 …", 0 `pageerror` |
+| F01 latensi `-5` | `note bad` — "Basis data tidak menjawab pengukuran latensi." |
+| F01 latensi `"abc"` (non-finite) | `note bad` — pesan sama, 0 `pageerror` |
+| F02 sukses lalu dua kali 500 | `[data-stale="1"]` = 1, `.note.bad` = 1, KPI 10/5/2/3/1/9 tetap utuh di bawah spanduk |
+| F02 pemulihan | setelah 200 berikutnya: 0 spanduk, KPI segar |
+| F03 tunda 6 dtk, respons 200 | saat menggantung: `sec-value` = "", tombol `disabled`, plaintext tidak ada di DOM; setelah selesai tetap kosong |
+| F03 tunda 6 dtk, HTTP 500 | sama: kosong saat menggantung dan sesudahnya |
+| F03 tunda 6 dtk, koneksi diputus | sama: kosong saat menggantung dan sesudahnya |
+| F03 tunda 22 dtk (abort 20 dtk) | kosong saat menggantung; setelah abort status `Koneksi terputus atau permintaan kedaluwarsa.`, plaintext tidak ada di DOM |
+| Sembilan tampilan | overview/token/wallets/funding/signals/clusters/telegram/queues/settings semuanya aktif dan terisi; tidak satu pun menampilkan `Respons tidak dikenali`; 0 `pageerror` |
+| XSS inert | payload `<img src=x onerror=…>` pada kanal Telegram, naratif token, relasi, kasus radar, sinyal: `window.__xss` = 0, `document.querySelectorAll('img')` = 0, teks tampil harfiah |
+| Mutasi | konfirmasi muncul (`Konfirmasi: Jeda antrean live_watch?`); dibatalkan → 0 permintaan tambahan; disetujui dengan tiga klik beruntun → tepat 1 POST `/pause`; pembacaan ulang menampilkan `live_watch DIJEDA … Lanjutkan` |
+| Responsif | 1440/760/390: `documentElement.scrollWidth` = `innerWidth` di ketiganya (1440/1440, 760/760, 390/390) |
+| Fokus keyboard | 12 kali Tab: sembilan tombol navigasi lalu `Muat ulang otoritatif`, semuanya `outline: solid 2px` |
+
+### Gate
+
+```
+cargo +1.89.0 test  --locked --test dashboard_ui_contract   ok. 10 passed; 0 failed
+cargo +1.89.0 check --locked --all-targets                  rc=0, 0 warning
+cargo +1.89.0 test  --locked                                rc=0 — lib 173, bin 145, authority_boundary 7,
+                                                            catalog_portability 3, chain_alias 3, cli_exit_codes 5,
+                                                            dashboard_ui_contract 10, migration_invariants 20,
+                                                            review_runtime_regressions 4, schema_enum_alignment 6,
+                                                            toolchain_gates 3, doc-tests 0 = 379 lulus, 0 gagal
+git diff --check                                            rc=0
+```
+
+### Yang tidak dikerjakan
+
+- Lane `pg_tests` dan lane migrasi PostgreSQL tidak dijalankan pada ronde ini: perubahannya hanya frontend dan tidak menyentuh SQL, skema, atau jalur basis data. Angka-angkanya tidak dikutip di sini.
+- Kesenjangan backend yang dinyatakan REV-109 (tidak ada endpoint anggota klaster, tidak ada linimasa per kasus radar, tidak ada aksi per sinyal) tetap ada; di luar lingkup ronde ini.
+- Server tiruan adalah alat probe di luar repo, bukan artefak yang dikirim. Tidak ada deployment.
+
+### Berkas berubah
+
+```
+static/index.html               F01 verdict latensi, F02 de-duplikasi spanduk usang, F03 pengosongan rahasia pra-permintaan (POST + DELETE)
+tests/dashboard_ui_contract.rs  tiga tes kontrak baru (no_harness_placeholder_survives_in_the_served_page,
+                                the_staleness_banner_is_replaced_not_stacked,
+                                the_secret_field_is_cleared_before_the_request_is_sent)
+REVIEW_RESULT.md                dua baris indeks + bagian REV-110 dan REV-111
+```
+
+**Verdict: READY FOR REVIEW.** Persetujuan dimiliki review independen berikutnya (REV-112).

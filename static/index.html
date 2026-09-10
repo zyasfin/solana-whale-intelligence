@@ -477,7 +477,12 @@
       const res = await api(path, opts);
       if (res.state !== 'ok') {
         if (had) {
+          // One staleness banner per panel: a second failed retry replaces the
+          // first instead of stacking, and the last-known data stays untouched.
+          const prev = node.querySelector(':scope > [data-stale="1"]');
+          if (prev) node.removeChild(prev);
           const banner = el('div', 'note bad', STATE.stale + ' (' + STATE[res.state] + ')');
+          banner.dataset.stale = '1';
           node.insertBefore(banner, node.firstChild);
         } else {
           note(node, 'bad', STATE[res.state]);
@@ -663,7 +668,7 @@
       const health = await load($('ov-health'), '/api/health', (h, node) => {
         if (!h || typeof h !== 'object') throw new Error('shape');
         const lat = Number(h.database_latency_ms);
-        const bad = __omp_shell("(lat >= 0);")
+        const bad = !Number.isFinite(lat) || lat < 0;
         note(node, bad ? 'bad' : 'ok',
           (bad ? 'Basis data tidak menjawab pengukuran latensi. ' : 'Basis data ' + lat.toFixed(1) + ' ms. ')
           + 'Radar: didanai ' + (h.funding_radar || {}).funded + ', persiapan ' + (h.funding_radar || {}).preparation
@@ -1167,8 +1172,11 @@
       const value = $('sec-value').value;
       if (!value.trim()) { status('Nilai rahasia kosong; tidak dikirim.'); return; }
       mutate(button, async () => {
-        const res = await api('/api/settings/secrets', { method: 'POST', body: { name, value } });
+        // Cleared after confirmation and BEFORE the request is initiated: a
+        // hung or timing-out POST must never leave the plaintext in the DOM.
+        // The captured local `value` is the only copy, and it is sent once.
         $('sec-value').value = '';
+        const res = await api('/api/settings/secrets', { method: 'POST', body: { name, value } });
         if (res.state === 'ok') loadEnv();
         return res;
       });
@@ -1178,8 +1186,8 @@
       const button = $('sec-del');
       const name = $('sec-name').value;
       mutate(button, async () => {
-        const res = await api('/api/settings/secrets/' + encodeURIComponent(name), { method: 'DELETE' });
         $('sec-value').value = '';
+        const res = await api('/api/settings/secrets/' + encodeURIComponent(name), { method: 'DELETE' });
         if (res.state === 'ok') loadEnv();
         return res;
       });

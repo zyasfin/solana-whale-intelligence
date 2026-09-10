@@ -238,3 +238,73 @@ fn legacy_token_recent_semantics_survive() {
     // Same-symbol alone stays unrelated.
     assert!(html.contains("simbol"), "the same-symbol caveat was dropped");
 }
+
+/// REV-110-F01: the shipped page must contain no harness placeholder call.
+/// `__omp_shell(...)` is undefined in a browser, so the expression it stands in
+/// throws at render time and a perfectly valid `/api/health` is reported as
+/// "Respons tidak dikenali". A placeholder is not a defect of one line: any
+/// `__omp_` token in the served asset is an unexecutable stub.
+#[test]
+fn no_harness_placeholder_survives_in_the_served_page() {
+    let html = dashboard();
+    assert!(
+        !html.contains("__omp_"),
+        "harness placeholder token `__omp_` is present in the served dashboard"
+    );
+    // The health verdict must be computed from the parsed latency itself.
+    assert!(
+        html.contains("!Number.isFinite(lat) || lat < 0"),
+        "database health must be decided by a finite, non-negative latency test"
+    );
+}
+
+/// REV-110-F02: repeated failed refreshes must not stack staleness banners.
+/// The banner has to be identifiable and the previous one replaced, while the
+/// last-known data underneath stays intact.
+#[test]
+fn the_staleness_banner_is_replaced_not_stacked() {
+    let html = dashboard();
+    assert!(
+        html.contains("banner.dataset.stale = '1'"),
+        "the staleness banner carries no marker, so it cannot be de-duplicated"
+    );
+    assert!(
+        html.contains("[data-stale=\"1\"]"),
+        "no lookup of the previous staleness banner before inserting a new one"
+    );
+    assert!(
+        html.contains("removeChild(prev)"),
+        "the previous staleness banner is never removed"
+    );
+    // The degrade path must still keep the stale content rather than clearing.
+    let load_fn = html.split("async function load(node, path, render, opts)").nth(1).expect("load()");
+    let body = &load_fn[..load_fn.find("function table(").unwrap_or(load_fn.len())];
+    assert!(
+        !body.contains("clear(node);\n        note"),
+        "the failure branch must not erase last-known data"
+    );
+}
+
+/// REV-110-F03: the secret field is cleared before the request is initiated,
+/// not after it resolves. A 20 s hung request must not leave the plaintext
+/// secret sitting in the DOM.
+#[test]
+fn the_secret_field_is_cleared_before_the_request_is_sent() {
+    let html = dashboard();
+    let form = html
+        .split("$('st-secret').addEventListener('submit'")
+        .nth(1)
+        .expect("secret submit handler");
+    let form = &form[..form.find("$('sec-del')").expect("secret delete handler")];
+    let cleared = form.find("$('sec-value').value = '';").expect("secret field is never cleared");
+    let sent = form.find("api('/api/settings/secrets'").expect("secret POST");
+    assert!(
+        cleared < sent,
+        "the secret is still in the DOM while the request is in flight"
+    );
+    // The captured value must be a local, never re-read from the DOM later.
+    assert!(
+        form.contains("body: { name, value }"),
+        "the request must send the captured local value, not a re-read of the input"
+    );
+}
