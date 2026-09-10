@@ -121,6 +121,7 @@ Lokasi kanonis hasil review source: file ini, di root Git `swi-src`.
 | REV-106 | 2026-09-09 | independent verification of REV-105 | CHANGES REQUIRED / BLOCKED | source PASS; Rust/PG gates PASS; migration lane unavailable; reviewer cleanup recovered |
 | REV-107 | 2026-09-09 | evidence remediation for REV-106 migration/provenance lane | READY FOR REVIEW | source unchanged; fresh/idempotent/predecessor upgrade PASS; residue 0 |
 | REV-108 | 2026-09-09 | independent verification of REV-107 | APPROVED / REV-106 BLOCKED evidence closed | 3/3 lanes; default 369/369; pg_tests 525/525; predecessor upgrade + residue PASS |
+| REV-109 | 2026-09-10 | dasbor operator Indonesia sembilan tampilan (frontend saja) | READY FOR REVIEW | RED 7/7 -> GREEN 7/7; default 376/376; check --all-targets rc=0; probe peramban 1440/760/390 + XSS inert 0 |
 
 
 
@@ -16923,3 +16924,134 @@ tracked diff                           empty
 The independent review discovered that a prior cleanup claim was false: a custom PostgreSQL cluster on port 55432 remained. REV-107 stopped it and removed its data directory; the final review independently confirmed zero nonstandard PostgreSQL processes/listeners and zero reviewer-owned database/temp residue.
 
 **Verdict: APPROVED.** Pure-information release-candidate preparation may proceed. Deferred LP/execution/AUTO_BOUNDED scope remains outside this approval.
+
+## REV-109 — Dasbor operator Indonesia (frontend saja)
+
+**Tanggal:** 2026-09-10
+**Basis terkunci:** `288cc1fa4cbc95080825eb5fd3ea3ea0fc53777f` (ledger teratas sebelumnya: REV-108 = APPROVED)
+**Toolchain:** Rust 1.89.0, `CARGO_TARGET_DIR=C:/temp/rev109_target`
+**Lingkup:** hanya UI. Tidak ada perubahan backend, skema, migrasi, dependensi, pipeline build, atau deploy.
+
+### Perubahan
+
+`static/index.html` — satu berkas mandiri, tanpa CDN, font eksternal, npm, atau framework — menggantikan halaman tunggal "Token Recent" berbahasa Inggris dengan meja operasi intelijen berbahasa Indonesia. Berkas ini adalah sumber `api::DASHBOARD_HTML` (`include_str!`), sehingga `api::serve_dashboard` dan `admin.rs:163` menyajikan byte yang sama.
+
+Arah desain: palet basalt `#0A0D10` / steel `#151A20` / teks `#E8ECEF` / amber `#F2B84B` / teal `#5CC8BE` / koral `#EF6B66`; tipografi sistem, monospace hanya untuk alamat, hash, stempel waktu, dan bukti mentah; navigasi kiri tetap, bilah konteks ringkas, kanvas investigasi padat; satu elemen khas berupa strip denyut operasional sempit (`#pulse`) yang mewarnai sel per sumber/antrean dari `/api/health` dan `/api/queues`. Tanpa gradien, glassmorphism, hero KPI raksasa, animasi dekoratif, atau grid kartu seragam.
+
+### Sembilan tampilan dan endpoint nyata
+
+| Tampilan | `data-view` | Endpoint `src/admin.rs` |
+| --- | --- | --- |
+| Ringkasan | `overview` | `/api/health`, `/api/metrics/overview`, `/api/metrics/signals/timeline`, `/api/metrics/radar/trend`, `/api/queues` |
+| Intelijen token | `token` | `/api/tokens/{chain}/{mint}/report`, `/recent?window=`, `/relations` |
+| Dompet | `wallets` | `/api/wallets?chain=&limit=&q=`, `/scores`, `/labels` (GET/POST), `/labels/{id}/revoke` |
+| Radar dana | `funding` | `/api/funding/radar/cases?limit=`, `/api/funding/radar/cases/{id}` |
+| Sinyal | `signals` | `/api/signals?limit=`, `/api/signals/rejections?limit=` |
+| Klaster | `clusters` | `/api/clusters` |
+| Telegram | `telegram` | `/api/telegram/channels` (GET/POST), `/bulk`, `/{key}` (POST/DELETE) |
+| Antrean | `queues` | `/api/queues`, `/api/queues/{name}/pause` |
+| Pengaturan | `settings` | `/api/settings/env`, `/api/settings/runtime` (GET/POST), `/api/settings/secrets` (POST), `/api/settings/secrets/{name}` (DELETE) |
+
+Kesenjangan backend dinyatakan jujur, bukan dikarang: detail/anggota klaster, linimasa kronologis per kasus radar, dan tindak lanjut per sinyal semuanya ditandai `Belum tersedia` dengan alasan.
+
+Kosakata yang dikirim ke backend diambil dari sumber, bukan tebakan: disposisi `score|watch|flow_only|skip` (`Disposition::parse`, ditampilkan sebagai TRACK/WATCH/FLOW_ONLY/SKIP), rantai `solana|robinhood` (`ChainKind`), enam nama antrean (`queues::ALL_QUEUES`), sembilan kunci runtime (`EDITABLE_KEYS`, `runtime_profile` hanya `low|scale`, sisanya bilangan bulat tak negatif), dan enam nama rahasia (`SECRET_KEYS`). `HELIUS_KEY_*`, `GMGN_API_KEY`, `ROBINHOOD_RPC_URL`, `ADMIN_PASSWORD_HASH_B64` tampil hanya-baca karena bersifat env-only.
+
+### Batas kepercayaan
+
+- Render lewat DOM (`textContent`/`createElement`); tidak ada `innerHTML` dinamis. `esc` beserta kelima entitas dipertahankan sesuai kontrak REV-062-F02 di `src/api.rs`.
+- Nol atribut penangan sebaris (`onclick=`, `onerror=`, dst.) di seluruh berkas; satu `addEventListener` per aksi.
+- Setiap segmen path/query melewati `encodeURIComponent` secara individual.
+- `fetch` same-origin dengan `credentials: 'same-origin'` dan batas waktu 20 detik.
+- Mutasi tidak pernah dipicu saat muat halaman, ganti tampilan, atau muat ulang; setiap kontrol mutasi membawa `data-confirm`, dijaga `data-pending` + `disabled` + `aria-busy`, lalu diikuti pembacaan ulang otoritatif.
+- Kolom rahasia adalah `type="password"`, dikosongkan segera setelah permintaan; nilai tersimpan tidak pernah dirender.
+- Validasi di batas UI: mint 20–64 alfanumerik, batas numerik dijepit (dompet 1–1000, radar/sinyal 1–500), kunci runtime dan nama rahasia hanya dari allowlist.
+
+### Kontrak status
+
+Setiap tampilan membedakan: `Belum ada kueri`, `Memuat…`, `Belum ada data`, `Cakupan sebagian`, `Data mungkin usang` (isi lama dipertahankan di bawah spanduk), `Koneksi terputus`, `Sesi berakhir` (arahkan ke `/login`), `Gangguan server (5xx)`, `Respons tidak dikenali`, `Belum tersedia`, dan `Perubahan tersimpan` + pembacaan ulang.
+
+### Bukti RED
+
+`tests/dashboard_ui_contract.rs` diperluas dari 2 menjadi 7 pengujian terfokus, dijalankan pada `static/index.html` HEAD yang belum disentuh:
+
+```text
+cargo +1.89.0 test --locked --test dashboard_ui_contract -- --nocapture
+test result: FAILED. 0 passed; 7 failed; 0 ignored
+
+dashboard missing lang="id"
+no view calls /api/health
+mutation-safety contract missing: function confirmAction(
+state vocabulary missing: Belum ada kueri
+path/query segments must be encoded individually
+the partial-coverage disclaimer was dropped
+stiff legacy copy remains: ...
+```
+
+Ketujuh kegagalan adalah kegagalan asersi atas perilaku yang hilang, bukan kegagalan kompilasi atau harness.
+
+### Bukti GREEN
+
+```text
+cargo +1.89.0 test --locked --test dashboard_ui_contract    7 passed; 0 failed
+cargo +1.89.0 check --locked --all-targets                  rc=0 (Finished dev profile)
+cargo +1.89.0 test --locked                                 376 passed; 0 failed (369 basis + 7 baru)
+git diff --check                                            rc=0
+```
+
+Lajur PostgreSQL penuh tidak dijalankan: tidak ada sumber backend, skema, atau migrasi yang berubah pada ronde ini.
+
+### Bukti perilaku peramban
+
+Probe dijalankan dengan Chromium terhadap server HTTP tiruan deterministik di luar repo (`C:/temp/rev109_probe/server.py`, port 8791) yang menyajikan `static/index.html` apa adanya dan merekam setiap mutasi.
+
+```text
+navigasi 9 tampilan                    9/9 aktif+terlihat, hash tersinkron, 0 galat konsol
+satu bacaan sukses per tampilan        9/9 merender baris nyata dari API
+kosong (array [])                      "Belum ada data untuk kriteria ini."
+401                                    "Sesi berakhir. Masuk kembali di /login."
+500 di atas panel berisi data          spanduk usang + isi lama (7|3) tetap ada
+JSON rusak                             "Respons tidak dikenali: bentuk data di luar kontrak."
+404                                    dipetakan ke "Belum tersedia"
+cakupan sebagian                       disclosure bertahan meski semua filter relasi dimatikan;
+                                       panel relasi menyatakan "bukan temuan tidak ada penggunaan ulang"
+mint tidak valid                       ditolak di UI sebelum permintaan dikirim
+muatan XSS (<img src=x onerror=...>)   window.__xss = 0; img[src=x] = 0; teks tampil inert
+                                       pada event_type, missing_inputs, evidence_refs, to_identity,
+                                       recipient, signal_kind, judul/kunci kanal, naratif
+konfirmasi dibatalkan                  0 mutasi terkirim
+konfirmasi diterima                    tepat 1 POST /api/queues/live_watch/pause {"paused":true},
+                                       pembacaan ulang menampilkan DIJEDA
+dua klik dalam satu tick               1 mutasi (data-pending=1, disabled=true)
+label dompet                           1 POST .../labels {kind,disposition:"score",reason}; kolom dibersihkan
+cabut label                            1 POST .../labels/5/revoke
+rahasia                                type=password; kolom kosong setelah kirim;
+                                       nilai tidak ada di DOM; server menerima nama allowlist saja
+navigasi ulang 9 tampilan              0 mutasi tambahan
+```
+
+Viewport (muat bersih, cache dimatikan):
+
+```text
+1440x900   navigasi kolom 216px, scrollWidth 1440 = viewport, denyut 4 sel
+760x900    navigasi menjadi baris horizontal, split menjadi satu kolom, scrollWidth 760
+390x844    scrollWidth 390 = viewport, navigasi dapat digulir, tabel digulir di dalam .scroll
+```
+
+Papan ketik: `Tab` memindahkan fokus antar tombol navigasi, `Enter` mengaktifkan tampilan (`#token`), `outline` fokus terlihat `rgb(92, 200, 190)`. Nol galat JS konsol pada seluruh probe kecuali status kegagalan API yang sengaja diinduksi.
+
+### Berkas berubah
+
+```text
+static/index.html              ditulis ulang (Token Recent -> dasbor sembilan tampilan)
+tests/dashboard_ui_contract.rs baru (7 kontrak statis)
+REVIEW_RESULT.md               satu baris indeks + satu bagian REV-109
+```
+
+### Batasan
+
+- Kesenjangan backend tetap ada dan dinyatakan di UI: tidak ada endpoint anggota klaster, tidak ada linimasa per kasus radar, tidak ada aksi per sinyal.
+- Pengujian statis Rust tidak dapat membuktikan perilaku runtime; buktinya adalah probe peramban di atas, bukan asersi berkas.
+- Server tiruan adalah alat probe di luar repo, bukan artefak yang dikirim.
+- Tidak ada deployment yang dilakukan.
+
+**Verdict: READY FOR REVIEW.** Persetujuan dimiliki review Hermes independen (REV-110).

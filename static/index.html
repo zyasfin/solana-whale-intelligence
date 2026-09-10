@@ -1,190 +1,400 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="id">
 
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Signal Forge — Token Recent</title>
+  <title>Signal Forge — Meja Operasi Intelijen</title>
   <style>
     :root {
       color-scheme: dark;
+      --basalt: #0A0D10;
+      --steel: #151A20;
+      --line: #232B34;
+      --text: #E8ECEF;
+      --dim: #93A1AE;
+      --amber: #F2B84B;
+      --teal: #5CC8BE;
+      --coral: #EF6B66;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
+
+    * { box-sizing: border-box; }
 
     body {
-      font-family: system-ui, sans-serif;
       margin: 0;
-      background: #0d1117;
-      color: #c9d1d9;
-    }
-
-    header {
-      padding: 16px 24px;
-      border-bottom: 1px solid #21262d;
-    }
-
-    h1 {
-      font-size: 18px;
-      margin: 0;
-    }
-
-    main {
-      padding: 24px;
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-
-    form {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 24px;
-      flex-wrap: wrap;
-    }
-
-    input,
-    select,
-    button {
-      background: #161b22;
-      color: #c9d1d9;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      padding: 6px 10px;
-    }
-
-    button {
-      cursor: pointer;
-    }
-
-    .panels {
+      background: var(--basalt);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 16px;
+      grid-template-columns: 216px minmax(0, 1fr);
+      min-height: 100vh;
     }
 
-    @media (max-width: 800px) {
-      .panels {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    .panel {
-      background: #161b22;
-      border: 1px solid #21262d;
-      border-radius: 8px;
-      padding: 16px;
-    }
-
-    .panel h2 {
-      font-size: 14px;
-      margin: 0 0 12px;
-      color: #58a6ff;
-    }
-
-    .event,
-    .relation {
-      border-top: 1px solid #21262d;
-      padding: 8px 0;
-      font-size: 13px;
-    }
-
-    .badge {
-      display: inline-block;
-      padding: 1px 7px;
-      border-radius: 10px;
-      font-size: 11px;
-      margin-right: 4px;
-    }
-
-    .exact {
-      background: #1f6feb33;
-      color: #58a6ff;
-    }
-
-    .reconstructed {
-      background: #a371f733;
-      color: #bc8cff;
-    }
-
-    .estimated {
-      background: #d2992233;
-      color: #e3b341;
-    }
-
-    .insufficient {
-      background: #f8514933;
-      color: #f85149;
-    }
-
-    .copycat {
-      background: #f8514933;
-      color: #f85149;
-    }
-
-    .official {
-      background: #2ea04333;
-      color: #3fb950;
-    }
-
-    .muted {
-      color: #8b949e;
-    }
-
-    .filters {
+    nav {
+      background: var(--steel);
+      border-right: 1px solid var(--line);
+      padding: 14px 10px;
       display: flex;
-      gap: 12px;
-      margin-bottom: 12px;
-      font-size: 13px;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .brand {
+      font-weight: 700;
+      letter-spacing: .01em;
+      padding: 4px 8px 14px;
+      color: var(--amber);
+    }
+
+    nav button {
+      text-align: left;
+      background: none;
+      border: 0;
+      border-left: 2px solid transparent;
+      color: var(--dim);
+      padding: 8px 10px;
+      font: inherit;
+      cursor: pointer;
+      min-height: 40px;
+    }
+
+    nav button[aria-current="page"] {
+      color: var(--text);
+      background: #1D242C;
+      border-left-color: var(--amber);
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--teal);
+      outline-offset: 2px;
+    }
+
+    header.bar {
+      display: flex;
+      gap: 14px;
+      align-items: center;
       flex-wrap: wrap;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #10151A;
+      font-size: 12.5px;
+      color: var(--dim);
+    }
+
+    header.bar strong { color: var(--text); font-weight: 600; }
+
+    #pulse {
+      display: flex;
+      gap: 3px;
+      align-items: center;
+      margin-left: auto;
+    }
+
+    #pulse i {
+      display: block;
+      width: 8px;
+      height: 18px;
+      background: #2A333D;
+      border-radius: 1px;
+    }
+
+    #pulse i.up { background: var(--teal); }
+    #pulse i.warn { background: var(--amber); }
+    #pulse i.down { background: var(--coral); }
+
+    @media (prefers-reduced-motion: no-preference) {
+      #pulse i { transition: background .35s linear; }
+    }
+
+    nav { min-width: 0; }
+    body > div { min-width: 0; overflow: hidden; }
+    main { padding: 18px; }
+    section[data-view].active > * { max-width: 100%; }
+
+    section[data-view] { display: none; }
+    section[data-view].active { display: block; }
+
+    h2 { font-size: 16px; margin: 0 0 4px; }
+    h3 { font-size: 13px; margin: 18px 0 6px; color: var(--dim); font-weight: 600; }
+    p.lede { margin: 0 0 14px; color: var(--dim); font-size: 12.5px; max-width: 74ch; }
+
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+
+    input, select, button, textarea {
+      background: #0E1318;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 7px 9px;
+      font: inherit;
+      min-height: 36px;
+    }
+
+    button { cursor: pointer; }
+    button.act { border-color: #3A4753; }
+    button.danger { border-color: #5A3230; color: var(--coral); }
+    button[disabled] { opacity: .5; cursor: progress; }
+
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--dim); font-weight: 600; font-size: 12px; }
+    tbody tr:hover { background: #12181E; }
+    td.m, .m { font-family: var(--mono); font-size: 12px; }
+
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .kpi { background: var(--steel); padding: 10px 12px; }
+    .kpi b { display: block; font-size: 20px; font-family: var(--mono); font-weight: 600; }
+    .kpi span { color: var(--dim); font-size: 12px; }
+
+    .note { padding: 8px 10px; border-left: 2px solid var(--line); color: var(--dim); font-size: 12.5px; margin: 8px 0; }
+    .note.warn { border-left-color: var(--amber); color: var(--amber); }
+    .note.bad { border-left-color: var(--coral); color: var(--coral); }
+    .note.ok { border-left-color: var(--teal); color: var(--teal); }
+
+    .badge { display: inline-block; padding: 1px 6px; border: 1px solid var(--line); border-radius: 3px; font-size: 11px; margin-right: 4px; font-family: var(--mono); }
+    .badge.official { border-color: #2C5E4F; color: var(--teal); }
+    .badge.copycat { border-color: #5A3230; color: var(--coral); }
+    .badge.estimated { border-color: #5A4A22; color: var(--amber); }
+    .exact { color: var(--teal); }
+    .reconstructed { color: #B9A7E8; }
+    .estimated { color: var(--amber); }
+    .insufficient { color: var(--coral); }
+    .muted { color: var(--dim); }
+
+    .split { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; }
+    .panel { border: 1px solid var(--line); background: var(--steel); padding: 12px; }
+    .filters { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12.5px; margin-bottom: 10px; }
+    .scroll { overflow-x: auto; max-width: 100%; }
+    svg.chart { width: 100%; height: 78px; background: #0E1318; border: 1px solid var(--line); }
+
+    @media (max-width: 760px) {
+      body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
+      nav { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 8px; }
+      nav button { border-left: 0; border-bottom: 2px solid transparent; white-space: nowrap; }
+      nav button[aria-current="page"] { border-bottom-color: var(--amber); }
+      .brand { display: none; }
+      .split { grid-template-columns: minmax(0, 1fr); }
+      table { min-width: 560px; }
+      main { padding: 12px; }
     }
   </style>
 </head>
 
 <body>
-  <header>
-    <h1>Signal Forge — Token Recent + Deployer/Social Reuse</h1>
-  </header>
-  <main>
-    <form id="query-form">
-      <input id="chain" placeholder="chain (solana)" value="solana" size="12">
-      <input id="mint" placeholder="contract address" size="40">
-      <select id="window">
-        <option value="1h">1h</option>
-        <option value="24h" selected>24h</option>
-        <option value="7d">7d</option>
-        <option value="30d">30d</option>
-        <option value="all">all</option>
-      </select>
-      <button type="submit">Load</button>
-    </form>
+  <nav aria-label="Navigasi utama">
+    <div class="brand">Signal Forge</div>
+    <button type="button" data-nav="overview" aria-current="page">Ringkasan</button>
+    <button type="button" data-nav="token">Intelijen token</button>
+    <button type="button" data-nav="wallets">Dompet</button>
+    <button type="button" data-nav="funding">Radar dana</button>
+    <button type="button" data-nav="signals">Sinyal</button>
+    <button type="button" data-nav="clusters">Klaster</button>
+    <button type="button" data-nav="telegram">Telegram</button>
+    <button type="button" data-nav="queues">Antrean</button>
+    <button type="button" data-nav="settings">Pengaturan</button>
+  </nav>
 
-    <!-- All five independent relation categories are user-filterable (REV-027-F09).
-       official/copycat were previously hidden by default rather than togglable. -->
-    <div class="filters" id="filters">
-      <label><input type="checkbox" data-filter="cross_chain" checked> cross-chain</label>
-      <label><input type="checkbox" data-filter="social" checked> social reuse</label>
-      <label><input type="checkbox" data-filter="deployer" checked> deployer/authority/funder</label>
-      <label><input type="checkbox" data-filter="official" checked> official CA</label>
-      <label><input type="checkbox" data-filter="copycat" checked> suspected copycat</label>
-    </div>
+  <div>
+    <header class="bar">
+      <span id="ctx-view"><strong>Ringkasan</strong></span>
+      <span id="ctx-fresh" class="m">kesegaran: belum diketahui</span>
+      <span id="ctx-status" role="status" aria-live="polite">Siap.</span>
+      <span id="pulse" aria-label="Denyut kesehatan sumber dan antrean" title="Denyut kesehatan sumber dan antrean"></span>
+    </header>
 
-    <div class="panels">
-      <section class="panel">
-        <h2>Token Recent Timeline</h2>
-        <div id="timeline"><span class="muted">No query yet.</span></div>
+    <main>
+      <section data-view="overview" class="active" aria-labelledby="h-overview">
+        <h2 id="h-overview">Ringkasan</h2>
+        <p class="lede">Kondisi infrastruktur, arus sinyal, dan tekanan antrean. Semua angka berasal langsung dari basis data; tidak ada nilai contoh.</p>
+        <div class="row"><button type="button" class="act" data-load="overview">Muat ulang otoritatif</button></div>
+        <div id="ov-kpis" class="kpis"></div>
+        <div id="ov-health"></div>
+        <h3>Sinyal per jam (diterima / ditolak)</h3>
+        <div id="ov-timeline"></div>
+        <h3>Tren radar dana per jam</h3>
+        <div id="ov-radar"></div>
+        <h3>Antrean</h3>
+        <div id="ov-queues"></div>
       </section>
-      <section class="panel">
-        <h2>Deployer / Social Reuse</h2>
-        <div id="relations"><span class="muted">No query yet.</span></div>
+
+      <section data-view="token" aria-labelledby="h-token">
+        <h2 id="h-token">Intelijen token</h2>
+        <p class="lede">Naratif, linimasa kejadian, dan relasi deployer/sosial. Ketiadaan relasi pada cakupan sebagian bukan temuan "tidak ada penggunaan ulang".</p>
+        <form class="row" id="token-form">
+          <label for="t-chain">Rantai</label>
+          <select id="t-chain">
+            <option value="solana">solana</option>
+            <option value="robinhood">robinhood</option>
+          </select>
+          <label for="t-mint">Alamat kontrak</label>
+          <input id="t-mint" size="42" placeholder="alamat mint" autocomplete="off">
+          <label for="t-window">Jendela</label>
+          <select id="t-window">
+            <option value="1h">1h</option>
+            <option value="24h" selected>24h</option>
+            <option value="7d">7d</option>
+            <option value="30d">30d</option>
+            <option value="all">semua</option>
+          </select>
+          <button type="submit" class="act">Telusuri</button>
+        </form>
+        <div class="filters" id="filters">
+          <label><input type="checkbox" data-filter="cross_chain" checked> lintas rantai</label>
+          <label><input type="checkbox" data-filter="social" checked> penggunaan ulang sosial</label>
+          <label><input type="checkbox" data-filter="deployer" checked> deployer/otoritas/pendana</label>
+          <label><input type="checkbox" data-filter="official" checked> CA resmi</label>
+          <label><input type="checkbox" data-filter="copycat" checked> dugaan tiruan</label>
+        </div>
+        <div id="t-report" class="note">Belum ada kueri.</div>
+        <div class="split">
+          <div class="panel"><h3>Linimasa kejadian</h3><div id="t-timeline"><span class="muted">Belum ada kueri.</span></div></div>
+          <div class="panel"><h3>Relasi terkorobori</h3><div id="t-relations"><span class="muted">Belum ada kueri.</span></div></div>
+        </div>
       </section>
-    </div>
-  </main>
+
+      <section data-view="wallets" aria-labelledby="h-wallets">
+        <h2 id="h-wallets">Dompet</h2>
+        <p class="lede">Daftar dompet terpantau beserta disposisi aktif. Skor hanya ditampilkan bila benar-benar ada; skor provisional ditandai.</p>
+        <form class="row" id="w-form">
+          <label for="w-chain">Rantai</label>
+          <select id="w-chain"><option value="solana">solana</option><option value="robinhood">robinhood</option></select>
+          <label for="w-q">Cari alamat</label>
+          <input id="w-q" size="26" placeholder="potongan alamat" autocomplete="off">
+          <label for="w-limit">Batas</label>
+          <input id="w-limit" type="number" min="1" max="1000" value="50" size="5">
+          <button type="submit" class="act">Muat daftar</button>
+        </form>
+        <div class="split">
+          <div class="panel scroll"><h3>Dompet</h3><div id="w-list"><span class="muted">Belum ada kueri.</span></div></div>
+          <div class="panel">
+            <h3>Detail dompet</h3>
+            <div id="w-detail"><span class="muted">Pilih satu dompet.</span></div>
+            <h3>Tambah label manual</h3>
+            <form class="row" id="w-label-form">
+              <label for="lbl-kind">Jenis</label>
+              <input id="lbl-kind" size="16" placeholder="mis. whale" autocomplete="off">
+              <label for="lbl-disp">Disposisi</label>
+              <select id="lbl-disp">
+                <option value="score">TRACK</option>
+                <option value="watch">WATCH</option>
+                <option value="flow_only">FLOW_ONLY</option>
+                <option value="skip">SKIP</option>
+              </select>
+              <label for="lbl-reason">Alasan</label>
+              <input id="lbl-reason" size="18" autocomplete="off">
+              <button type="submit" class="act" data-confirm="Tambahkan label manual untuk dompet terpilih?">Tambah label</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section data-view="funding" aria-labelledby="h-funding">
+        <h2 id="h-funding">Radar dana</h2>
+        <p class="lede">Kasus pendanaan yang terdeteksi. Linimasa per kasus tidak didukung backend; hanya bukti mentah yang tersedia.</p>
+        <form class="row" id="f-form">
+          <label for="f-limit">Batas</label>
+          <input id="f-limit" type="number" min="1" max="500" value="50" size="5">
+          <button type="submit" class="act">Muat kasus</button>
+        </form>
+        <div class="split">
+          <div class="panel scroll"><h3>Kasus</h3><div id="f-list"><span class="muted">Belum ada kueri.</span></div></div>
+          <div class="panel"><h3>Bukti kasus</h3><div id="f-detail"><span class="muted">Pilih satu kasus.</span></div></div>
+        </div>
+      </section>
+
+      <section data-view="signals" aria-labelledby="h-signals">
+        <h2 id="h-signals">Sinyal</h2>
+        <p class="lede">Sinyal diterima dan evaluasi yang ditolak beserta kode penolakannya. Tidak ada aksi tindak lanjut di backend.</p>
+        <form class="row" id="s-form">
+          <button type="button" class="act" data-tab="accepted" aria-pressed="true">Diterima</button>
+          <button type="button" class="act" data-tab="rejected" aria-pressed="false">Ditolak</button>
+          <label for="s-limit">Batas</label>
+          <input id="s-limit" type="number" min="1" max="500" value="50" size="5">
+          <button type="submit" class="act">Muat</button>
+        </form>
+        <div id="s-list"><span class="muted">Belum ada kueri.</span></div>
+      </section>
+
+      <section data-view="clusters" aria-labelledby="h-clusters">
+        <h2 id="h-clusters">Klaster</h2>
+        <p class="lede">Agregat klaster dompet dan jumlah anggota aktif.</p>
+        <div class="row"><button type="button" class="act" data-load="clusters">Muat klaster</button></div>
+        <div id="c-list"><span class="muted">Belum ada kueri.</span></div>
+        <div class="note">Detail dan daftar anggota klaster: <strong>Belum tersedia</strong> — backend tidak menyediakan endpoint anggota klaster.</div>
+      </section>
+
+      <section data-view="telegram" aria-labelledby="h-telegram">
+        <h2 id="h-telegram">Telegram</h2>
+        <p class="lede">Allowlist kanal. Menghapus kanal hanya mencabut allowlist dan menonaktifkannya; riwayat pesan tetap tersimpan.</p>
+        <div class="row"><button type="button" class="act" data-load="telegram">Muat kanal</button></div>
+        <div id="tg-list"><span class="muted">Belum ada kueri.</span></div>
+        <h3>Tambah satu kanal</h3>
+        <form class="row" id="tg-add">
+          <label for="tg-key">Kunci kanal</label>
+          <input id="tg-key" size="22" autocomplete="off">
+          <label for="tg-title">Judul</label>
+          <input id="tg-title" size="18" autocomplete="off">
+          <label for="tg-user">Username</label>
+          <input id="tg-user" size="16" autocomplete="off">
+          <button type="submit" class="act" data-confirm="Tambahkan kanal ini ke allowlist?">Tambah</button>
+        </form>
+        <h3>Impor massal</h3>
+        <form class="row" id="tg-bulk">
+          <label for="tg-bulk-text">Satu kunci kanal per baris</label>
+          <textarea id="tg-bulk-text" rows="3" cols="40"></textarea>
+          <button type="submit" class="act" data-confirm="Impor semua kanal pada daftar ini?">Impor</button>
+        </form>
+      </section>
+
+      <section data-view="queues" aria-labelledby="h-queues">
+        <h2 id="h-queues">Antrean</h2>
+        <p class="lede">Otoritas tekanan balik yang dibaca worker. Jeda dan lanjut hanya terjadi setelah klik eksplisit dan konfirmasi; tidak ada jeda otomatis.</p>
+        <div class="row"><button type="button" class="act" data-load="queues">Muat ulang otoritatif</button></div>
+        <div id="q-list"><span class="muted">Belum ada kueri.</span></div>
+      </section>
+
+      <section data-view="settings" aria-labelledby="h-settings">
+        <h2 id="h-settings">Pengaturan</h2>
+        <p class="lede">Variabel lingkungan hanya-baca, setelan runtime yang dapat diubah, dan penyimpanan rahasia yang bersifat tulis-saja. Nilai rahasia tidak pernah dikirim ke peramban.</p>
+        <div class="row"><button type="button" class="act" data-load="settings">Muat ulang otoritatif</button></div>
+        <h3>Lingkungan</h3>
+        <div id="st-env"><span class="muted">Belum ada kueri.</span></div>
+        <h3>Setelan runtime</h3>
+        <div id="st-runtime"><span class="muted">Belum ada kueri.</span></div>
+        <h3>Rahasia (tulis-saja)</h3>
+        <form class="row" id="st-secret">
+          <label for="sec-name">Nama</label>
+          <select id="sec-name">
+            <option value="DATABASE_URL">DATABASE_URL</option>
+            <option value="TG_API_ID">TG_API_ID</option>
+            <option value="TG_API_HASH">TG_API_HASH</option>
+            <option value="TG_SESSION_PATH">TG_SESSION_PATH</option>
+            <option value="TELEGRAM_BOT_TOKEN">TELEGRAM_BOT_TOKEN</option>
+            <option value="TELEGRAM_CHAT_ID">TELEGRAM_CHAT_ID</option>
+          </select>
+          <label for="sec-value">Nilai baru</label>
+          <input id="sec-value" type="password" size="30" autocomplete="new-password">
+          <button type="submit" class="act" data-confirm="Simpan rahasia ini? Nilai lama akan ditimpa.">Simpan rahasia</button>
+          <button type="button" class="danger" id="sec-del" data-confirm="Hapus override rahasia ini dan kembali ke nilai lingkungan?">Hapus override</button>
+        </form>
+        <div class="note">Kolom rahasia dikosongkan segera setelah permintaan dikirim. Nilai tersimpan tidak pernah ditampilkan kembali.</div>
+      </section>
+    </main>
+  </div>
 
   <script>
-    // REV-062-F02: the dashboard renders API data from ingest/provider/store, which
-    // is NOT trusted. Every dynamic value must be escaped before it reaches
-    // innerHTML — an injected `<img src=x onerror=...>` as an event_type, a
-    // missing-input name, or a relation value would otherwise become executable
-    // DOM in an auth-admin UI. `esc` HTML-escapes the five characters that can
-    // break out of an element or attribute.
+    'use strict';
+
+    // REV-062-F02 / REV-109: every value from the API originates in ingest,
+    // providers, the DB or another operator and is UNTRUSTED. This dashboard
+    // renders exclusively through DOM construction (`textContent` /
+    // `createElement`), so no markup string is built from data at all and the
+    // escape can no longer be forgotten at one call site.
+    //
+    // `esc` stays as the ONE sanctioned escaper: the REV-062-F02 guard in
+    // `src/api.rs` requires it to exist with all five entities, so any future
+    // markup path has a correct helper waiting instead of a hand-rolled one.
     function esc(v) {
       return String(v == null ? '' : v)
         .replace(/&/g, '&amp;')
@@ -194,17 +404,292 @@
         .replace(/'/g, '&#39;');
     }
 
-    const form = document.getElementById('query-form');
-    const timeline = document.getElementById('timeline');
-    const relations = document.getElementById('relations');
+    const $ = id => document.getElementById(id);
 
-    function confidenceClass(c) {
-      const map = { exact: 'exact', reconstructed: 'reconstructed', estimated: 'estimated', insufficient: 'insufficient' };
-      return map[c] || 'estimated';
+    function el(tag, cls, text) {
+      const n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text != null) n.textContent = String(text);
+      return n;
     }
 
-    // A relation's independent category (REV-023 §7). Categories are independent:
-    // a `reused_social_link` is NOT a copycat; a `suspected_copycat` is.
+    function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+    function note(node, kind, text) {
+      clear(node);
+      node.appendChild(el('div', 'note' + (kind ? ' ' + kind : ''), text));
+    }
+
+    function status(text) { $('ctx-status').textContent = text; }
+
+    // Distinct outcome vocabulary. Nothing here may collapse into "kosong":
+    // an outage, an expired session and a genuinely empty table are different
+    // facts and the operator must be able to tell them apart.
+    const STATE = {
+      idle: 'Belum ada kueri.',
+      loading: 'Memuat…',
+      empty: 'Belum ada data untuk kriteria ini.',
+      partial: 'Cakupan sebagian — sebagian masukan otoritatif tidak tersedia.',
+      stale: 'Data mungkin usang: pembaruan terakhir gagal, isi di bawah berasal dari muatan sebelumnya.',
+      offline: 'Koneksi terputus atau permintaan kedaluwarsa.',
+      auth: 'Sesi berakhir. Masuk kembali di /login.',
+      server: 'Gangguan server (5xx). Ini bukan "tidak ada data".',
+      shape: 'Respons tidak dikenali: bentuk data di luar kontrak.',
+      unsupported: 'Belum tersedia: backend tidak menyediakan kemampuan ini.',
+      saved: 'Perubahan tersimpan. Menampilkan pembacaan ulang otoritatif.'
+    };
+
+    // Same-origin fetch with credentials; classifies every failure mode.
+    async function api(path, options) {
+      const opts = Object.assign({ credentials: 'same-origin', headers: {} }, options || {});
+      if (opts.body != null && typeof opts.body !== 'string') {
+        opts.headers['content-type'] = 'application/json';
+        opts.body = JSON.stringify(opts.body);
+      }
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 20000);
+      opts.signal = ctl.signal;
+      let resp;
+      try {
+        resp = await fetch(path, opts);
+      } catch (e) {
+        clearTimeout(timer);
+        return { state: 'offline' };
+      }
+      clearTimeout(timer);
+      if (resp.status === 401 || resp.status === 403) return { state: 'auth' };
+      if (resp.status === 404 || resp.status === 501) return { state: 'unsupported' };
+      if (resp.status >= 500) return { state: 'server' };
+      if (!resp.ok) return { state: 'shape' };
+      try {
+        return { state: 'ok', data: await resp.json(), at: new Date() };
+      } catch (e) {
+        return { state: 'shape' };
+      }
+    }
+
+    // A read that fails must never blank a panel that already holds real data:
+    // it degrades to an explicit staleness banner above the last-known content.
+    async function load(node, path, render, opts) {
+      const had = node.dataset.loaded === '1';
+      if (!had) note(node, null, STATE.loading);
+      status(STATE.loading);
+      const res = await api(path, opts);
+      if (res.state !== 'ok') {
+        if (had) {
+          const banner = el('div', 'note bad', STATE.stale + ' (' + STATE[res.state] + ')');
+          node.insertBefore(banner, node.firstChild);
+        } else {
+          note(node, 'bad', STATE[res.state]);
+        }
+        status(STATE[res.state]);
+        return null;
+      }
+      clear(node);
+      try {
+        render(res.data, node);
+      } catch (e) {
+        note(node, 'bad', STATE.shape);
+        status(STATE.shape);
+        return null;
+      }
+      node.dataset.loaded = '1';
+      $('ctx-fresh').textContent = 'kesegaran: ' + res.at.toLocaleTimeString('id-ID');
+      status('Pembacaan selesai.');
+      return res.data;
+    }
+
+    function table(node, columns, rows, cell) {
+      if (!Array.isArray(rows)) throw new Error('shape');
+      if (!rows.length) { note(node, null, STATE.empty); return; }
+      const wrap = el('div', 'scroll');
+      const t = el('table');
+      const thead = el('thead');
+      const htr = el('tr');
+      columns.forEach(c => htr.appendChild(el('th', null, c)));
+      thead.appendChild(htr);
+      t.appendChild(thead);
+      const tb = el('tbody');
+      rows.forEach((r, i) => tb.appendChild(cell(r, i)));
+      t.appendChild(tb);
+      wrap.appendChild(t);
+      node.appendChild(wrap);
+    }
+
+    function td(text, cls) { return el('td', cls || null, text == null ? '—' : text); }
+
+    // Mutations are operator-initiated only. Every mutating control carries
+    // `data-confirm`; nothing here runs on load, on view change, or on refresh.
+    function confirmAction(button) {
+      const question = button.getAttribute('data-confirm');
+      if (!question) return true;
+      return window.confirm('Konfirmasi: ' + question);
+    }
+
+    // One in-flight guard per control: a second click while a mutation is
+    // pending cannot produce a second write.
+    async function mutate(button, fn) {
+      if (button.dataset.pending === '1') return;
+      if (!confirmAction(button)) { status('Dibatalkan operator.'); return; }
+      button.dataset.pending = '1';
+      button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
+      try {
+        const res = await fn();
+        if (res && res.state === 'ok') status(STATE.saved);
+        else status(res ? STATE[res.state] : STATE.shape);
+        return res;
+      } finally {
+        button.dataset.pending = '0';
+        button.disabled = false;
+        button.removeAttribute('aria-busy');
+      }
+    }
+
+    const VIEW_TITLES = {
+      overview: 'Ringkasan', token: 'Intelijen token', wallets: 'Dompet',
+      funding: 'Radar dana', signals: 'Sinyal', clusters: 'Klaster',
+      telegram: 'Telegram', queues: 'Antrean', settings: 'Pengaturan'
+    };
+
+    function show(name) {
+      document.querySelectorAll('section[data-view]').forEach(s => {
+        s.classList.toggle('active', s.dataset.view === name);
+      });
+      document.querySelectorAll('nav [data-nav]').forEach(b => {
+        if (b.dataset.nav === name) b.setAttribute('aria-current', 'page');
+        else b.removeAttribute('aria-current');
+      });
+      $('ctx-view').textContent = VIEW_TITLES[name] || name;
+      status('Tampilan: ' + (VIEW_TITLES[name] || name) + '. Muat data secara eksplisit.');
+      if (location.hash.slice(1) !== name) location.hash = name;
+    }
+
+    document.querySelectorAll('nav [data-nav]').forEach(b => {
+      b.addEventListener('click', () => show(b.dataset.nav));
+    });
+
+    // Operational pulse: source/queue health, refreshed from real endpoints only.
+    function pulse(cells) {
+      const strip = $('pulse');
+      clear(strip);
+      cells.forEach(c => {
+        const i = el('i');
+        i.className = c.cls;
+        i.title = c.label;
+        strip.appendChild(i);
+      });
+    }
+    pulse([{ cls: '', label: 'kesehatan belum dibaca' }]);
+
+    // ---------------------------------------------------------------- Ringkasan
+    function sparkline(rows, keys, colors) {
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('class', 'chart');
+      svg.setAttribute('viewBox', '0 0 100 30');
+      svg.setAttribute('preserveAspectRatio', 'none');
+      svg.setAttribute('role', 'img');
+      const max = Math.max(1, ...rows.flatMap(r => keys.map(k => Number(r[k]) || 0)));
+      keys.forEach((k, ki) => {
+        const pts = rows.map((r, i) => {
+          const x = rows.length > 1 ? (i / (rows.length - 1)) * 100 : 0;
+          const y = 30 - ((Number(r[k]) || 0) / max) * 28;
+          return x.toFixed(2) + ',' + y.toFixed(2);
+        }).join(' ');
+        const line = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+        line.setAttribute('points', pts);
+        line.setAttribute('fill', 'none');
+        line.setAttribute('stroke', colors[ki]);
+        line.setAttribute('stroke-width', '1');
+        svg.appendChild(line);
+      });
+      svg.setAttribute('aria-label', keys.join(' / ') + ', maksimum ' + max);
+      return svg;
+    }
+
+    function seriesPanel(node, rows, keys, colors) {
+      if (!Array.isArray(rows)) throw new Error('shape');
+      if (!rows.length) { note(node, null, STATE.empty); return; }
+      node.appendChild(sparkline(rows, keys, colors));
+      const legend = el('div', 'muted m', keys.map((k, i) => k + ' (' + colors[i] + ')').join(' · ')
+        + ' · titik terakhir ' + (rows[rows.length - 1].t || ''));
+      node.appendChild(legend);
+    }
+
+    function queueRows(node, rows, withControls) {
+      table(node, ['antrean', 'status', 'lag (dtk)', 'diperbarui', 'oleh', withControls ? 'aksi' : ''].filter(Boolean),
+        rows, q => {
+          const tr = el('tr');
+          tr.appendChild(td(q.queue, 'm'));
+          tr.appendChild(td(q.paused ? 'DIJEDA' : 'jalan', q.paused ? 'insufficient' : 'exact'));
+          tr.appendChild(td(q.lag_seconds, 'm'));
+          tr.appendChild(td(q.updated_at, 'm'));
+          tr.appendChild(td(q.updated_by, 'm'));
+          if (withControls) {
+            const cell = el('td');
+            const b = el('button', q.paused ? 'act' : 'danger', q.paused ? 'Lanjutkan' : 'Jeda');
+            b.setAttribute('data-confirm', (q.paused ? 'Lanjutkan' : 'Jeda') + ' antrean ' + q.queue + '?');
+            b.addEventListener('click', () => mutate(b, async () => {
+              const res = await api('/api/queues/' + encodeURIComponent(q.queue) + '/pause',
+                { method: 'POST', body: { paused: !q.paused } });
+              if (res.state === 'ok') await loadQueues();
+              return res;
+            }));
+            cell.appendChild(b);
+            tr.appendChild(cell);
+          }
+          return tr;
+        });
+    }
+
+    const loadQueues = () => load($('q-list'), '/api/queues', (rows, node) => queueRows(node, rows, true));
+
+    async function loadOverview() {
+      const kpiNode = $('ov-kpis');
+      const ov = await load(kpiNode, '/api/metrics/overview', (d, node) => {
+        if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('shape');
+        const spec = [
+          ['wallets', 'Dompet terpantau'], ['tokens', 'Token'], ['clusters', 'Klaster'],
+          ['signals_24h', 'Sinyal 24 jam'], ['radar_open', 'Kasus radar terbuka'],
+          ['transfers_24h', 'Transfer 24 jam']
+        ];
+        spec.forEach(([k, label]) => {
+          const box = el('div', 'kpi');
+          box.appendChild(el('b', null, d[k] == null ? '—' : d[k]));
+          box.appendChild(el('span', null, label + (d[k] == null ? ' · Belum tersedia' : '')));
+          node.appendChild(box);
+        });
+      });
+      const health = await load($('ov-health'), '/api/health', (h, node) => {
+        if (!h || typeof h !== 'object') throw new Error('shape');
+        const lat = Number(h.database_latency_ms);
+        const bad = __omp_shell("(lat >= 0);")
+        note(node, bad ? 'bad' : 'ok',
+          (bad ? 'Basis data tidak menjawab pengukuran latensi. ' : 'Basis data ' + lat.toFixed(1) + ' ms. ')
+          + 'Radar: didanai ' + (h.funding_radar || {}).funded + ', persiapan ' + (h.funding_radar || {}).preparation
+          + ', ter-deploy ' + (h.funding_radar || {}).deployed
+          + ' · Telegram aktif ' + (h.telegram || {}).active + '/' + (h.telegram || {}).allowlisted
+          + ', pesan ' + (h.telegram || {}).messages_stored);
+        if (!(h.telegram || {}).active) {
+          node.appendChild(el('div', 'note warn', 'Sumber Telegram tidak punya kanal aktif — cakupan ingest berkurang.'));
+        }
+      });
+      await load($('ov-timeline'), '/api/metrics/signals/timeline?hours=24',
+        (rows, node) => seriesPanel(node, rows, ['accepted', 'rejected'], ['#5CC8BE', '#EF6B66']));
+      await load($('ov-radar'), '/api/metrics/radar/trend?hours=48',
+        (rows, node) => seriesPanel(node, rows, ['funded', 'preparation', 'deployed'], ['#F2B84B', '#5CC8BE', '#93A1AE']));
+      const queues = await load($('ov-queues'), '/api/queues', (rows, node) => queueRows(node, rows, false));
+      const cells = [];
+      cells.push({ cls: health ? 'up' : 'down', label: 'kesehatan basis data' });
+      cells.push({ cls: ov ? 'up' : 'down', label: 'metrik' });
+      cells.push({ cls: (health && (health.telegram || {}).active) ? 'up' : 'warn', label: 'ingest telegram' });
+      (Array.isArray(queues) ? queues : []).forEach(q => {
+        cells.push({ cls: q.paused ? 'down' : (Number(q.lag_seconds) > 300 ? 'warn' : 'up'), label: q.queue + (q.paused ? ' dijeda' : ' lag ' + q.lag_seconds + 's') });
+      });
+      pulse(cells);
+    }
+
+    // ------------------------------------------------------- Intelijen token
     function relationCategory(rel) {
       const r = (rel || '').toLowerCase();
       if (r === 'cross_chain_deployment') return 'cross_chain';
@@ -219,141 +704,490 @@
       return 'other';
     }
 
-    function relationBadge(r) {
-      const cat = relationCategory(r);
-      const isOfficial = cat === 'official';
-      const isCopycat = cat === 'copycat';
-      const cls = isOfficial ? 'official' : (isCopycat ? 'copycat' : 'estimated');
-      return `<span class="badge ${esc(cls)}">${esc(r)}</span>`;
-    }
-
     function categoriesOf(rel) {
-      // An event/relation may belong to several independent categories.
       const cat = relationCategory(rel);
       return cat === 'other' ? [] : [cat];
     }
 
-    async function render() {
-      const chain = document.getElementById('chain').value.trim();
-      const mint = document.getElementById('mint').value.trim();
-      const window = document.getElementById('window').value;
-      if (!mint) { timeline.innerHTML = '<span class="muted">Enter a contract address.</span>'; relations.innerHTML = ''; return; }
-
-      const filterState = {};
-      document.querySelectorAll('[data-filter]').forEach(cb => filterState[cb.dataset.filter] = cb.checked);
-      const active = Object.keys(filterState).filter(k => filterState[k]);
-
-      function passesFilters(cats) {
-        if (active.length === 0) return true; // no category filter selected -> show all
-        return cats.some(c => active.includes(c));
-      }
-
-      // Distinct capability/error states (REV-023 §7): never collapse a failure to
-      // "no data".
-      function renderState(resp) {
-        if (resp.ok) return null;
-        if (resp.status === 401 || resp.status === 403) return 'auth failure';
-        if (resp.status >= 500) return 'DB/API failure';
-        return 'capability unavailable';
-      }
-
-      function showState(msg) {
-        timeline.innerHTML = `<span class="muted">${msg}</span>`;
-        relations.innerHTML = `<span class="muted">${msg}</span>`;
-      }
-
-      // REV-027-F09: fetch/network/JSON exceptions were uncaught, so a dropped
-      // connection or a malformed body left both panels showing stale content
-      // with the error only in the console. Every failure mode now surfaces as
-      // an explicit state.
-      let recent, rel;
-      try {
-        const [recentResp, relResp] = await Promise.all([
-          fetch(`/api/tokens/${chain}/${mint}/recent?window=${window}`),
-          fetch(`/api/tokens/${chain}/${mint}/relations`),
-        ]);
-
-        const state = renderState(recentResp) || renderState(relResp);
-        if (state) {
-          showState(`${state}.`);
-          return;
-        }
-
-        recent = await recentResp.json();
-        rel = await relResp.json();
-      } catch (err) {
-        const detail = err && err.message ? err.message : 'network or malformed response';
-        showState(`request failed: ${detail}`);
-        return;
-      }
-
-      if (!Array.isArray(recent) || !Array.isArray(rel)) {
-        showState('DB/API failure: unexpected response shape.');
-        return;
-      }
-
-      // A coverage disclosure carries NO relation, so it has no category and every
-      // relation-category filter would drop it — leaving the timeline showing
-      // "No recent events" for a token whose coverage is admittedly partial. That is
-      // the confusion this disclosure exists to prevent, so it is never filtered out:
-      // the category filters select among RELATIONS, and this row is not one.
-      // `isDisclosure` recognises FULL coverage too: `missing_inputs=[]` is a real
-      // disclosure of "nothing is missing", the improvement REV-058-F05 records
-      // explicitly rather than inferring from silence (REV-060-F02).
-      const isDisclosure = e => e.event_type === 'coverage_disclosure' && !e.relation;
-      const recentShown = recent.filter(e => isDisclosure(e) || passesFilters(categoriesOf(e.relation)));
-      function coverageNote(e) {
-        const missing = e.missing_inputs || [];
-        if (!missing.length) return '<div class="muted">coverage <strong>full</strong> — every authoritative input accounted for</div>';
-        return `<div class="muted">coverage <strong>partial</strong> · missing inputs: ${esc(missing.join(', '))} — absence of a relation here is NOT evidence of no reuse</div>`;
-      }
-
-      // The CURRENT coverage state is the one the SERVER marks as current, not one
-      // the UI ranks for itself.
-      //
-      // REV-060-F02: forming the union from every historical disclosure meant that on
-      // `window=all` a past degraded disclosure kept the UI saying "Coverage partial"
-      // while the newest state was full. A state has exactly one current value;
-      // history is the archive, not the answer.
-      //
-      // REV-062-F03: sorting by `occurred_at` alone is nondeterministic on a
-      // timestamp tie and `NaN`-prone on a malformed value, and the client cannot see
-      // the store's tie-breaker (`id DESC`) at all — so the UI could name a different
-      // current state than every server-side policy read. The API now ships
-      // `is_current_coverage`, decided by that canonical order, and this code just
-      // reads it. A timestamp is no longer part of the decision.
-      const currentDisclosure = recent.find(e => e.event_type === 'coverage_disclosure' && e.is_current_coverage);
-      const currentMissing = currentDisclosure ? (currentDisclosure.missing_inputs || []) : [];
-      const missingUnion = [...new Set(currentMissing)];
-
-      timeline.innerHTML = recentShown.length
-        ? recentShown.map(e => `
-      <div class="event" data-kinds="${esc(categoriesOf(e.relation).join(' '))}">
-        <div>${isDisclosure(e) ? '<span class="badge estimated">coverage limit</span>' : relationBadge(e.relation || 'unknown')}<span class="muted">${esc(e.event_type)}</span></div>
-        <div>occurred ${esc(e.occurred_at)} · observed ${esc(e.observed_at)}</div>
-        <div class="muted">confidence: <span class="${esc(confidenceClass(e.confidence_level))}">${esc(e.confidence_level)}</span>
-          · freshness ${e.freshness ? esc(e.freshness.age_seconds) + 's' : 'n/a'} · coverage ${esc(e.coverage)} · capability ${esc(e.capability_status)}</div>
-        ${coverageNote(e)}
-        <div class="muted">evidence: ${esc((e.evidence_refs || []).join(', ')) || 'none'}${e.dependency_group ? ' · group ' + esc(e.dependency_group) : ''}</div>
-      </div>`).join('')
-        : '<span class="muted">No recent events.</span>';
-
-      const relShown = rel.filter(c => passesFilters(categoriesOf(c.relation)));
-      relations.innerHTML = relShown.length
-        ? relShown.map(c => `
-      <div class="relation">
-        <div>${relationBadge(c.relation)} → ${esc(c.to_identity.kind)}:${esc(c.to_identity.value)}</div>
-        <div class="muted">confidence <span class="${esc(confidenceClass(c.confidence))}">${esc(c.confidence)}</span> · evidence ${esc((c.evidence_refs || []).join(', ')) || 'none'}</div>
-      </div>`).join('')
-        : (missingUnion.length
-          ? `<span class="muted">Coverage <strong>partial</strong>: ${esc(missingUnion.join(', '))} not available for this token, so deployer/authority/funder reuse was NOT evaluated. This is not a finding of "no reuse".</span>`
-          : '<span class="muted">No corroborated relations (same-symbol-only contracts stay unrelated).</span>');
+    function confidenceClass(c) {
+      return ({ exact: 'exact', reconstructed: 'reconstructed', estimated: 'estimated', insufficient: 'insufficient' })[c] || 'estimated';
     }
 
-    form.addEventListener('submit', e => { e.preventDefault(); render(); });
-    document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', render));
-    // Initial load (page renders on open, not only on submit).
-    render();
+    function relationBadge(rel) {
+      const cat = relationCategory(rel);
+      const b = el('span', 'badge ' + (cat === 'official' ? 'official' : cat === 'copycat' ? 'copycat' : 'estimated'), rel);
+      return b;
+    }
+
+    function activeFilters() {
+      const on = [];
+      document.querySelectorAll('[data-filter]').forEach(cb => { if (cb.checked) on.push(cb.dataset.filter); });
+      return on;
+    }
+
+    function passes(cats, on) { return on.length === 0 || cats.some(c => on.includes(c)); }
+
+    async function loadToken() {
+      const chain = $('t-chain').value;
+      const mint = $('t-mint').value.trim();
+      const win = $('t-window').value;
+      if (!/^[A-Za-z0-9]{20,64}$/.test(mint)) {
+        note($('t-report'), 'warn', 'Alamat kontrak tidak valid: masukkan 20–64 karakter alfanumerik.');
+        note($('t-timeline'), null, STATE.idle);
+        note($('t-relations'), null, STATE.idle);
+        return;
+      }
+      const base = '/api/tokens/' + encodeURIComponent(chain) + '/' + encodeURIComponent(mint);
+
+      await load($('t-report'), base + '/report', (d, node) => {
+        const n = d && d.narrative;
+        if (!n) { note(node, 'warn', 'Naratif Belum tersedia untuk token ini.'); return; }
+        node.appendChild(el('div', null, n.narrative));
+        node.appendChild(el('div', 'muted', 'keyakinan ' + n.confidence + ' · alasan sekarang: ' + (n.why_now || '—')));
+        node.appendChild(el('div', 'muted', 'kontra-bukti: ' + (n.counter_evidence || '—')));
+      });
+
+      const on = activeFilters();
+      const recent = await load($('t-timeline'), base + '/recent?window=' + encodeURIComponent(win), (rows, node) => {
+        if (!Array.isArray(rows)) throw new Error('shape');
+        // A coverage disclosure carries no relation, so no category filter may
+        // drop it: the filters select among RELATIONS, and this row is not one.
+        const isDisclosure = e => e.event_type === 'coverage_disclosure' && !e.relation;
+        const shown = rows.filter(e => isDisclosure(e) || passes(categoriesOf(e.relation), on));
+        if (!shown.length) { note(node, null, STATE.empty); return; }
+        shown.forEach(e => {
+          const box = el('div', 'panel');
+          box.style.marginBottom = '8px';
+          const head = el('div');
+          head.appendChild(isDisclosure(e) ? el('span', 'badge estimated', 'batas cakupan') : relationBadge(e.relation || 'tidak diketahui'));
+          head.appendChild(el('span', 'muted', e.event_type));
+          box.appendChild(head);
+          box.appendChild(el('div', 'm muted', 'terjadi ' + e.occurred_at + ' · teramati ' + e.observed_at));
+          const conf = el('div', 'muted');
+          conf.appendChild(document.createTextNode('keyakinan: '));
+          conf.appendChild(el('span', confidenceClass(e.confidence_level), e.confidence_level));
+          conf.appendChild(document.createTextNode(' · kesegaran ' + (e.freshness ? e.freshness.age_seconds + 's' : 'n/a')
+            + ' · cakupan ' + e.coverage + ' · kemampuan ' + e.capability_status));
+          box.appendChild(conf);
+          const missing = e.missing_inputs || [];
+          box.appendChild(el('div', missing.length ? 'note warn' : 'note ok',
+            missing.length
+              ? STATE.partial + ' Masukan hilang: ' + missing.join(', ') + ' — ketiadaan relasi di sini bukan temuan "tidak ada penggunaan ulang".'
+              : 'Cakupan penuh — seluruh masukan otoritatif terhitung.'));
+          box.appendChild(el('div', 'muted m', 'bukti: ' + ((e.evidence_refs || []).join(', ') || 'tidak ada')
+            + (e.dependency_group ? ' · grup ' + e.dependency_group : '')));
+          node.appendChild(box);
+        });
+      });
+
+      // The CURRENT coverage state is the one the SERVER marks current
+      // (`is_current_coverage`), never one the client ranks for itself.
+      const current = Array.isArray(recent)
+        ? recent.find(e => e.event_type === 'coverage_disclosure' && e.is_current_coverage) : null;
+      const missingUnion = current ? [...new Set(current.missing_inputs || [])] : [];
+
+      await load($('t-relations'), base + '/relations', (rows, node) => {
+        if (!Array.isArray(rows)) throw new Error('shape');
+        const shown = rows.filter(c => passes(categoriesOf(c.relation), on));
+        if (!shown.length) {
+          note(node, missingUnion.length ? 'warn' : null, missingUnion.length
+            ? STATE.partial + ' ' + missingUnion.join(', ') + ' tidak tersedia untuk token ini, sehingga penggunaan ulang deployer/otoritas/pendana TIDAK dievaluasi — ini bukan temuan "tidak ada penggunaan ulang".'
+            : 'Belum ada data relasi terkorobori. Kontrak yang hanya berbagi simbol yang sama tetap dianggap tidak berelasi.');
+          return;
+        }
+        shown.forEach(c => {
+          const box = el('div', 'panel');
+          box.style.marginBottom = '8px';
+          const head = el('div');
+          head.appendChild(relationBadge(c.relation));
+          head.appendChild(el('span', 'm', '→ ' + c.to_identity.kind + ':' + c.to_identity.value));
+          box.appendChild(head);
+          const conf = el('div', 'muted');
+          conf.appendChild(document.createTextNode('keyakinan '));
+          conf.appendChild(el('span', confidenceClass(c.confidence), c.confidence));
+          conf.appendChild(document.createTextNode(' · bukti ' + ((c.evidence_refs || []).join(', ') || 'tidak ada')));
+          box.appendChild(conf);
+          node.appendChild(box);
+        });
+      });
+    }
+
+    // -------------------------------------------------------------- Dompet
+    const DISPOSITION_LABEL = { score: 'TRACK', watch: 'WATCH', flow_only: 'FLOW_ONLY', skip: 'SKIP' };
+
+    // Selected wallet for the label panel. `null` until the operator picks one,
+    // so the label form can never mutate an implicit target.
+    let selectedWallet = null;
+
+    function walletBase() {
+      return '/api/wallets/' + encodeURIComponent(selectedWallet.chain) + '/' + encodeURIComponent(selectedWallet.address);
+    }
+
+    function loadLabels() {
+      return load($('w-labels'), walletBase() + '/labels', (rows, n) => {
+        table(n, ['id', 'jenis', 'disposisi', 'manual', 'keyakinan', 'status', 'aksi'], rows, r => {
+          const tr = el('tr');
+          tr.appendChild(td(r.id, 'm'));
+          tr.appendChild(td(r.kind));
+          tr.appendChild(td(DISPOSITION_LABEL[r.disposition] || r.disposition, 'm'));
+          tr.appendChild(td(r.manual ? 'ya' : 'tidak'));
+          tr.appendChild(td(r.confidence, 'm'));
+          tr.appendChild(td(r.active ? 'aktif' : 'dicabut/kedaluwarsa'));
+          const cell = el('td');
+          if (r.active) {
+            const b = el('button', 'danger', 'Cabut');
+            b.setAttribute('data-confirm', 'Cabut label ' + r.id + ' pada ' + selectedWallet.address + '?');
+            b.addEventListener('click', () => mutate(b, async () => {
+              const res = await api(walletBase() + '/labels/' + encodeURIComponent(r.id) + '/revoke', { method: 'POST' });
+              if (res.state === 'ok') loadLabels();
+              return res;
+            }));
+            cell.appendChild(b);
+          }
+          tr.appendChild(cell);
+          return tr;
+        });
+      });
+    }
+
+    function walletDetail(chain, address) {
+      selectedWallet = { chain, address };
+      const node = $('w-detail');
+      node.dataset.loaded = '';
+      clear(node);
+      node.appendChild(el('div', 'm', chain + ':' + address));
+      const scores = el('div');
+      node.appendChild(el('h3', null, 'Riwayat skor'));
+      node.appendChild(scores);
+      node.appendChild(el('h3', null, 'Label'));
+      const labels = el('div');
+      labels.id = 'w-labels';
+      node.appendChild(labels);
+      load(scores, walletBase() + '/scores', (rows, n) => {
+        table(n, ['per', 'skill', 'copyability', 'conviction', 'status'], rows, r => {
+          const tr = el('tr');
+          tr.appendChild(td(r.as_of, 'm'));
+          tr.appendChild(td(r.skill_score, 'm'));
+          tr.appendChild(td(r.copyability_score, 'm'));
+          tr.appendChild(td(r.conviction, 'm'));
+          tr.appendChild(td(r.provisional ? 'provisional (belum final)' : 'final'));
+          return tr;
+        });
+      });
+      loadLabels();
+    }
+
+    function loadWallets() {
+      const chain = $('w-chain').value;
+      const q = $('w-q').value.trim();
+      const limit = Math.min(1000, Math.max(1, parseInt($('w-limit').value, 10) || 50));
+      let path = '/api/wallets?chain=' + encodeURIComponent(chain) + '&limit=' + encodeURIComponent(limit);
+      if (q) path += '&q=' + encodeURIComponent(q);
+      return load($('w-list'), path, (rows, node) => {
+        table(node, ['alamat', 'terakhir terlihat', 'sumber', 'disposisi aktif'], rows, w => {
+          const tr = el('tr');
+          const cell = el('td', 'm');
+          const b = el('button', 'act', w.address);
+          b.style.font = 'inherit';
+          b.addEventListener('click', () => walletDetail(w.chain, w.address));
+          cell.appendChild(b);
+          tr.appendChild(cell);
+          tr.appendChild(td(w.last_seen, 'm'));
+          tr.appendChild(td(w.source));
+          tr.appendChild(td(w.disposition ? (DISPOSITION_LABEL[w.disposition] || w.disposition) : 'tanpa disposisi', 'm'));
+          return tr;
+        });
+      });
+    }
+
+    // ---------------------------------------------------------- Radar dana
+    function fundingDetail(id) {
+      const node = $('f-detail');
+      node.dataset.loaded = '';
+      load(node, '/api/funding/radar/cases/' + encodeURIComponent(id), (c, n) => {
+        if (!c || typeof c !== 'object') throw new Error('shape');
+        n.appendChild(el('div', 'm', 'kasus #' + c.id + ' · ' + c.chain + ' · tahap ' + c.stage + ' · keyakinan ' + c.confidence));
+        n.appendChild(el('div', 'm', 'penerima: ' + c.recipient));
+        n.appendChild(el('h3', null, 'Bukti mentah'));
+        const pre = el('pre', 'm');
+        pre.style.whiteSpace = 'pre-wrap';
+        pre.textContent = JSON.stringify(c.evidence, null, 2);
+        n.appendChild(pre);
+        n.appendChild(el('div', 'note', 'Linimasa kronologis per kasus: Belum tersedia — backend hanya menyimpan bukti agregat.'));
+      });
+    }
+
+    function loadFunding() {
+      const limit = Math.min(500, Math.max(1, parseInt($('f-limit').value, 10) || 50));
+      return load($('f-list'), '/api/funding/radar/cases?limit=' + encodeURIComponent(limit), (rows, node) => {
+        table(node, ['id', 'rantai', 'penerima', 'tahap', 'keyakinan', 'dana awal', 'diperbarui'], rows, c => {
+          const tr = el('tr');
+          const cell = el('td', 'm');
+          const b = el('button', 'act', String(c.id));
+          b.addEventListener('click', () => fundingDetail(c.id));
+          cell.appendChild(b);
+          tr.appendChild(cell);
+          tr.appendChild(td(c.chain, 'm'));
+          tr.appendChild(td(c.recipient, 'm'));
+          tr.appendChild(td(c.stage));
+          tr.appendChild(td(c.confidence, 'm'));
+          tr.appendChild(td(c.first_funding_native, 'm'));
+          tr.appendChild(td(c.updated_at, 'm'));
+          return tr;
+        });
+      });
+    }
+
+    // -------------------------------------------------------------- Sinyal
+    let signalTab = 'accepted';
+
+    function loadSignals() {
+      const limit = Math.min(500, Math.max(1, parseInt($('s-limit').value, 10) || 50));
+      const path = (signalTab === 'accepted' ? '/api/signals?limit=' : '/api/signals/rejections?limit=')
+        + encodeURIComponent(limit);
+      return load($('s-list'), path, (rows, node) => {
+        if (signalTab === 'accepted') {
+          table(node, ['id', 'rantai', 'mint', 'jenis', 'skor', 'dibuat'], rows, s => {
+            const tr = el('tr');
+            tr.appendChild(td(s.id, 'm'));
+            tr.appendChild(td(s.chain, 'm'));
+            tr.appendChild(td(s.mint, 'm'));
+            tr.appendChild(td(s.signal_kind));
+            tr.appendChild(td(s.score, 'm'));
+            tr.appendChild(td(s.created_at, 'm'));
+            return tr;
+          });
+        } else {
+          table(node, ['rantai', 'mint', 'jenis', 'kode penolakan', 'dievaluasi'], rows, s => {
+            const tr = el('tr');
+            tr.appendChild(td(s.chain, 'm'));
+            tr.appendChild(td(s.mint, 'm'));
+            tr.appendChild(td(s.signal_kind));
+            tr.appendChild(td(s.rejection_code, 'm'));
+            tr.appendChild(td(s.evaluated_at, 'm'));
+            return tr;
+          });
+        }
+        node.appendChild(el('div', 'note', 'Tindak lanjut per sinyal: Belum tersedia — backend tidak menyediakan endpoint aksi.'));
+      });
+    }
+
+    // ------------------------------------------------------------- Klaster
+    const loadClusters = () => load($('c-list'), '/api/clusters', (rows, node) => {
+      table(node, ['id klaster', 'anggota aktif'], rows, c => {
+        const tr = el('tr');
+        tr.appendChild(td(c.cluster_id, 'm'));
+        tr.appendChild(td(c.member_count, 'm'));
+        return tr;
+      });
+    });
+
+    // ------------------------------------------------------------ Telegram
+    const loadTelegram = () => load($('tg-list'), '/api/telegram/channels', (rows, node) => {
+      table(node, ['kunci', 'judul', 'username', 'allowlist', 'status', 'terakhir teramati', 'aksi'], rows, c => {
+        const tr = el('tr');
+        tr.appendChild(td(c.channel_key, 'm'));
+        tr.appendChild(td(c.title));
+        tr.appendChild(td(c.username, 'm'));
+        tr.appendChild(td(c.allowlisted ? 'ya' : 'tidak'));
+        tr.appendChild(td(c.status));
+        tr.appendChild(td(c.last_observed_at, 'm'));
+        const cell = el('td');
+        const key = '/api/telegram/channels/' + encodeURIComponent(c.channel_key);
+        const toggle = el('button', 'act', c.allowlisted ? 'Nonaktifkan allowlist' : 'Aktifkan');
+        toggle.setAttribute('data-confirm', (c.allowlisted ? 'Nonaktifkan' : 'Aktifkan') + ' kanal ' + c.channel_key + '?');
+        toggle.addEventListener('click', () => mutate(toggle, async () => {
+          const res = await api(key, { method: 'POST', body: { allowlisted: !c.allowlisted, status: c.allowlisted ? 'disabled' : 'active' } });
+          if (res.state === 'ok') loadTelegram();
+          return res;
+        }));
+        const del = el('button', 'danger', 'Hapus dari allowlist');
+        del.setAttribute('data-confirm', 'Hapus ' + c.channel_key + ' dari allowlist? Riwayat pesan tetap tersimpan.');
+        del.addEventListener('click', () => mutate(del, async () => {
+          const res = await api(key, { method: 'DELETE' });
+          if (res.state === 'ok') loadTelegram();
+          return res;
+        }));
+        cell.append(toggle, del);
+        tr.appendChild(cell);
+        return tr;
+      });
+    });
+
+    // ---------------------------------------------------------- Pengaturan
+    const RUNTIME_KEYS = ['large_funding_min_sol', 'large_funding_min_usd', 'recipient_max_age_days',
+      'preparation_alert_confidence', 'entry_min_liquidity_usd', 'full_skill_score',
+      'full_copyability_score', 'telegram_concurrency', 'runtime_profile'];
+
+    const loadEnv = () => load($('st-env'), '/api/settings/env', (rows, node) => {
+      table(node, ['variabel', 'terisi', 'pratinjau', 'sumber', 'dapat diubah'], rows, r => {
+        const tr = el('tr');
+        tr.appendChild(td(r.name, 'm'));
+        tr.appendChild(td(r.set ? 'ya' : 'tidak'));
+        tr.appendChild(td(r.preview, 'm'));
+        tr.appendChild(td(r.source, 'm'));
+        tr.appendChild(td(r.editable ? 'ya (lewat panel rahasia)' : 'tidak — hanya lingkungan'));
+        return tr;
+      });
+    });
+
+    const loadRuntime = () => load($('st-runtime'), '/api/settings/runtime', (d, node) => {
+      if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('shape');
+      const form = el('form', 'row');
+      const inputs = {};
+      RUNTIME_KEYS.forEach(k => {
+        const lab = el('label', null, k);
+        lab.htmlFor = 'rt-' + k;
+        let input;
+        if (k === 'runtime_profile') {
+          input = document.createElement('select');
+          ['low', 'scale'].forEach(v => {
+            const o = document.createElement('option');
+            o.value = v;
+            o.textContent = v;
+            if (String(d[k]) === v) o.selected = true;
+            input.appendChild(o);
+          });
+        } else {
+          input = el('input');
+          input.type = 'number';
+          input.min = '0';
+          input.step = '1';
+          input.value = d[k] == null ? '' : d[k];
+        }
+        input.id = 'rt-' + k;
+        inputs[k] = input;
+        form.append(lab, input);
+      });
+      const save = el('button', 'act', 'Simpan setelan');
+      save.type = 'submit';
+      save.setAttribute('data-confirm', 'Simpan setelan runtime yang berubah?');
+      form.appendChild(save);
+      form.addEventListener('submit', ev => {
+        ev.preventDefault();
+        const settings = {};
+        let invalid = null;
+        RUNTIME_KEYS.forEach(k => {
+          const raw = inputs[k].value;
+          if (raw === '') return;
+          if (k === 'runtime_profile') {
+            if (raw !== 'low' && raw !== 'scale') invalid = k;
+            else settings[k] = raw;
+            return;
+          }
+          const n = Number(raw);
+          if (!Number.isInteger(n) || n < 0) invalid = k;
+          else settings[k] = n;
+        });
+        if (invalid) { status('Nilai tidak valid untuk ' + invalid + '; harus bilangan bulat tak negatif.'); return; }
+        if (!Object.keys(settings).length) { status('Tidak ada nilai untuk disimpan.'); return; }
+        mutate(save, async () => {
+          const res = await api('/api/settings/runtime', { method: 'POST', body: { settings } });
+          if (res.state === 'ok') loadRuntime();
+          return res;
+        });
+      });
+      node.appendChild(form);
+      node.appendChild(el('div', 'note', 'Sebagian worker membaca konfigurasi saat mulai; perubahan tertentu baru berlaku penuh setelah layanan dijalankan ulang.'));
+    });
+
+    function loadSettings() {
+      loadEnv();
+      loadRuntime();
+    }
+
+    // --------------------------------------------------------------- Wiring
+    $('token-form').addEventListener('submit', ev => { ev.preventDefault(); loadToken(); });
+    document.querySelectorAll('[data-filter]').forEach(cb => cb.addEventListener('change', () => {
+      if ($('t-timeline').dataset.loaded === '1') loadToken();
+    }));
+    $('w-form').addEventListener('submit', ev => { ev.preventDefault(); loadWallets(); });
+    $('w-label-form').addEventListener('submit', ev => {
+      ev.preventDefault();
+      const button = ev.submitter || $('w-label-form').querySelector('button[type="submit"]');
+      if (!selectedWallet) { status('Pilih satu dompet lebih dulu.'); return; }
+      const kind = $('lbl-kind').value.trim();
+      if (!kind) { status('Jenis label wajib diisi.'); return; }
+      mutate(button, async () => {
+        const res = await api(walletBase() + '/labels', {
+          method: 'POST',
+          body: { kind, disposition: $('lbl-disp').value, reason: $('lbl-reason').value.trim() || null }
+        });
+        if (res.state === 'ok') { $('lbl-kind').value = ''; $('lbl-reason').value = ''; loadLabels(); }
+        return res;
+      });
+    });
+    $('f-form').addEventListener('submit', ev => { ev.preventDefault(); loadFunding(); });
+    $('s-form').addEventListener('submit', ev => { ev.preventDefault(); loadSignals(); });
+    document.querySelectorAll('[data-tab]').forEach(b => b.addEventListener('click', () => {
+      signalTab = b.dataset.tab;
+      document.querySelectorAll('[data-tab]').forEach(o => o.setAttribute('aria-pressed', String(o === b)));
+      if ($('s-list').dataset.loaded === '1') loadSignals();
+    }));
+
+    const LOADERS = {
+      overview: loadOverview, clusters: loadClusters, telegram: loadTelegram,
+      queues: loadQueues, settings: loadSettings
+    };
+    document.querySelectorAll('[data-load]').forEach(b => {
+      b.addEventListener('click', () => LOADERS[b.dataset.load]());
+    });
+
+    $('tg-add').addEventListener('submit', ev => {
+      ev.preventDefault();
+      const button = ev.submitter || $('tg-add').querySelector('button[type="submit"]');
+      const key = $('tg-key').value.trim();
+      if (!key) { status('Kunci kanal wajib diisi.'); return; }
+      mutate(button, async () => {
+        const res = await api('/api/telegram/channels', {
+          method: 'POST',
+          body: { channel_key: key, title: $('tg-title').value.trim() || null, username: $('tg-user').value.trim() || null }
+        });
+        if (res.state === 'ok') { $('tg-key').value = ''; $('tg-title').value = ''; $('tg-user').value = ''; loadTelegram(); }
+        return res;
+      });
+    });
+
+    $('tg-bulk').addEventListener('submit', ev => {
+      ev.preventDefault();
+      const button = ev.submitter || $('tg-bulk').querySelector('button[type="submit"]');
+      const channels = $('tg-bulk-text').value.split('\n').map(s => s.trim()).filter(Boolean);
+      if (!channels.length) { status('Daftar impor kosong.'); return; }
+      mutate(button, async () => {
+        const res = await api('/api/telegram/channels/bulk', { method: 'POST', body: { channels } });
+        if (res.state === 'ok') { $('tg-bulk-text').value = ''; loadTelegram(); }
+        return res;
+      });
+    });
+
+    $('st-secret').addEventListener('submit', ev => {
+      ev.preventDefault();
+      const button = ev.submitter || $('st-secret').querySelector('button[type="submit"]');
+      const name = $('sec-name').value;
+      const value = $('sec-value').value;
+      if (!value.trim()) { status('Nilai rahasia kosong; tidak dikirim.'); return; }
+      mutate(button, async () => {
+        const res = await api('/api/settings/secrets', { method: 'POST', body: { name, value } });
+        $('sec-value').value = '';
+        if (res.state === 'ok') loadEnv();
+        return res;
+      });
+    });
+
+    $('sec-del').addEventListener('click', () => {
+      const button = $('sec-del');
+      const name = $('sec-name').value;
+      mutate(button, async () => {
+        const res = await api('/api/settings/secrets/' + encodeURIComponent(name), { method: 'DELETE' });
+        $('sec-value').value = '';
+        if (res.state === 'ok') loadEnv();
+        return res;
+      });
+    });
+
+    // Navigation only; no read and certainly no mutation happens implicitly.
+    const initial = location.hash.slice(1);
+    show(VIEW_TITLES[initial] ? initial : 'overview');
   </script>
 </body>
 
